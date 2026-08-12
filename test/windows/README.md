@@ -19,8 +19,9 @@ Run with:
 powershell.exe -ExecutionPolicy Bypass -File .\interactive-win11-validate.ps1 -ResetState
 ```
 
-Pass `-Rebuild` to force one upfront `zig build -Demit-exe=true` before
-the suite starts. The suite also does that upfront build automatically
+From the repository root, pass `-Rebuild` to force one upfront
+`.\scripts\dev-windows.cmd zig build -Demit-exe=true` before the suite starts.
+The suite also does that upfront build automatically
 when tracked inputs are newer than `zig-out\bin\winghostty.exe`, so child
 harnesses reuse one fresh binary instead of rebuilding in parallel.
 
@@ -220,11 +221,13 @@ runtime is properly initialized.
 
 ### Build
 
-First build ghostty.dll, then compile the test:
+From the repository root, first build ghostty.dll, then compile the test:
 
 ```powershell
-zig build -Dapp-runtime=none -Demit-exe=false
-zig cc test_dll_init.c -o test_dll_init.exe -target native-native-msvc
+.\scripts\dev-windows.cmd zig build -Dapp-runtime=none -Demit-exe=false
+Push-Location .\test\windows
+..\..\scripts\dev-windows.cmd zig cc test_dll_init.c -o test_dll_init.exe -target native-native-msvc
+Pop-Location
 ```
 
 ### Run

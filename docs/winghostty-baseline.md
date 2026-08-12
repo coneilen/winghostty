@@ -5,16 +5,19 @@ does not add a host API or GraphCode product code.
 
 ## Compatibility tuple
 
-The tuple below is atomic: changing one component requires re-running the
-baseline validation.
+The pinned inputs below are atomic: changing one requires re-running the
+baseline validation. MSVC and Windows SDK are detected reference values on
+the validating machine, not portable pins.
 
-| Component | Pinned value |
+| Component | Value |
 | --- | --- |
-| Winghostty | `dccedf73600e0ef59c938aa8997f378f27d08f31` (`host/baseline-ci`) |
+| Upstream source baseline (`winghostty/main`) | `dccedf73600e0ef59c938aa8997f378f27d08f31` |
+| Initial baseline branch commit (`host/baseline-ci`) | `ca6273e249a4410470f2449786d0ea950e05e250` |
 | Ghostty base | `ba398dfff3e30ff83da07140981ca138410cf608` (merge-base with `ghostty/main`, 2026-04-05) |
-| Zig | `0.15.2` |
-| MSVC | `19.29.30159` (`14.29.30133`, x64 host tools) |
-| Windows SDK | `10.0.26100.0` |
+| Zig | `0.15.2` (pinned and enforced by wrapper/CI) |
+| GitHub Actions Windows runners | x64 `windows-2022`; native ARM64 `windows-11-arm` (fixed labels) |
+| MSVC detected reference | `19.29.30159` (`14.29.30133`, x64 host tools) |
+| Windows SDK detected reference | `10.0.26100.0` |
 
 The public host contract used for later work is
 `GraphCode/investigation/contracts/winghostty-host.md` at GraphCode
@@ -23,9 +26,11 @@ provider as-is; no extraction has started.
 
 ## Clean validation
 
-Run from the repository root:
+Run from the repository root. Seed and build through the wrapper so separate
+processes receive the same explicit cache paths:
 
 ```powershell
+.\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\fetch-zig-deps.ps1
 .\scripts\dev-windows.cmd zig build test -Dtest-filter=win32
 .\scripts\dev-windows.cmd zig build -Demit-exe=true
 ```
@@ -33,10 +38,11 @@ Run from the repository root:
 The wrapper places `ZIG_GLOBAL_CACHE_DIR` and `ZIG_LOCAL_CACHE_DIR` on the
 worktree volume. This is required for Zig 0.15.2 on Windows when the checkout
 and the global cache would otherwise be on different drives. The regression
-guard is:
+guards are:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\test\windows\zig-cache-same-drive.ps1
+.\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\test\windows\zig-cache-same-drive.ps1
+.\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\test\windows\zig-cache-offline-build.ps1
 ```
 
 ## Win32 terminal `Surface` dependency map

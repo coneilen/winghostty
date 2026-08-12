@@ -92,7 +92,7 @@ if (-not (Test-Path (Join-Path $gitUsrBin "sh.exe"))) {
     throw "Missing Git runtime under $gitUsrBin"
 }
 if (-not $env:ZIG_HOME) {
-    throw "Zig 0.15.2+ not found. Set ZIG_HOME or install Zig under $userHome\tools\zig or $programFiles\Zig."
+    throw "Zig 0.15.2 not found. Set ZIG_HOME or install Zig under $userHome\tools\zig or $programFiles\Zig."
 }
 if (-not (Test-Path (Join-Path $env:ZIG_HOME "zig.exe"))) {
     throw "Missing zig.exe under $env:ZIG_HOME"
@@ -128,6 +128,11 @@ where rc || exit /b 1
 where zig || exit /b 1
 git --version || exit /b 1
 zig version || exit /b 1
+for /f %%v in ('zig version') do set "ZIG_VERSION=%%v"
+if /i not "%ZIG_VERSION%"=="0.15.2" (
+echo winghostty baseline requires Zig 0.15.2. Resolved: %ZIG_VERSION%
+exit /b 1
+)
 cl 2>&1 | findstr /c:"Version" || exit /b 1
 echo == WSL ==
 if "%DEV_WINDOWS_CHECK_WSL%"=="1" (

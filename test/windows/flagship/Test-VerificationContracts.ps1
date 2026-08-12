@@ -8145,8 +8145,8 @@ Assert-WorkflowContract `
     -Description 'Windows bootstrap preserves caller-provided Zig cache isolation'
 Assert-WorkflowContract `
     -Path (Join-Path $repoRoot 'scripts\dev-windows.ps1') `
-    -Pattern '(?s)IsNullOrWhiteSpace\(\$env:ZIG_GLOBAL_CACHE_DIR\).*?IsNullOrWhiteSpace\(\$env:ZIG_LOCAL_CACHE_DIR\)' `
-    -Description 'PowerShell Windows bootstrap preserves caller-provided Zig cache isolation'
+    -Pattern '(?s)\. \(Join-Path \$PSScriptRoot "zig-cache\.ps1"\).*?Set-WinghosttyZigCacheEnvironment' `
+    -Description 'PowerShell Windows bootstrap centralizes Zig cache isolation'
 Assert-TextContract `
     -Content (Get-YamlStepBlock -Content $testWorkflowText -Name 'Upload interactive evidence' -Source $testWorkflow) `
     -Pattern '(?ms)include-hidden-files: true.*?github\.workspace.*?\.sandbox/win11/\*\*/logs/\*\*' `

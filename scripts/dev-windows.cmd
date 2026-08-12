@@ -69,7 +69,7 @@ if not exist "%GIT_USR_BIN%\sh.exe" (
 )
 
 if "%ZIG_HOME%"=="" (
-  echo Zig 0.15.2+ not found. Set ZIG_HOME or install Zig to "%_USER_HOME%\tools\zig" or "%_PROGRAM_FILES%\Zig".
+  echo Zig 0.15.2 not found. Set ZIG_HOME or install Zig to "%_USER_HOME%\tools\zig" or "%_PROGRAM_FILES%\Zig".
   exit /b 1
 )
 
@@ -109,8 +109,8 @@ git --version || exit /b 1
 zig version || exit /b 1
 cl 2>&1 | findstr /c:"Version" || exit /b 1
 for /f %%v in ('zig version') do set "ZIG_VERSION=%%v"
-echo %ZIG_VERSION% | findstr /b /c:"0.15." >nul || (
-  echo winghostty currently requires Zig 0.15.x. Resolved: %ZIG_VERSION%
+if /i not "%ZIG_VERSION%"=="0.15.2" (
+  echo winghostty baseline requires Zig 0.15.2. Resolved: %ZIG_VERSION%
   exit /b 1
 )
 

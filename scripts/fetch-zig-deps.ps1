@@ -19,11 +19,15 @@ $zigExe = if ($env:ZIG_HOME -and (Test-Path (Join-Path $env:ZIG_HOME "zig.exe"))
 } else {
     "zig.exe"
 }
+$zigVersion = (& $zigExe version).Trim()
+if ($zigVersion -ne "0.15.2") {
+    throw "Winghostty baseline requires Zig 0.15.2; resolved $zigVersion."
+}
 
-$downloadDir = Join-Path (Get-Location) ".zig-cache\downloads"
-New-Item -ItemType Directory -Force -Path $downloadDir | Out-Null
 . (Join-Path $PSScriptRoot "zig-cache.ps1")
 $zigCache = Set-WinghosttyZigCacheEnvironment -RepoRoot (Get-Location).Path
+$downloadDir = Join-Path $zigCache.Local "downloads"
+New-Item -ItemType Directory -Force -Path $downloadDir | Out-Null
 $globalCacheDir = $zigCache.Global
 
 $deps = @(

@@ -27,7 +27,7 @@ concurrency:
 jobs:
   windows-release:
     name: Windows Release
-    runs-on: windows-latest
+    runs-on: windows-2022
     environment: release
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -236,6 +236,10 @@ jobs:
         with:
           version: 0.15.2
           use-cache: false
+
+      - name: Seed Windows Zig dependencies
+        shell: pwsh
+        run: .\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\fetch-zig-deps.ps1
 
       - name: Install Inno Setup
         shell: pwsh

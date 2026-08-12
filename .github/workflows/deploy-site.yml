@@ -21,7 +21,7 @@ jobs:
   deploy:
     name: Canary, verify, and publish
     if: github.event_name != 'release' || github.event.release.prerelease == false
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 20
     environment: cloudflare-pages-production
     env:

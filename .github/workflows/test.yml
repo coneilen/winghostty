@@ -20,7 +20,7 @@ concurrency:
 jobs:
   windows:
     name: Windows Build And Tests
-    runs-on: windows-latest
+    runs-on: windows-2022
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}\.zig-global-cache
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}\.zig-cache
@@ -82,9 +82,17 @@ jobs:
           # Failed and cancelled jobs can save incomplete generated files.
           use-cache: false
 
+      - name: Seed Windows Zig dependencies
+        shell: pwsh
+        run: .\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\fetch-zig-deps.ps1
+
       - name: Zig cache volume regression check
         shell: pwsh
         run: ./test/windows/zig-cache-same-drive.ps1
+
+      - name: Zig offline cache-consumption regression check
+        shell: pwsh
+        run: ./test/windows/zig-cache-offline-build.ps1
 
       - name: Zig version
         run: zig version
@@ -132,7 +140,7 @@ jobs:
 
   windows-portable-smoke:
     name: Windows x64 Portable Package Smoke
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 45
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}\.zig-global-cache
@@ -178,6 +186,9 @@ jobs:
       (github.event_name == 'workflow_dispatch' && inputs.run_interactive_win11)
     runs-on: [self-hosted, Windows, X64, winghostty-interactive]
     timeout-minutes: 60
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}\.zig-global-cache
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}\.zig-cache
 
     steps:
       - name: Checkout code
@@ -201,9 +212,6 @@ jobs:
 
       - name: Run interactive Win11 composite
         shell: pwsh
-        env:
-          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}\zig-global-cache
-          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}\zig-local-cache
         run: |
           $ErrorActionPreference = 'Stop'
           $quick = '${{ github.event_name }}' -eq 'pull_request'

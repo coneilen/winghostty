@@ -145,7 +145,7 @@ documented in **[docs/windows.md](docs/windows.md)**.
 ## Build from source
 
 Most users should install from Releases. Building needs Windows 10/11 on x64
-or ARM64, **Zig 0.15.x (patch ≥ 2)**, Visual Studio 2019 or later with the
+or ARM64, **Zig 0.15.2**, Visual Studio 2019 or later with the
 MSVC toolchain, and Git for Windows:
 
 ```powershell
