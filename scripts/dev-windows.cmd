@@ -94,9 +94,21 @@ if not exist "%APPDATA%" mkdir "%APPDATA%" >nul 2>nul
 if not exist "%TEMP%" mkdir "%TEMP%" >nul 2>nul
 if "%ZIG_LOCAL_CACHE_DIR%"=="" set "ZIG_LOCAL_CACHE_DIR=%CD%\.zig-cache"
 if "%ZIG_GLOBAL_CACHE_DIR%"=="" set "ZIG_GLOBAL_CACHE_DIR=%CD%\.zig-global-cache"
-for %%I in ("%ZIG_LOCAL_CACHE_DIR%") do set "_LOCAL_CACHE_DRIVE=%%~dI"
-for %%I in ("%ZIG_GLOBAL_CACHE_DIR%") do set "_GLOBAL_CACHE_DRIVE=%%~dI"
-if /i not "%_LOCAL_CACHE_DRIVE%"=="%_GLOBAL_CACHE_DRIVE%" set "ZIG_GLOBAL_CACHE_DIR=%CD%\.zig-global-cache"
+for %%I in ("%ZIG_LOCAL_CACHE_DIR%") do (
+  set "ZIG_LOCAL_CACHE_DIR=%%~fI"
+  set "_LOCAL_CACHE_DRIVE=%%~dI"
+  set "_LOCAL_CACHE_PARENT=%%~dpI"
+)
+for %%I in ("%ZIG_GLOBAL_CACHE_DIR%") do (
+  set "ZIG_GLOBAL_CACHE_DIR=%%~fI"
+  set "_GLOBAL_CACHE_DRIVE=%%~dI"
+)
+if /i not "%_LOCAL_CACHE_DRIVE%"=="%_GLOBAL_CACHE_DRIVE%" set "ZIG_GLOBAL_CACHE_DIR=%_LOCAL_CACHE_PARENT%.zig-global-cache"
+if /i "%~1"=="--print-cache-paths" (
+  echo ZIG_LOCAL_CACHE_DIR=%ZIG_LOCAL_CACHE_DIR%
+  echo ZIG_GLOBAL_CACHE_DIR=%ZIG_GLOBAL_CACHE_DIR%
+  exit /b 0
+)
 set "PATH=%GIT_CMD%;%GIT_USR_BIN%;%ZIG_HOME%;%PATH%"
 
 echo == Versions ==

@@ -8153,6 +8153,18 @@ Assert-WorkflowContract `
     -Pattern '(?s)if "%ZIG_LOCAL_CACHE_DIR%"=="" set "ZIG_LOCAL_CACHE_DIR=.*?if "%ZIG_GLOBAL_CACHE_DIR%"=="" set "ZIG_GLOBAL_CACHE_DIR=' `
     -Description 'Windows bootstrap resolves local then global Zig caches'
 Assert-WorkflowContract `
+    -Path (Join-Path $repoRoot 'scripts\dev-windows.cmd') `
+    -Pattern '(?s)for %%I in \("%ZIG_LOCAL_CACHE_DIR%"\) do \(.*?set "_LOCAL_CACHE_DRIVE=%%~dI".*?set "_LOCAL_CACHE_PARENT=%%~dpI".*?if /i not "%_LOCAL_CACHE_DRIVE%"=="%_GLOBAL_CACHE_DRIVE%" set "ZIG_GLOBAL_CACHE_DIR=%_LOCAL_CACHE_PARENT%\.zig-global-cache"' `
+    -Description 'Windows bootstrap follows the resolved local cache volume for cross-drive global fallback'
+Assert-WorkflowContract `
+    -Path (Join-Path $repoRoot 'scripts\fetch-zig-deps.cmd') `
+    -Pattern '(?s)for %%I in \("%ZIG_LOCAL_CACHE_DIR%"\) do \(.*?set "_LOCAL_CACHE_DRIVE=%%~dI".*?set "_LOCAL_CACHE_PARENT=%%~dpI".*?if /i not "%_LOCAL_CACHE_DRIVE%"=="%_GLOBAL_CACHE_DRIVE%" set "ZIG_GLOBAL_CACHE_DIR=%_LOCAL_CACHE_PARENT%\.zig-global-cache"' `
+    -Description 'CMD dependency seeding follows the resolved local cache volume for cross-drive global fallback'
+Assert-WorkflowContract `
+    -Path $testWorkflow `
+    -Pattern '(?ms)- name: CMD Zig cache cross-drive regression check\s+shell: pwsh\s+run: ./test/windows/zig-cache-cmd-cross-drive\.ps1' `
+    -Description 'Windows CI executes the forced cross-drive CMD cache regression'
+Assert-WorkflowContract `
     -Path (Join-Path $repoRoot 'scripts\dev-windows.ps1') `
     -Pattern '(?s)\. \(Join-Path \$PSScriptRoot "zig-cache\.ps1"\).*?Set-WinghosttyZigCacheEnvironment' `
     -Description 'PowerShell Windows bootstrap centralizes Zig cache isolation'

@@ -90,6 +90,10 @@ jobs:
         shell: pwsh
         run: ./test/windows/zig-cache-same-drive.ps1
 
+      - name: CMD Zig cache cross-drive regression check
+        shell: pwsh
+        run: ./test/windows/zig-cache-cmd-cross-drive.ps1
+
       - name: Zig offline cache-consumption regression check
         shell: pwsh
         run: ./test/windows/zig-cache-offline-build.ps1
