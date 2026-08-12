@@ -6710,9 +6710,9 @@ $releasePreflightStepSha256 =
 $readinessPreflightStepSha256 =
     '021214f70c1b21adcc770f9e96f66daf1ada2f9eae4180daf3958236941b05c9'
 $releaseWorkflowSha256 =
-    '2aba54c3128eae8ab191751f2c746785347ae8a7dd166e12f69db2bd5ed36b4f'
+    '13db031b8ee25fd3579ef1bd65354a14cec844e10f0b55817d1efe82b9dfe91a'
 $readinessWorkflowSha256 =
-    '2659a58baeffaa9861c33bd4cdcd7adc8838dd6f9e91d51dcffc338af906f303'
+    'be9d472e2d2e2d8a57803810409634c8acc503093b0c7403050d9f80cc09c808'
 # Full-file pins deliberately make every workflow edit a semantic-review event,
 # including triggers, permissions, inherited job metadata, and unprotected steps.
 $commonWorkflowBoundaryMutations = @(
@@ -6733,7 +6733,7 @@ $commonWorkflowBoundaryMutations = @(
     },
     @{
         Label = 'runner redirect'
-        Target = '    runs-on: windows-latest'
+        Target = '    runs-on: windows-2022'
         Replacement = '    runs-on: [self-hosted, forged-release]'
     },
     @{
@@ -8085,14 +8085,23 @@ Assert-TextContract `
     -Pattern '(?m)^\s*timeout-minutes:\s+60\s*$' `
     -Description 'full interactive validation has enough job budget for the accessibility soak' `
     -Context "$testWorkflow :: windows-interactive"
+$interactiveJobText = Get-YamlJobText `
+    -Content $testWorkflowText `
+    -Name 'windows-interactive' `
+    -Source $testWorkflow
 $interactiveRunStep = Get-YamlStepBlock `
-    -Content (Get-YamlJobText -Content $testWorkflowText -Name 'windows-interactive' -Source $testWorkflow) `
+    -Content $interactiveJobText `
     -Name 'Run interactive Win11 composite' `
     -Source "$testWorkflow :: windows-interactive"
 Assert-TextContract `
+    -Content $interactiveJobText `
+    -Pattern '(?ms)^    env:\s+ZIG_GLOBAL_CACHE_DIR: \$\{\{ github\.workspace \}\}\\\.zig-global-cache\s+ZIG_LOCAL_CACHE_DIR: \$\{\{ github\.workspace \}\}\\\.zig-cache' `
+    -Description 'interactive builds use the job-level workspace Zig caches' `
+    -Context "$testWorkflow :: windows-interactive"
+Assert-TextContract `
     -Content $interactiveRunStep `
-    -Pattern '(?ms)env:\s+ZIG_GLOBAL_CACHE_DIR: \$\{\{ runner\.temp \}\}\\zig-global-cache\s+ZIG_LOCAL_CACHE_DIR: \$\{\{ runner\.temp \}\}\\zig-local-cache' `
-    -Description 'interactive builds use clean per-job Zig caches' `
+    -Pattern '(?ms)^        run:\s+\|' `
+    -Description 'interactive cache paths are inherited by the run step' `
     -Context "$testWorkflow :: windows-interactive :: Run interactive Win11 composite"
 $interactiveRunScript = Get-YamlLiteralRunScript `
     -Content $interactiveRunStep `
@@ -8141,12 +8150,16 @@ Assert-TextContract `
     -Context "$testWorkflow :: Verify default source-build shader mode"
 Assert-WorkflowContract `
     -Path (Join-Path $repoRoot 'scripts\dev-windows.cmd') `
-    -Pattern '(?s)if "%ZIG_GLOBAL_CACHE_DIR%"=="" set "ZIG_GLOBAL_CACHE_DIR=.*?if "%ZIG_LOCAL_CACHE_DIR%"=="" set "ZIG_LOCAL_CACHE_DIR=' `
-    -Description 'Windows bootstrap preserves caller-provided Zig cache isolation'
+    -Pattern '(?s)if "%ZIG_LOCAL_CACHE_DIR%"=="" set "ZIG_LOCAL_CACHE_DIR=.*?if "%ZIG_GLOBAL_CACHE_DIR%"=="" set "ZIG_GLOBAL_CACHE_DIR=' `
+    -Description 'Windows bootstrap resolves local then global Zig caches'
 Assert-WorkflowContract `
     -Path (Join-Path $repoRoot 'scripts\dev-windows.ps1') `
     -Pattern '(?s)\. \(Join-Path \$PSScriptRoot "zig-cache\.ps1"\).*?Set-WinghosttyZigCacheEnvironment' `
     -Description 'PowerShell Windows bootstrap centralizes Zig cache isolation'
+Assert-WorkflowContract `
+    -Path (Join-Path $repoRoot 'scripts\zig-cache.ps1') `
+    -Pattern '(?s)\$local = \$env:ZIG_LOCAL_CACHE_DIR.*?\$global = \$env:ZIG_GLOBAL_CACHE_DIR' `
+    -Description 'shared Zig cache bootstrap resolves local before global paths'
 Assert-TextContract `
     -Content (Get-YamlStepBlock -Content $testWorkflowText -Name 'Upload interactive evidence' -Source $testWorkflow) `
     -Pattern '(?ms)include-hidden-files: true.*?github\.workspace.*?\.sandbox/win11/\*\*/logs/\*\*' `
