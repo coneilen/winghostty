@@ -21,6 +21,9 @@ jobs:
   windows:
     name: Windows Build And Tests
     runs-on: windows-latest
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}\.zig-global-cache
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}\.zig-cache
 
     steps:
       - name: Checkout code
@@ -79,6 +82,10 @@ jobs:
           # Failed and cancelled jobs can save incomplete generated files.
           use-cache: false
 
+      - name: Zig cache volume regression check
+        shell: pwsh
+        run: ./test/windows/zig-cache-same-drive.ps1
+
       - name: Zig version
         run: zig version
 
@@ -127,6 +134,9 @@ jobs:
     name: Windows x64 Portable Package Smoke
     runs-on: windows-latest
     timeout-minutes: 45
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}\.zig-global-cache
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}\.zig-cache
 
     steps:
       - name: Checkout code
@@ -139,6 +149,10 @@ jobs:
         with:
           version: 0.15.2
           use-cache: false
+
+      - name: Zig cache volume regression check
+        shell: pwsh
+        run: ./test/windows/zig-cache-same-drive.ps1
 
       - name: Run portable package CLI smoke
         shell: pwsh

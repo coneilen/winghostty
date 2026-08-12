@@ -33,6 +33,14 @@ if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES%\Microsoft Visual Studio\2022\Buil
 if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES%\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES%\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat"
 if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES%\Microsoft Visual Studio\2022\Professional\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES%\Microsoft Visual Studio\2022\Professional\Common7\Tools\VsDevCmd.bat"
 if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES%\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES%\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat"
+if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES_X86%\Microsoft Visual Studio\2019\BuildTools\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES_X86%\Microsoft Visual Studio\2019\BuildTools\Common7\Tools\VsDevCmd.bat"
+if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES_X86%\Microsoft Visual Studio\2019\Community\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES_X86%\Microsoft Visual Studio\2019\Community\Common7\Tools\VsDevCmd.bat"
+if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES_X86%\Microsoft Visual Studio\2019\Professional\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES_X86%\Microsoft Visual Studio\2019\Professional\Common7\Tools\VsDevCmd.bat"
+if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES_X86%\Microsoft Visual Studio\2019\Enterprise\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES_X86%\Microsoft Visual Studio\2019\Enterprise\Common7\Tools\VsDevCmd.bat"
+if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES%\Microsoft Visual Studio\2019\BuildTools\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES%\Microsoft Visual Studio\2019\BuildTools\Common7\Tools\VsDevCmd.bat"
+if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES%\Microsoft Visual Studio\2019\Community\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES%\Microsoft Visual Studio\2019\Community\Common7\Tools\VsDevCmd.bat"
+if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES%\Microsoft Visual Studio\2019\Professional\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES%\Microsoft Visual Studio\2019\Professional\Common7\Tools\VsDevCmd.bat"
+if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES%\Microsoft Visual Studio\2019\Enterprise\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES%\Microsoft Visual Studio\2019\Enterprise\Common7\Tools\VsDevCmd.bat"
 if "%DEV_WINDOWS_ARCH%"=="" (
   if /i "%PROCESSOR_ARCHITECTURE%"=="ARM64" (
     set "DEV_WINDOWS_ARCH=arm64"
@@ -46,7 +54,7 @@ if /i not "%DEV_WINDOWS_ARCH%"=="x64" if /i not "%DEV_WINDOWS_ARCH%"=="arm64" (
 )
 
 if "%VSDEVCMD%"=="" (
-  echo Missing VS Dev shell bootstrap. Install Visual Studio 2022 Build Tools with the C++ workload.
+  echo Missing VS Dev shell bootstrap. Install Visual Studio 2019 or later with the C++ workload.
   exit /b 1
 )
 
@@ -84,8 +92,11 @@ set "TMP=%_TMP_DIR%"
 if not exist "%LOCALAPPDATA%" mkdir "%LOCALAPPDATA%" >nul 2>nul
 if not exist "%APPDATA%" mkdir "%APPDATA%" >nul 2>nul
 if not exist "%TEMP%" mkdir "%TEMP%" >nul 2>nul
-if "%ZIG_GLOBAL_CACHE_DIR%"=="" set "ZIG_GLOBAL_CACHE_DIR=%LOCALAPPDATA%\zig"
 if "%ZIG_LOCAL_CACHE_DIR%"=="" set "ZIG_LOCAL_CACHE_DIR=%CD%\.zig-cache"
+if "%ZIG_GLOBAL_CACHE_DIR%"=="" set "ZIG_GLOBAL_CACHE_DIR=%CD%\.zig-global-cache"
+for %%I in ("%ZIG_LOCAL_CACHE_DIR%") do set "_LOCAL_CACHE_DRIVE=%%~dI"
+for %%I in ("%ZIG_GLOBAL_CACHE_DIR%") do set "_GLOBAL_CACHE_DRIVE=%%~dI"
+if /i not "%_LOCAL_CACHE_DRIVE%"=="%_GLOBAL_CACHE_DRIVE%" set "ZIG_GLOBAL_CACHE_DIR=%CD%\.zig-global-cache"
 set "PATH=%GIT_CMD%;%GIT_USR_BIN%;%ZIG_HOME%;%PATH%"
 
 echo == Versions ==

@@ -30,6 +30,21 @@ Bare `zig build test` errors in this fork — pass `-Dtest-filter=<name>` or
 prefer the narrowest verification that covers your change, then run
 `zig build` before you finish.
 
+### Clean Windows baseline
+
+From the repository root, use the native shell wrapper for a clean build/test
+run:
+
+```powershell
+.\scripts\dev-windows.cmd zig build test -Dtest-filter=win32
+.\scripts\dev-windows.cmd zig build -Demit-exe=true
+```
+
+The wrapper keeps Zig's global and local caches on the worktree's volume.
+Zig 0.15.2's Windows build runner can panic when a generated child path and
+its dependency cwd are on different volumes. The focused guard is
+`test/windows/zig-cache-same-drive.ps1`.
+
 ## Toolchain
 
 This fork requires a **Zig 0.15.x release with patch ≥ 2**. The check is
@@ -50,6 +65,10 @@ powershell -ExecutionPolicy Bypass -File scripts/fetch-zig-deps.ps1
 The repo also ships `scripts/dev-windows.ps1` and `scripts/dev-windows.cmd`
 to open a Windows-native shell with the expected Visual Studio and Zig cache
 environment already configured.
+
+The pinned fork/base and validated Windows toolchain tuple, plus the Win32
+terminal `Surface` dependency map, are recorded in
+[docs/winghostty-baseline.md](docs/winghostty-baseline.md).
 
 ## Manual Validation
 

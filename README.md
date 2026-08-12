@@ -145,11 +145,11 @@ documented in **[docs/windows.md](docs/windows.md)**.
 ## Build from source
 
 Most users should install from Releases. Building needs Windows 10/11 on x64
-or ARM64, **Zig 0.15.x (patch ≥ 2)**, Visual Studio 2022 with the MSVC
-toolchain on PATH, and Git for Windows:
+or ARM64, **Zig 0.15.x (patch ≥ 2)**, Visual Studio 2019 or later with the
+MSVC toolchain, and Git for Windows:
 
 ```powershell
-zig build -Demit-exe=true
+.\scripts\dev-windows.cmd zig build -Demit-exe=true
 ```
 
 Output lands at `zig-out\bin\winghostty.exe`. Toolchain details, dependency

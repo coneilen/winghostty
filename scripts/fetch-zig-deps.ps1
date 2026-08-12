@@ -20,15 +20,11 @@ $zigExe = if ($env:ZIG_HOME -and (Test-Path (Join-Path $env:ZIG_HOME "zig.exe"))
     "zig.exe"
 }
 
-$globalCacheDir = if ($env:ZIG_GLOBAL_CACHE_DIR) {
-    $env:ZIG_GLOBAL_CACHE_DIR
-} else {
-    Join-Path $userHome "AppData\Local\zig"
-}
-
 $downloadDir = Join-Path (Get-Location) ".zig-cache\downloads"
-New-Item -ItemType Directory -Force -Path $globalCacheDir | Out-Null
 New-Item -ItemType Directory -Force -Path $downloadDir | Out-Null
+. (Join-Path $PSScriptRoot "zig-cache.ps1")
+$zigCache = Set-WinghosttyZigCacheEnvironment -RepoRoot (Get-Location).Path
+$globalCacheDir = $zigCache.Global
 
 $deps = @(
     @{ Url = "https://deps.files.ghostty.org/libxev-34fa50878aec6e5fa8f532867001ab3c36fae23e.tar.gz"; File = "libxev-34fa50878aec6e5fa8f532867001ab3c36fae23e.tar.gz" },
