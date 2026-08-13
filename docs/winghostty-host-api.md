@@ -22,6 +22,9 @@ independent of GraphCode product types.
   surface handles remain safe until explicit surface or host teardown.
 - Initial focus delivery is guarded against callbacks that destroy the surface
   or deinitialize the host reentrantly.
+- Surface creation is guarded before `CreateWindowExW`; synchronous parent
+  `WM_PARENTNOTIFY` teardown is deferred until creation unwinds and returns a
+  null surface after cleaning up any partial child window.
 - `winghostty_host_drain` is a non-blocking adapter hook; it does not pump or
   dispatch the caller's messages.
 

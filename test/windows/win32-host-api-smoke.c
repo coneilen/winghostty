@@ -19,6 +19,8 @@ typedef struct smoke_context {
     int loop_active;
     int destroy_on_focus;
     int deinit_on_focus;
+    int deinit_on_parent_notify;
+    int parent_notify_called;
     int reentrant_called;
     winghostty_result reentrant_result;
 } smoke_context;
@@ -33,11 +35,20 @@ static LRESULT CALLBACK parent_window_proc(
     WPARAM wparam,
     LPARAM lparam
 ) {
-    (void)wparam;
     (void)lparam;
 
     smoke_context *context = parent_context(hwnd);
     switch (message) {
+        case WM_PARENTNOTIFY:
+            if (context &&
+                LOWORD(wparam) == WM_CREATE &&
+                context->deinit_on_parent_notify &&
+                !context->parent_notify_called) {
+                context->parent_notify_called = 1;
+                context->reentrant_result =
+                    winghostty_host_deinitialize(context->host);
+            }
+            break;
         case WM_HOST_API_TRIGGER:
             if (context && context->surface) {
                 InvalidateRect(winghostty_surface_get_hwnd(context->surface), NULL, FALSE);
@@ -180,6 +191,37 @@ int main(void) {
         return fail();
     }
     context.loop_active = 0;
+
+    context.deinit_on_parent_notify = 1;
+    context.parent_notify_called = 0;
+    context.reentrant_result = WINGHOSTTY_INVALID_ARGUMENT;
+    options.focus = 0;
+    winghostty_surface *parent_notify_surface = NULL;
+    const winghostty_result parent_notify_create_result =
+        winghostty_host_create_surface(
+            context.host,
+            context.parent,
+            &options,
+            &parent_notify_surface
+        );
+    if (parent_notify_create_result != WINGHOSTTY_SHUTTING_DOWN ||
+        parent_notify_surface != NULL ||
+    !context.parent_notify_called ||
+        context.reentrant_result != WINGHOSTTY_OK) {
+        if (!context.parent_notify_called && context.host) {
+            winghostty_host_deinitialize(context.host);
+        }
+        DestroyWindow(context.parent);
+        return fail();
+    }
+    context.host = NULL;
+    context.deinit_on_parent_notify = 0;
+
+    if (winghostty_host_initialize(&context.host) != WINGHOSTTY_OK) {
+        DestroyWindow(context.parent);
+        return fail();
+    }
+    options.focus = 1;
 
     context.destroy_on_focus = 1;
     winghostty_surface *reentrant_destroy_surface = NULL;

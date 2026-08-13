@@ -8172,6 +8172,14 @@ Assert-WorkflowContract `
     -Path (Join-Path $repoRoot 'src\win32_host.zig') `
     -Pattern '(?s)pub export fn winghostty_host_initialize.*?pub export fn winghostty_host_deinitialize.*?pub export fn winghostty_host_create_surface.*?pub export fn winghostty_surface_destroy' `
     -Description 'Win32 host API owns explicit initialize/create/destroy lifecycle exports'
+Assert-WorkflowContract `
+    -Path (Join-Path $repoRoot 'src\win32_host.zig') `
+    -Pattern '(?s)state\.creation_depth \+= 1;\s+surface\.creation_in_progress = true;\s+const hwnd = CreateWindowExW.*?if \(state\.shutting_down\)' `
+    -Description 'Win32 host API guards child creation before synchronous parent reentrancy'
+Assert-WorkflowContract `
+    -Path (Join-Path $repoRoot 'test\windows\win32-host-api-smoke.c') `
+    -Pattern '(?s)case WM_PARENTNOTIFY:.*?deinit_on_parent_notify.*?winghostty_host_deinitialize.*?WINGHOSTTY_SHUTTING_DOWN' `
+    -Description 'Win32 host API smoke covers parent-notify deinitialization during child creation'
 Assert-WorkflowContractAbsent `
     -Path (Join-Path $repoRoot 'src\win32_host.zig') `
     -Pattern '(?i)GraphCode|App\.zig|Surface\.zig|apprt\.win32' `

@@ -377,6 +377,36 @@ fn requestSurfaceDestroy(surface: *SurfaceState) void {
     if (!surface.creation_in_progress) destroySurfaceNow(surface);
 }
 
+fn cleanupUnregisteredSurface(
+    surface: *SurfaceState,
+    hwnd: ?HWND,
+) void {
+    surface.destroying = true;
+    if (hwnd) |value| {
+        setUserData(value, null);
+        _ = DestroyWindow(value);
+        surface.hwnd = null;
+    }
+    surface.options.deinit();
+    allocator.destroy(surface);
+}
+
+fn finishUnregisteredSurfaceCreation(
+    state: *HostState,
+    surface: *SurfaceState,
+    hwnd: ?HWND,
+    result: Result,
+) Result {
+    surface.creation_in_progress = false;
+    cleanupUnregisteredSurface(surface, hwnd);
+    state.creation_depth -= 1;
+    const deinitialize_requested = state.deinitialize_requested;
+    if (deinitialize_requested and state.creation_depth == 0) {
+        deinitializeHost(state);
+    }
+    return if (deinitialize_requested) result_shutting_down else result;
+}
+
 fn deinitializeHost(state: *HostState) void {
     state.shutting_down = true;
     while (state.surfaces.items.len > 0) {
@@ -469,11 +499,8 @@ pub export fn winghostty_host_create_surface(
         .parent = parent_hwnd,
         .options = owned,
     };
-    errdefer {
-        surface.options.deinit();
-        allocator.destroy(surface);
-    }
-
+    state.creation_depth += 1;
+    surface.creation_in_progress = true;
     const hwnd = CreateWindowExW(
         0,
         class_name,
@@ -487,17 +514,34 @@ pub export fn winghostty_host_create_surface(
         null,
         GetModuleHandleW(null),
         surface,
-    ) orelse return result_win32_error;
+    ) orelse {
+        return finishUnregisteredSurfaceCreation(
+            state,
+            surface,
+            null,
+            result_win32_error,
+        );
+    };
     surface.hwnd = hwnd;
-    errdefer {
-        setUserData(hwnd, null);
-        _ = DestroyWindow(hwnd);
+
+    if (state.shutting_down) {
+        return finishUnregisteredSurfaceCreation(
+            state,
+            surface,
+            hwnd,
+            result_shutting_down,
+        );
     }
 
-    state.surfaces.append(allocator, surface) catch return result_out_of_memory;
+    state.surfaces.append(allocator, surface) catch {
+        return finishUnregisteredSurfaceCreation(
+            state,
+            surface,
+            hwnd,
+            result_out_of_memory,
+        );
+    };
 
-    state.creation_depth += 1;
-    surface.creation_in_progress = true;
     if (source.focus != 0) {
         _ = SetFocus(hwnd);
     }
