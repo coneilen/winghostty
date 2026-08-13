@@ -107,20 +107,18 @@ extern "user32" fn ShowWindow(hwnd: HWND, command: i32) callconv(.winapi) BOOL;
 extern "kernel32" fn GetCurrentThreadId() callconv(.winapi) DWORD;
 extern "kernel32" fn GetModuleHandleW(module: ?LPCWSTR) callconv(.winapi) HINSTANCE;
 
-pub const Result = enum(c_int) {
-    ok = 0,
-    invalid_argument = 1,
-    wrong_thread = 2,
-    out_of_memory = 3,
-    shutting_down = 4,
-    win32_error = 5,
-};
+pub const Result = i32;
+pub const Theme = i32;
 
-pub const Theme = enum(c_int) {
-    system = 0,
-    light = 1,
-    dark = 2,
-};
+const result_ok: Result = 0;
+const result_invalid_argument: Result = 1;
+const result_wrong_thread: Result = 2;
+const result_out_of_memory: Result = 3;
+const result_shutting_down: Result = 4;
+const result_win32_error: Result = 5;
+const result_surface_invalidated: Result = 6;
+
+const theme_system: Theme = 0;
 
 pub const Rect = extern struct {
     x: i32,
@@ -209,6 +207,8 @@ const SurfaceState = struct {
     parent: HWND,
     hwnd: ?HWND = null,
     options: OwnedOptions,
+    invalidated: bool = false,
+    creation_in_progress: bool = false,
     destroying: bool = false,
 };
 
@@ -216,6 +216,8 @@ const HostState = struct {
     thread_id: DWORD,
     surfaces: std.ArrayListUnmanaged(*SurfaceState) = .empty,
     shutting_down: bool = false,
+    deinitialize_requested: bool = false,
+    creation_depth: usize = 0,
 };
 
 fn duplicate(value: ?[*:0]const u8) !?[:0]u8 {
@@ -242,13 +244,16 @@ fn surfaceState(surface: ?*Surface) ?*SurfaceState {
 }
 
 fn checkHost(host: *HostState) Result {
-    if (host.shutting_down) return .shutting_down;
-    if (GetCurrentThreadId() != host.thread_id) return .wrong_thread;
-    return .ok;
+    if (host.shutting_down) return result_shutting_down;
+    if (GetCurrentThreadId() != host.thread_id) return result_wrong_thread;
+    return result_ok;
 }
 
 fn checkSurface(surface: *SurfaceState) Result {
-    return checkHost(surface.host);
+    const result = checkHost(surface.host);
+    if (result != result_ok) return result;
+    if (surface.invalidated) return result_surface_invalidated;
+    return result_ok;
 }
 
 fn registerSurfaceClass() void {
@@ -337,12 +342,7 @@ fn surfaceWindowProc(
             setUserData(hwnd, null);
             if (surface) |value| {
                 value.hwnd = null;
-                if (!value.destroying) {
-                    value.destroying = true;
-                    removeSurface(value.host, value);
-                    value.options.deinit();
-                    allocator.destroy(value);
-                }
+                if (!value.destroying) value.invalidated = true;
             }
             return DefWindowProcW(hwnd, message, wparam, lparam);
         },
@@ -360,7 +360,7 @@ fn removeSurface(host: *HostState, surface: *SurfaceState) void {
     }
 }
 
-fn destroySurface(surface: *SurfaceState) void {
+fn destroySurfaceNow(surface: *SurfaceState) void {
     surface.destroying = true;
     removeSurface(surface.host, surface);
     if (surface.hwnd) |hwnd| {
@@ -372,6 +372,21 @@ fn destroySurface(surface: *SurfaceState) void {
     allocator.destroy(surface);
 }
 
+fn requestSurfaceDestroy(surface: *SurfaceState) void {
+    surface.destroying = true;
+    if (!surface.creation_in_progress) destroySurfaceNow(surface);
+}
+
+fn deinitializeHost(state: *HostState) void {
+    state.shutting_down = true;
+    while (state.surfaces.items.len > 0) {
+        const surface = state.surfaces.items[state.surfaces.items.len - 1];
+        destroySurfaceNow(surface);
+    }
+    state.surfaces.deinit(allocator);
+    allocator.destroy(state);
+}
+
 pub export fn winghostty_surface_options_init(options: *SurfaceOptions) void {
     options.* = .{
         .command = null,
@@ -380,7 +395,7 @@ pub export fn winghostty_surface_options_init(options: *SurfaceOptions) void {
         .bounds = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
         .visible = 1,
         .focus = 0,
-        .theme = .system,
+        .theme = theme_system,
         .font_scale = 1.0,
         .callbacks = .{
             .on_exit = null,
@@ -397,29 +412,28 @@ pub export fn winghostty_surface_options_init(options: *SurfaceOptions) void {
 }
 
 pub export fn winghostty_host_initialize(out_host: ?*?*Host) Result {
-    const output = out_host orelse return .invalid_argument;
+    const output = out_host orelse return result_invalid_argument;
     output.* = null;
 
-    const host = allocator.create(HostState) catch return .out_of_memory;
+    const host = allocator.create(HostState) catch return result_out_of_memory;
     host.* = .{ .thread_id = GetCurrentThreadId() };
     registerSurfaceClass();
     output.* = hostHandle(host);
-    return .ok;
+    return result_ok;
 }
 
 pub export fn winghostty_host_deinitialize(host: ?*Host) Result {
-    const state = hostState(host) orelse return .invalid_argument;
+    const state = hostState(host) orelse return result_invalid_argument;
     const result = checkHost(state);
-    if (result != .ok) return result;
+    if (result != result_ok) return result;
 
     state.shutting_down = true;
-    while (state.surfaces.items.len > 0) {
-        const surface = state.surfaces.items[state.surfaces.items.len - 1];
-        destroySurface(surface);
+    if (state.creation_depth != 0) {
+        state.deinitialize_requested = true;
+        return result_ok;
     }
-    state.surfaces.deinit(allocator);
-    allocator.destroy(state);
-    return .ok;
+    deinitializeHost(state);
+    return result_ok;
 }
 
 pub export fn winghostty_host_create_surface(
@@ -428,27 +442,27 @@ pub export fn winghostty_host_create_surface(
     options: ?*const SurfaceOptions,
     out_surface: ?*?*Surface,
 ) Result {
-    const output = out_surface orelse return .invalid_argument;
+    const output = out_surface orelse return result_invalid_argument;
     output.* = null;
-    const state = hostState(host) orelse return .invalid_argument;
-    const parent_hwnd = parent orelse return .invalid_argument;
-    const source = options orelse return .invalid_argument;
+    const state = hostState(host) orelse return result_invalid_argument;
+    const parent_hwnd = parent orelse return result_invalid_argument;
+    const source = options orelse return result_invalid_argument;
     const thread_result = checkHost(state);
-    if (thread_result != .ok) return thread_result;
+    if (thread_result != result_ok) return thread_result;
     if (source.font_scale <= 0 or !std.math.isFinite(source.font_scale)) {
-        return .invalid_argument;
+        return result_invalid_argument;
     }
     if (source.bounds.width > std.math.maxInt(i32) or
         source.bounds.height > std.math.maxInt(i32))
     {
-        return .invalid_argument;
+        return result_invalid_argument;
     }
 
-    const owned = OwnedOptions.init(source) catch return .out_of_memory;
+    const owned = OwnedOptions.init(source) catch return result_out_of_memory;
     const surface = allocator.create(SurfaceState) catch {
         var cleanup = owned;
         cleanup.deinit();
-        return .out_of_memory;
+        return result_out_of_memory;
     };
     surface.* = .{
         .host = state,
@@ -473,43 +487,64 @@ pub export fn winghostty_host_create_surface(
         null,
         GetModuleHandleW(null),
         surface,
-    ) orelse return .win32_error;
+    ) orelse return result_win32_error;
     surface.hwnd = hwnd;
     errdefer {
         setUserData(hwnd, null);
         _ = DestroyWindow(hwnd);
     }
 
-    state.surfaces.append(allocator, surface) catch return .out_of_memory;
-    output.* = surfaceHandle(surface);
+    state.surfaces.append(allocator, surface) catch return result_out_of_memory;
 
+    state.creation_depth += 1;
+    surface.creation_in_progress = true;
     if (source.focus != 0) {
         _ = SetFocus(hwnd);
     }
-    return .ok;
+    surface.creation_in_progress = false;
+    state.creation_depth -= 1;
+
+    if (surface.destroying or surface.invalidated or state.shutting_down) {
+        const was_invalidated = surface.invalidated;
+        const was_shutting_down = state.shutting_down;
+        if (!surface.destroying) surface.destroying = true;
+        destroySurfaceNow(surface);
+        const deinitialize_requested = state.deinitialize_requested;
+        if (deinitialize_requested and state.creation_depth == 0) {
+            deinitializeHost(state);
+        }
+        return if (was_invalidated and !was_shutting_down)
+            result_surface_invalidated
+        else
+            result_shutting_down;
+    }
+
+    output.* = surfaceHandle(surface);
+    return result_ok;
 }
 
 pub export fn winghostty_surface_destroy(surface: ?*Surface) Result {
-    const state = surfaceState(surface) orelse return .invalid_argument;
-    const result = checkSurface(state);
-    if (result != .ok) return result;
-    destroySurface(state);
-    return .ok;
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const result = checkHost(state.host);
+    if (result != result_ok) return result;
+    if (state.destroying) return result_ok;
+    requestSurfaceDestroy(state);
+    return result_ok;
 }
 
 pub export fn winghostty_surface_set_bounds(
     surface: ?*Surface,
     bounds: ?*const Rect,
 ) Result {
-    const state = surfaceState(surface) orelse return .invalid_argument;
-    const next = bounds orelse return .invalid_argument;
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const next = bounds orelse return result_invalid_argument;
     const result = checkSurface(state);
-    if (result != .ok) return result;
+    if (result != result_ok) return result;
     if (next.width > std.math.maxInt(i32) or next.height > std.math.maxInt(i32)) {
-        return .invalid_argument;
+        return result_invalid_argument;
     }
     state.options.bounds = next.*;
-    const hwnd = state.hwnd orelse return .shutting_down;
+    const hwnd = state.hwnd orelse return result_shutting_down;
     if (SetWindowPos(
         hwnd,
         null,
@@ -518,149 +553,149 @@ pub export fn winghostty_surface_set_bounds(
         @intCast(next.width),
         @intCast(next.height),
         SWP_NOZORDER | SWP_NOACTIVATE,
-    ) == 0) return .win32_error;
-    return .ok;
+    ) == 0) return result_win32_error;
+    return result_ok;
 }
 
 pub export fn winghostty_surface_set_visible(
     surface: ?*Surface,
     visible: u8,
 ) Result {
-    const state = surfaceState(surface) orelse return .invalid_argument;
+    const state = surfaceState(surface) orelse return result_invalid_argument;
     const result = checkSurface(state);
-    if (result != .ok) return result;
+    if (result != result_ok) return result;
     state.options.visible = if (visible == 0) 0 else 1;
-    const hwnd = state.hwnd orelse return .shutting_down;
+    const hwnd = state.hwnd orelse return result_shutting_down;
     _ = ShowWindow(hwnd, if (state.options.visible != 0) SW_SHOW else SW_HIDE);
-    return .ok;
+    return result_ok;
 }
 
 pub export fn winghostty_surface_set_focus(
     surface: ?*Surface,
     focused: u8,
 ) Result {
-    const state = surfaceState(surface) orelse return .invalid_argument;
+    const state = surfaceState(surface) orelse return result_invalid_argument;
     const result = checkSurface(state);
-    if (result != .ok) return result;
+    if (result != result_ok) return result;
     state.options.focus = if (focused == 0) 0 else 1;
-    const hwnd = state.hwnd orelse return .shutting_down;
+    const hwnd = state.hwnd orelse return result_shutting_down;
     if (focused != 0) {
         _ = SetFocus(hwnd);
     } else if (GetFocus()) |current| {
         if (current == hwnd) _ = SetFocus(null);
     }
-    return .ok;
+    return result_ok;
 }
 
 pub export fn winghostty_surface_set_theme(
     surface: ?*Surface,
     theme: Theme,
 ) Result {
-    const state = surfaceState(surface) orelse return .invalid_argument;
+    const state = surfaceState(surface) orelse return result_invalid_argument;
     const result = checkSurface(state);
-    if (result != .ok) return result;
+    if (result != result_ok) return result;
     state.options.theme = theme;
     if (state.hwnd) |hwnd| _ = InvalidateRect(hwnd, null, 0);
-    return .ok;
+    return result_ok;
 }
 
 pub export fn winghostty_surface_set_font_scale(
     surface: ?*Surface,
     font_scale: f32,
 ) Result {
-    const state = surfaceState(surface) orelse return .invalid_argument;
+    const state = surfaceState(surface) orelse return result_invalid_argument;
     const result = checkSurface(state);
-    if (result != .ok) return result;
+    if (result != result_ok) return result;
     if (font_scale <= 0 or !std.math.isFinite(font_scale)) {
-        return .invalid_argument;
+        return result_invalid_argument;
     }
     state.options.font_scale = font_scale;
     if (state.hwnd) |hwnd| _ = InvalidateRect(hwnd, null, 0);
-    return .ok;
+    return result_ok;
 }
 
 pub export fn winghostty_surface_notify_exit(
     surface: ?*Surface,
     status: i32,
 ) Result {
-    const state = surfaceState(surface) orelse return .invalid_argument;
+    const state = surfaceState(surface) orelse return result_invalid_argument;
     const result = checkSurface(state);
-    if (result != .ok) return result;
+    if (result != result_ok) return result;
     if (state.options.callbacks.on_exit) |callback| {
         callback(state.options.user_data, surfaceHandle(state), status);
     }
-    return .ok;
+    return result_ok;
 }
 
 pub export fn winghostty_surface_notify_title(
     surface: ?*Surface,
     title: ?[*:0]const u8,
 ) Result {
-    const state = surfaceState(surface) orelse return .invalid_argument;
-    const value = title orelse return .invalid_argument;
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const value = title orelse return result_invalid_argument;
     const result = checkSurface(state);
-    if (result != .ok) return result;
+    if (result != result_ok) return result;
     if (state.options.callbacks.on_title) |callback| {
         callback(state.options.user_data, surfaceHandle(state), value);
     }
-    return .ok;
+    return result_ok;
 }
 
 pub export fn winghostty_surface_notify_cwd(
     surface: ?*Surface,
     cwd: ?[*:0]const u8,
 ) Result {
-    const state = surfaceState(surface) orelse return .invalid_argument;
-    const value = cwd orelse return .invalid_argument;
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const value = cwd orelse return result_invalid_argument;
     const result = checkSurface(state);
-    if (result != .ok) return result;
+    if (result != result_ok) return result;
     if (state.options.callbacks.on_cwd) |callback| {
         callback(state.options.user_data, surfaceHandle(state), value);
     }
-    return .ok;
+    return result_ok;
 }
 
 pub export fn winghostty_surface_notify_bell(surface: ?*Surface) Result {
-    const state = surfaceState(surface) orelse return .invalid_argument;
+    const state = surfaceState(surface) orelse return result_invalid_argument;
     const result = checkSurface(state);
-    if (result != .ok) return result;
+    if (result != result_ok) return result;
     if (state.options.callbacks.on_bell) |callback| {
         callback(state.options.user_data, surfaceHandle(state));
     }
-    return .ok;
+    return result_ok;
 }
 
 pub export fn winghostty_surface_notify_notification(
     surface: ?*Surface,
     notification: ?[*:0]const u8,
 ) Result {
-    const state = surfaceState(surface) orelse return .invalid_argument;
-    const value = notification orelse return .invalid_argument;
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const value = notification orelse return result_invalid_argument;
     const result = checkSurface(state);
-    if (result != .ok) return result;
+    if (result != result_ok) return result;
     if (state.options.callbacks.on_notification) |callback| {
         callback(state.options.user_data, surfaceHandle(state), value);
     }
-    return .ok;
+    return result_ok;
 }
 
 pub export fn winghostty_surface_notify_redraw(surface: ?*Surface) Result {
-    const state = surfaceState(surface) orelse return .invalid_argument;
+    const state = surfaceState(surface) orelse return result_invalid_argument;
     const result = checkSurface(state);
-    if (result != .ok) return result;
+    if (result != result_ok) return result;
     notifyRedraw(state);
-    return .ok;
+    return result_ok;
 }
 
 pub export fn winghostty_surface_notify_focus(
     surface: ?*Surface,
     focused: u8,
 ) Result {
-    const state = surfaceState(surface) orelse return .invalid_argument;
+    const state = surfaceState(surface) orelse return result_invalid_argument;
     const result = checkSurface(state);
-    if (result != .ok) return result;
+    if (result != result_ok) return result;
     notifyFocus(state, focused != 0);
-    return .ok;
+    return result_ok;
 }
 
 pub export fn winghostty_surface_notify_fatal_error(
@@ -668,19 +703,19 @@ pub export fn winghostty_surface_notify_fatal_error(
     result_code: Result,
     message: ?[*:0]const u8,
 ) Result {
-    const state = surfaceState(surface) orelse return .invalid_argument;
-    const value = message orelse return .invalid_argument;
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const value = message orelse return result_invalid_argument;
     const result = checkSurface(state);
-    if (result != .ok) return result;
+    if (result != result_ok) return result;
     if (state.options.callbacks.on_fatal_error) |callback| {
         callback(state.options.user_data, surfaceHandle(state), result_code, value);
     }
-    return .ok;
+    return result_ok;
 }
 
 pub export fn winghostty_surface_get_hwnd(surface: ?*const Surface) ?HWND {
     const state = surfaceState(@constCast(surface)) orelse return null;
-    if (checkSurface(state) != .ok or state.destroying) return null;
+    if (checkSurface(state) != result_ok or state.destroying) return null;
     return state.hwnd;
 }
 
@@ -688,11 +723,11 @@ pub export fn winghostty_host_drain(
     host: ?*Host,
     out_drained: ?*u32,
 ) Result {
-    const state = hostState(host) orelse return .invalid_argument;
+    const state = hostState(host) orelse return result_invalid_argument;
     const result = checkHost(state);
-    if (result != .ok) return result;
+    if (result != result_ok) return result;
     if (out_drained) |count| count.* = 0;
-    return .ok;
+    return result_ok;
 }
 
 test "SurfaceOptions copies caller-owned strings" {
@@ -706,7 +741,7 @@ test "SurfaceOptions copies caller-owned strings" {
         .bounds = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
         .visible = 0,
         .focus = 0,
-        .theme = .system,
+        .theme = theme_system,
         .font_scale = 1,
         .callbacks = .{
             .on_exit = null,

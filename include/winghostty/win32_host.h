@@ -11,20 +11,21 @@ extern "C" {
 typedef struct winghostty_host winghostty_host;
 typedef struct winghostty_surface winghostty_surface;
 
-typedef enum winghostty_result {
-    WINGHOSTTY_OK = 0,
-    WINGHOSTTY_INVALID_ARGUMENT = 1,
-    WINGHOSTTY_WRONG_THREAD = 2,
-    WINGHOSTTY_OUT_OF_MEMORY = 3,
-    WINGHOSTTY_SHUTTING_DOWN = 4,
-    WINGHOSTTY_WIN32_ERROR = 5,
-} winghostty_result;
+typedef int32_t winghostty_result;
 
-typedef enum winghostty_theme {
-    WINGHOSTTY_THEME_SYSTEM = 0,
-    WINGHOSTTY_THEME_LIGHT = 1,
-    WINGHOSTTY_THEME_DARK = 2,
-} winghostty_theme;
+#define WINGHOSTTY_OK ((winghostty_result)0)
+#define WINGHOSTTY_INVALID_ARGUMENT ((winghostty_result)1)
+#define WINGHOSTTY_WRONG_THREAD ((winghostty_result)2)
+#define WINGHOSTTY_OUT_OF_MEMORY ((winghostty_result)3)
+#define WINGHOSTTY_SHUTTING_DOWN ((winghostty_result)4)
+#define WINGHOSTTY_WIN32_ERROR ((winghostty_result)5)
+#define WINGHOSTTY_SURFACE_INVALIDATED ((winghostty_result)6)
+
+typedef int32_t winghostty_theme;
+
+#define WINGHOSTTY_THEME_SYSTEM ((winghostty_theme)0)
+#define WINGHOSTTY_THEME_LIGHT ((winghostty_theme)1)
+#define WINGHOSTTY_THEME_DARK ((winghostty_theme)2)
 
 typedef struct winghostty_rect {
     int32_t x;

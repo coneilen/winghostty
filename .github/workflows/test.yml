@@ -98,7 +98,7 @@ jobs:
         shell: pwsh
         run: ./test/windows/zig-cache-offline-build.ps1
 
-      - name: Win32 host API external compile contract
+      - name: Win32 host API external compile/layout contract
         shell: pwsh
         run: ./test/windows/compile-win32-host-api.ps1
 

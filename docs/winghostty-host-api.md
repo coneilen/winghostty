@@ -8,12 +8,20 @@ independent of GraphCode product types.
 
 - The caller owns the parent `HWND` and the sole Win32 message loop.
 - The host owns every child surface `HWND` and never destroys the parent.
+- ABI-facing result and theme values are fixed-width `int32_t` typedefs with
+  constants; the external contract checks C/C++ layouts with and without
+  `-fshort-enums`.
 - `winghostty_surface_options` is copied during creation, including strings
   and callback configuration.
 - All host and surface calls are UI-thread-affine to the thread that
   initialized the host.
 - Destroy is synchronous. It disables callbacks before destroying the child
-  window and frees copied options before returning.
+  window, drains no caller messages, and frees copied options before
+  returning; no callbacks occur after completion.
+- If the caller destroys the parent, child windows are invalidated but their
+  surface handles remain safe until explicit surface or host teardown.
+- Initial focus delivery is guarded against callbacks that destroy the surface
+  or deinitialize the host reentrantly.
 - `winghostty_host_drain` is a non-blocking adapter hook; it does not pump or
   dispatch the caller's messages.
 

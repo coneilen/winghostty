@@ -8166,8 +8166,8 @@ Assert-WorkflowContract `
     -Description 'Windows CI executes the forced cross-drive CMD cache regression'
 Assert-WorkflowContract `
     -Path $testWorkflow `
-    -Pattern '(?ms)- name: Win32 host API external compile contract\s+shell: pwsh\s+run: ./test/windows/compile-win32-host-api\.ps1.*?- name: Win32 host API lifecycle smoke\s+shell: pwsh\s+run: ./test/windows/run-win32-host-api-smoke\.ps1' `
-    -Description 'Windows CI compiles and exercises the external Win32 host API boundary'
+    -Pattern '(?ms)- name: Win32 host API external compile/layout contract\s+shell: pwsh\s+run: ./test/windows/compile-win32-host-api\.ps1.*?- name: Win32 host API lifecycle smoke\s+shell: pwsh\s+run: ./test/windows/run-win32-host-api-smoke\.ps1' `
+    -Description 'Windows CI compiles, checks layout, and exercises the external Win32 host API boundary'
 Assert-WorkflowContract `
     -Path (Join-Path $repoRoot 'src\win32_host.zig') `
     -Pattern '(?s)pub export fn winghostty_host_initialize.*?pub export fn winghostty_host_deinitialize.*?pub export fn winghostty_host_create_surface.*?pub export fn winghostty_surface_destroy' `
@@ -8176,6 +8176,18 @@ Assert-WorkflowContractAbsent `
     -Path (Join-Path $repoRoot 'src\win32_host.zig') `
     -Pattern '(?i)GraphCode|App\.zig|Surface\.zig|apprt\.win32' `
     -Description 'Win32 host API boundary does not import GraphCode or product surface types'
+Assert-WorkflowContract `
+    -Path (Join-Path $repoRoot 'include\winghostty\win32_host.h') `
+    -Pattern '(?s)typedef int32_t winghostty_result;.*?typedef int32_t winghostty_theme;' `
+    -Description 'Win32 host API uses fixed-width ABI typedefs instead of C enums'
+Assert-WorkflowContractAbsent `
+    -Path (Join-Path $repoRoot 'include\winghostty\win32_host.h') `
+    -Pattern 'typedef\s+enum\s+winghostty_(result|theme)' `
+    -Description 'Win32 host API header has no ABI-facing C enums'
+Assert-WorkflowContract `
+    -Path (Join-Path $repoRoot 'test\windows\compile-win32-host-api.ps1') `
+    -Pattern '(?s)-fshort-enums.*?zig.*?c\+\+.*?-fshort-enums' `
+    -Description 'Win32 host API layout contract covers C and C++ short-enum modes'
 Assert-WorkflowContract `
     -Path (Join-Path $repoRoot 'scripts\dev-windows.ps1') `
     -Pattern '(?s)\. \(Join-Path \$PSScriptRoot "zig-cache\.ps1"\).*?Set-WinghosttyZigCacheEnvironment' `

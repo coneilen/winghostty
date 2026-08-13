@@ -1,4 +1,49 @@
 #include "../../include/winghostty/win32_host.h"
+#include <stddef.h>
+
+#if defined(__cplusplus)
+#define WINGHOSTTY_LAYOUT_ASSERT static_assert
+#else
+#define WINGHOSTTY_LAYOUT_ASSERT _Static_assert
+#endif
+
+WINGHOSTTY_LAYOUT_ASSERT(
+    sizeof(winghostty_result) == sizeof(int32_t),
+    "winghostty_result must remain int32_t"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    sizeof(winghostty_theme) == sizeof(int32_t),
+    "winghostty_theme must remain int32_t"
+);
+WINGHOSTTY_LAYOUT_ASSERT(sizeof(winghostty_rect) == 16, "rect ABI changed");
+WINGHOSTTY_LAYOUT_ASSERT(
+    offsetof(winghostty_rect, width) == 8,
+    "rect width offset changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    sizeof(winghostty_callbacks) == 64,
+    "callback ABI changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    offsetof(winghostty_callbacks, on_fatal_error) == 56,
+    "fatal callback offset changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    sizeof(winghostty_surface_options) == 128,
+    "surface options ABI changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    offsetof(winghostty_surface_options, theme) == 44,
+    "surface theme offset changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    offsetof(winghostty_surface_options, callbacks) == 56,
+    "surface callbacks offset changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    offsetof(winghostty_surface_options, user_data) == 120,
+    "surface user data offset changed"
+);
 
 static void on_exit(void *user_data, winghostty_surface *surface, int32_t status) {
     (void)user_data;
