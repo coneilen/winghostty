@@ -33,6 +33,13 @@ typedef struct render_call {
 static int current_matches(winghostty_surface *surface);
 static int current_is_clear(void);
 
+typedef struct teardown_stress {
+    winghostty_surface *surface;
+    volatile LONG stop;
+    volatile LONG entered;
+    volatile LONG failures;
+} teardown_stress;
+
 static LRESULT CALLBACK parent_window_proc(
     HWND hwnd,
     UINT message,
@@ -89,6 +96,43 @@ static DWORD WINAPI render_thread(void *parameter) {
     winghostty_rect bounds = {0, 0, 11, 11};
     call->ui_call_result =
         winghostty_surface_set_bounds(call->surface, &bounds);
+    return 0;
+}
+
+static int renderer_result_allowed(winghostty_result result) {
+    return result == WINGHOSTTY_OK ||
+        result == WINGHOSTTY_INVALID_ARGUMENT ||
+        result == WINGHOSTTY_WRONG_THREAD ||
+        result == WINGHOSTTY_SHUTTING_DOWN ||
+        result == WINGHOSTTY_SURFACE_INVALIDATED ||
+        result == WINGHOSTTY_RENDERER_ERROR ||
+        result == WINGHOSTTY_CONTEXT_ERROR ||
+        result == WINGHOSTTY_PRESENT_ERROR;
+}
+
+static DWORD WINAPI teardown_stress_thread(void *parameter) {
+    teardown_stress *stress = (teardown_stress *)parameter;
+    while (InterlockedCompareExchange(&stress->stop, 0, 0) == 0) {
+        InterlockedIncrement(&stress->entered);
+        winghostty_result result =
+            winghostty_surface_make_current(stress->surface);
+        if (!renderer_result_allowed(result)) {
+            InterlockedIncrement(&stress->failures);
+        }
+        result = winghostty_surface_render(stress->surface);
+        if (!renderer_result_allowed(result)) {
+            InterlockedIncrement(&stress->failures);
+        }
+        result = winghostty_surface_present(stress->surface);
+        if (!renderer_result_allowed(result)) {
+            InterlockedIncrement(&stress->failures);
+        }
+        result = winghostty_surface_clear_current(stress->surface);
+        if (!renderer_result_allowed(result)) {
+            InterlockedIncrement(&stress->failures);
+        }
+        Sleep(1);
+    }
     return 0;
 }
 
@@ -381,6 +425,88 @@ static int run_persistent_teardown_contract(HWND parent) {
     return 0;
 }
 
+static int run_teardown_admission_contract(HWND parent, int destroy_surface) {
+    winghostty_host *host = NULL;
+    winghostty_surface *surface = NULL;
+    winghostty_surface_options options;
+    teardown_stress stress = {0};
+
+    if (winghostty_host_initialize(&host) != WINGHOSTTY_OK) {
+        return fail("teardown-race host initialization failed");
+    }
+    winghostty_surface_options_init(&options);
+    options.visible = 0;
+    options.bounds.width = 80;
+    options.bounds.height = 40;
+    if (winghostty_host_create_surface(host, parent, &options, &surface) !=
+            WINGHOSTTY_OK ||
+        surface == NULL) {
+        winghostty_host_deinitialize(host);
+        return fail("teardown-race surface creation failed");
+    }
+
+    stress.surface = surface;
+    HANDLE thread = CreateThread(NULL, 0, teardown_stress_thread, &stress, 0, NULL);
+    if (thread == NULL) {
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return fail("teardown-race worker creation failed");
+    }
+    for (int i = 0; i < 100 && stress.entered == 0; ++i) {
+        Sleep(1);
+    }
+    if (check(stress.entered != 0, "teardown-race worker did not enter renderer")) {
+        InterlockedExchange(&stress.stop, 1);
+        WaitForSingleObject(thread, 10000);
+        CloseHandle(thread);
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return 1;
+    }
+
+    winghostty_result teardown_result;
+    if (destroy_surface) {
+        teardown_result = winghostty_surface_destroy(surface);
+    } else {
+        teardown_result = winghostty_host_deinitialize(host);
+    }
+    if (check(
+            teardown_result == WINGHOSTTY_OK,
+            destroy_surface
+                ? "surface destroy admission race failed"
+                : "host deinitialize admission race failed"
+        )) {
+        InterlockedExchange(&stress.stop, 1);
+        WaitForSingleObject(thread, 10000);
+        CloseHandle(thread);
+        if (destroy_surface) winghostty_host_deinitialize(host);
+        return 1;
+    }
+
+    InterlockedExchange(&stress.stop, 1);
+    if (check(
+            WaitForSingleObject(thread, 10000) == WAIT_OBJECT_0,
+            "teardown-race worker did not terminate"
+        )) {
+        CloseHandle(thread);
+        return 1;
+    }
+    CloseHandle(thread);
+    if (check(stress.failures == 0, "teardown-race returned an invalid result")) {
+        return 1;
+    }
+
+    if (destroy_surface) {
+        if (check(
+                winghostty_host_deinitialize(host) == WINGHOSTTY_OK,
+                "surface-race host teardown failed"
+            )) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int main(void) {
     test_state state = {
         .ui_thread = GetCurrentThreadId(),
@@ -396,6 +522,11 @@ int main(void) {
         return 1;
     }
     if (run_persistent_teardown_contract(state.parent) != 0) {
+        DestroyWindow(state.parent);
+        return 1;
+    }
+    if (run_teardown_admission_contract(state.parent, 1) != 0 ||
+        run_teardown_admission_contract(state.parent, 0) != 0) {
         DestroyWindow(state.parent);
         return 1;
     }

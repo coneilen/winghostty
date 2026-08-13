@@ -29,6 +29,10 @@ independent of GraphCode product types.
 - Destroy is synchronous. It disables callbacks before destroying the child
   window, drains no caller messages, and frees copied options before
   returning; no callbacks occur after completion.
+- Renderer entry points take a lifetime admission before touching surface,
+  host, or WGL state. Teardown closes new admissions and waits for admitted
+  calls and active operations before freeing the surface, host, or renderer;
+  calls racing a completed teardown are rejected safely.
 - If teardown is waiting for a persistent context owned by another render
   thread, that thread may call `winghostty_surface_clear_current` to release
   it and allow synchronous destruction to complete.

@@ -234,6 +234,8 @@ pub const Context = struct {
     }
 
     pub fn clearCurrent(self: *Context) void {
+        self.operation_mutex.lock();
+        defer self.operation_mutex.unlock();
         const actual_current = currentBinding().matches(self);
         if (!self.persistent_current and !actual_current) return;
         if (actual_current) {
@@ -241,7 +243,9 @@ pub const Context = struct {
         }
         if (self.persistent_current) {
             self.persistent_current = false;
-            self.endOperation();
+            std.debug.assert(self.active_operations > 0);
+            self.active_operations -= 1;
+            if (self.active_operations == 0) self.operation_done.broadcast();
         }
     }
 

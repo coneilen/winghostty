@@ -253,7 +253,8 @@ Before the fix, loading the DLL would crash with "access violation writing
 External host contract for the embeddable renderer. It validates caller-owned
 parenting, child HWND/HDC/HGLRC ownership, UI/render thread affinity,
 visibility/bounds/theme/font-scale updates, synchronous WGL presentation and
-teardown, plus 100 create/destroy cycles with USER/GDI handle counts.
+teardown, renderer-entry races against surface/host destruction, and 100
+create/destroy cycles with USER/GDI handle counts.
 
 ```powershell
 .\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\test\windows\run-win32-host-renderer.ps1

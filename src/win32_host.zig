@@ -209,33 +209,49 @@ const OwnedOptions = struct {
     }
 };
 
+const AdmissionState = struct {
+    mutex: std.Thread.Mutex = .{},
+    done: std.Thread.Condition = .{},
+    accepting: bool = true,
+    clearable: bool = true,
+    admitted: usize = 0,
+    clear_admitted: usize = 0,
+};
+
 const SurfaceState = struct {
     host: *HostState,
     parent: HWND,
     hwnd: ?HWND = null,
     options: OwnedOptions,
+    admission: AdmissionState = .{},
     options_mutex: std.Thread.Mutex = .{},
     renderer: ?*win32_context.Context = null,
+    retired_renderer: ?*win32_context.Context = null,
     renderer_mutex: std.Thread.Mutex = .{},
     renderer_done: std.Thread.Condition = .{},
     active_renderer_operations: usize = 0,
     renderer_destroying: bool = false,
     last_error: std.atomic.Value(DWORD) = .init(0),
     present_count: std.atomic.Value(u64) = .init(0),
-    invalidated: bool = false,
+    invalidated: std.atomic.Value(bool) = .init(false),
     creation_in_progress: bool = false,
-    destroying: bool = false,
+    destroying: std.atomic.Value(bool) = .init(false),
 };
 
 const HostState = struct {
     thread_id: DWORD,
     surfaces: std.ArrayListUnmanaged(*SurfaceState) = .empty,
-    shutting_down: bool = false,
+    admission: AdmissionState = .{},
+    shutting_down: std.atomic.Value(bool) = .init(false),
     deinitialize_requested: bool = false,
     creation_depth: usize = 0,
     render_thread_mutex: std.Thread.Mutex = .{},
     render_thread_id: DWORD = 0,
 };
+
+var admission_registry_mutex: std.Thread.Mutex = .{};
+var host_registry: std.AutoHashMapUnmanaged(usize, *HostState) = .empty;
+var surface_registry: std.AutoHashMapUnmanaged(usize, *SurfaceState) = .empty;
 
 fn duplicate(value: ?[*:0]const u8) !?[:0]u8 {
     const source = value orelse return null;
@@ -260,8 +276,186 @@ fn surfaceState(surface: ?*Surface) ?*SurfaceState {
     return @ptrCast(@alignCast(handle));
 }
 
+const HostAdmission = struct {
+    state: *HostState,
+    released: bool = false,
+};
+
+const SurfaceAdmission = struct {
+    surface: *SurfaceState,
+    host: ?*HostState = null,
+    clear: bool = false,
+    released: bool = false,
+};
+
+fn registerHost(state: *HostState) !void {
+    admission_registry_mutex.lock();
+    defer admission_registry_mutex.unlock();
+    try host_registry.put(allocator, @intFromPtr(state), state);
+}
+
+fn registerSurface(state: *SurfaceState) !void {
+    admission_registry_mutex.lock();
+    defer admission_registry_mutex.unlock();
+    try surface_registry.put(allocator, @intFromPtr(state), state);
+}
+
+fn unregisterHost(state: *HostState) void {
+    admission_registry_mutex.lock();
+    defer admission_registry_mutex.unlock();
+    _ = host_registry.remove(@intFromPtr(state));
+    if (host_registry.count() == 0 and surface_registry.count() == 0) {
+        host_registry.deinit(allocator);
+        surface_registry.deinit(allocator);
+        host_registry = .empty;
+        surface_registry = .empty;
+    }
+}
+
+fn unregisterSurface(state: *SurfaceState) void {
+    admission_registry_mutex.lock();
+    defer admission_registry_mutex.unlock();
+    _ = surface_registry.remove(@intFromPtr(state));
+    if (host_registry.count() == 0 and surface_registry.count() == 0) {
+        host_registry.deinit(allocator);
+        surface_registry.deinit(allocator);
+        host_registry = .empty;
+        surface_registry = .empty;
+    }
+}
+
+fn admitHost(handle: ?*Host) ?HostAdmission {
+    const pointer = handle orelse return null;
+    admission_registry_mutex.lock();
+    defer admission_registry_mutex.unlock();
+    const state = host_registry.get(@intFromPtr(pointer)) orelse return null;
+    state.admission.mutex.lock();
+    defer state.admission.mutex.unlock();
+    if (!state.admission.accepting) return null;
+    state.admission.admitted += 1;
+    return .{ .state = state };
+}
+
+fn admitSurface(handle: ?*Surface) ?SurfaceAdmission {
+    const pointer = handle orelse return null;
+    admission_registry_mutex.lock();
+    defer admission_registry_mutex.unlock();
+    const surface = surface_registry.get(@intFromPtr(pointer)) orelse return null;
+    surface.admission.mutex.lock();
+    defer surface.admission.mutex.unlock();
+    if (!surface.admission.accepting) return null;
+
+    const host = surface.host;
+    const host_admission = host_registry.get(@intFromPtr(host)) orelse return null;
+    host_admission.admission.mutex.lock();
+    defer host_admission.admission.mutex.unlock();
+    if (!host_admission.admission.accepting) return null;
+
+    surface.admission.admitted += 1;
+    host_admission.admission.admitted += 1;
+    return .{
+        .surface = surface,
+        .host = host_admission,
+    };
+}
+
+fn admitClearSurface(handle: ?*Surface) ?SurfaceAdmission {
+    const pointer = handle orelse return null;
+    admission_registry_mutex.lock();
+    defer admission_registry_mutex.unlock();
+    const surface = surface_registry.get(@intFromPtr(pointer)) orelse return null;
+    surface.admission.mutex.lock();
+    defer surface.admission.mutex.unlock();
+    if (!surface.admission.clearable) return null;
+    surface.admission.clear_admitted += 1;
+    return .{
+        .surface = surface,
+        .clear = true,
+    };
+}
+
+fn releaseHostAdmission(admission: *HostAdmission) void {
+    if (admission.released) return;
+    admission.state.admission.mutex.lock();
+    std.debug.assert(admission.state.admission.admitted > 0);
+    admission.state.admission.admitted -= 1;
+    admission.state.admission.done.broadcast();
+    admission.state.admission.mutex.unlock();
+    admission.released = true;
+}
+
+fn releaseSurfaceAdmission(admission: *SurfaceAdmission) void {
+    if (admission.released) return;
+    admission.surface.admission.mutex.lock();
+    if (admission.clear) {
+        std.debug.assert(admission.surface.admission.clear_admitted > 0);
+        admission.surface.admission.clear_admitted -= 1;
+    } else {
+        std.debug.assert(admission.surface.admission.admitted > 0);
+        admission.surface.admission.admitted -= 1;
+    }
+    admission.surface.admission.done.broadcast();
+    admission.surface.admission.mutex.unlock();
+    if (admission.host) |host| {
+        host.admission.mutex.lock();
+        std.debug.assert(host.admission.admitted > 0);
+        host.admission.admitted -= 1;
+        host.admission.done.broadcast();
+        host.admission.mutex.unlock();
+    }
+    admission.released = true;
+}
+
+fn closeHostAdmission(state: *HostState) void {
+    admission_registry_mutex.lock();
+    state.admission.mutex.lock();
+    state.admission.accepting = false;
+    state.shutting_down.store(true, .release);
+    _ = host_registry.remove(@intFromPtr(state));
+    state.admission.mutex.unlock();
+    admission_registry_mutex.unlock();
+}
+
+fn closeSurfaceAdmission(state: *SurfaceState) void {
+    admission_registry_mutex.lock();
+    state.admission.mutex.lock();
+    state.admission.accepting = false;
+    state.admission.mutex.unlock();
+    admission_registry_mutex.unlock();
+}
+
+fn waitHostAdmissions(state: *HostState, remaining: usize) void {
+    state.admission.mutex.lock();
+    while (state.admission.admitted > remaining) {
+        state.admission.done.wait(&state.admission.mutex);
+    }
+    state.admission.mutex.unlock();
+}
+
+fn waitSurfaceAdmissions(state: *SurfaceState, remaining: usize) void {
+    state.admission.mutex.lock();
+    while (state.admission.admitted > remaining) {
+        state.admission.done.wait(&state.admission.mutex);
+    }
+    state.admission.mutex.unlock();
+}
+
+fn disableClearAdmissionAndWait(
+    state: *SurfaceState,
+    remaining: usize,
+) void {
+    state.admission.mutex.lock();
+    state.admission.clearable = false;
+    while (state.admission.admitted > remaining or
+        state.admission.clear_admitted != 0)
+    {
+        state.admission.done.wait(&state.admission.mutex);
+    }
+    state.admission.mutex.unlock();
+}
+
 fn checkHost(host: *HostState) Result {
-    if (host.shutting_down) return result_shutting_down;
+    if (host.shutting_down.load(.acquire)) return result_shutting_down;
     if (GetCurrentThreadId() != host.thread_id) return result_wrong_thread;
     return result_ok;
 }
@@ -269,18 +463,22 @@ fn checkHost(host: *HostState) Result {
 fn checkSurface(surface: *SurfaceState) Result {
     const result = checkHost(surface.host);
     if (result != result_ok) return result;
-    if (surface.invalidated) return result_surface_invalidated;
+    if (surface.invalidated.load(.acquire)) return result_surface_invalidated;
     return result_ok;
 }
 
 fn checkRenderSurface(surface: *SurfaceState) Result {
-    if (surface.host.shutting_down) return result_shutting_down;
-    if (surface.invalidated or surface.destroying) return result_surface_invalidated;
+    if (surface.host.shutting_down.load(.acquire)) return result_shutting_down;
+    if (surface.invalidated.load(.acquire) or
+        surface.destroying.load(.acquire))
+    {
+        return result_surface_invalidated;
+    }
     return result_ok;
 }
 
 fn claimRenderThread(host: *HostState) Result {
-    if (host.shutting_down) return result_shutting_down;
+    if (host.shutting_down.load(.acquire)) return result_shutting_down;
     const thread_id = GetCurrentThreadId();
     host.render_thread_mutex.lock();
     defer host.render_thread_mutex.unlock();
@@ -318,21 +516,35 @@ fn destroyRenderer(surface: *SurfaceState) void {
 
     if (renderer) |value| {
         value.deinit();
-        allocator.destroy(value);
     }
 
     surface.renderer_mutex.lock();
-    surface.renderer = null;
+    if (renderer) |value| {
+        if (surface.renderer == value) {
+            surface.renderer = null;
+            surface.retired_renderer = value;
+        }
+    }
     surface.renderer_destroying = false;
     surface.renderer_done.broadcast();
     surface.renderer_mutex.unlock();
 }
 
+fn freeRendererStorage(surface: *SurfaceState) void {
+    if (surface.retired_renderer) |renderer| {
+        allocator.destroy(renderer);
+        surface.retired_renderer = null;
+    }
+}
+
 fn beginRendererOperation(surface: *SurfaceState) ?*win32_context.Context {
-    if (surface.host.shutting_down) return null;
+    if (surface.host.shutting_down.load(.acquire)) return null;
     surface.renderer_mutex.lock();
     defer surface.renderer_mutex.unlock();
-    if (surface.invalidated or surface.destroying or surface.renderer_destroying) {
+    if (surface.invalidated.load(.acquire) or
+        surface.destroying.load(.acquire) or
+        surface.renderer_destroying)
+    {
         return null;
     }
     const renderer = surface.renderer orelse return null;
@@ -343,7 +555,6 @@ fn beginRendererOperation(surface: *SurfaceState) ?*win32_context.Context {
 fn beginClearRendererOperation(surface: *SurfaceState) ?*win32_context.Context {
     surface.renderer_mutex.lock();
     defer surface.renderer_mutex.unlock();
-    if (surface.host.render_thread_id != GetCurrentThreadId()) return null;
     const renderer = surface.renderer orelse return null;
     surface.active_renderer_operations += 1;
     return renderer;
@@ -362,7 +573,10 @@ fn endRendererOperation(surface: *SurfaceState) void {
 fn rendererHdc(surface: *SurfaceState) HDC {
     surface.renderer_mutex.lock();
     defer surface.renderer_mutex.unlock();
-    if (surface.invalidated or surface.destroying or surface.renderer_destroying) {
+    if (surface.invalidated.load(.acquire) or
+        surface.destroying.load(.acquire) or
+        surface.renderer_destroying)
+    {
         return null;
     }
     return if (surface.renderer) |renderer| renderer.hdc else null;
@@ -371,7 +585,10 @@ fn rendererHdc(surface: *SurfaceState) HDC {
 fn rendererHglrc(surface: *SurfaceState) HGLRC {
     surface.renderer_mutex.lock();
     defer surface.renderer_mutex.unlock();
-    if (surface.invalidated or surface.destroying or surface.renderer_destroying) {
+    if (surface.invalidated.load(.acquire) or
+        surface.destroying.load(.acquire) or
+        surface.renderer_destroying)
+    {
         return null;
     }
     return if (surface.renderer) |renderer| renderer.hglrc else null;
@@ -418,7 +635,7 @@ fn setUserData(hwnd: HWND, surface: ?*SurfaceState) void {
 }
 
 fn notifyFocus(surface: *SurfaceState, focused: bool) void {
-    if (surface.destroying) return;
+    if (surface.destroying.load(.acquire)) return;
     if (surface.options.callbacks.on_focus) |callback| {
         callback(
             surface.options.user_data,
@@ -429,7 +646,7 @@ fn notifyFocus(surface: *SurfaceState, focused: bool) void {
 }
 
 fn notifyRedraw(surface: *SurfaceState) void {
-    if (surface.destroying) return;
+    if (surface.destroying.load(.acquire)) return;
     if (surface.options.callbacks.on_redraw) |callback| {
         callback(surface.options.user_data, surfaceHandle(surface));
     }
@@ -472,7 +689,9 @@ fn surfaceWindowProc(
             if (surface) |value| {
                 value.hwnd = null;
                 destroyRenderer(value);
-                if (!value.destroying) value.invalidated = true;
+                if (!value.destroying.load(.acquire)) {
+                    value.invalidated.store(true, .release);
+                }
             }
             return DefWindowProcW(hwnd, message, wparam, lparam);
         },
@@ -490,36 +709,37 @@ fn removeSurface(host: *HostState, surface: *SurfaceState) void {
     }
 }
 
-fn destroySurfaceNow(surface: *SurfaceState) void {
-    surface.destroying = true;
+fn destroySurfaceNow(
+    surface: *SurfaceState,
+    remaining_admissions: usize,
+) void {
+    surface.destroying.store(true, .release);
     removeSurface(surface.host, surface);
+    waitSurfaceAdmissions(surface, remaining_admissions);
     if (surface.hwnd) |hwnd| {
         setUserData(hwnd, null);
         _ = DestroyWindow(hwnd);
         surface.hwnd = null;
     }
     destroyRenderer(surface);
+    disableClearAdmissionAndWait(surface, remaining_admissions);
+    unregisterSurface(surface);
+    freeRendererStorage(surface);
     surface.options.deinit();
-    allocator.destroy(surface);
-}
-
-fn requestSurfaceDestroy(surface: *SurfaceState) void {
-    surface.destroying = true;
-    if (!surface.creation_in_progress) destroySurfaceNow(surface);
 }
 
 fn cleanupUnregisteredSurface(
     surface: *SurfaceState,
     hwnd: ?HWND,
 ) void {
-    surface.destroying = true;
+    surface.destroying.store(true, .release);
     if (hwnd) |value| {
         setUserData(value, null);
         _ = DestroyWindow(value);
         surface.hwnd = null;
     }
-    destroyRenderer(surface);
-    surface.options.deinit();
+    closeSurfaceAdmission(surface);
+    destroySurfaceNow(surface, 0);
     allocator.destroy(surface);
 }
 
@@ -534,19 +754,26 @@ fn finishUnregisteredSurfaceCreation(
     state.creation_depth -= 1;
     const deinitialize_requested = state.deinitialize_requested;
     if (deinitialize_requested and state.creation_depth == 0) {
-        deinitializeHost(state);
+        deinitializeHost(state, 0);
+        allocator.destroy(state);
     }
     return if (deinitialize_requested) result_shutting_down else result;
 }
 
-fn deinitializeHost(state: *HostState) void {
-    state.shutting_down = true;
+fn deinitializeHost(
+    state: *HostState,
+    remaining_host_admissions: usize,
+) void {
+    closeHostAdmission(state);
+    waitHostAdmissions(state, remaining_host_admissions);
     while (state.surfaces.items.len > 0) {
         const surface = state.surfaces.items[state.surfaces.items.len - 1];
-        destroySurfaceNow(surface);
+        closeSurfaceAdmission(surface);
+        destroySurfaceNow(surface, 0);
+        allocator.destroy(surface);
     }
     state.surfaces.deinit(allocator);
-    allocator.destroy(state);
+    unregisterHost(state);
 }
 
 pub export fn winghostty_surface_options_init(options: *SurfaceOptions) void {
@@ -579,22 +806,33 @@ pub export fn winghostty_host_initialize(out_host: ?*?*Host) Result {
 
     const host = allocator.create(HostState) catch return result_out_of_memory;
     host.* = .{ .thread_id = GetCurrentThreadId() };
+    registerHost(host) catch {
+        allocator.destroy(host);
+        return result_out_of_memory;
+    };
     registerSurfaceClass();
     output.* = hostHandle(host);
     return result_ok;
 }
 
 pub export fn winghostty_host_deinitialize(host: ?*Host) Result {
-    const state = hostState(host) orelse return result_invalid_argument;
+    var admission = admitHost(host) orelse return result_invalid_argument;
+    const state = admission.state;
     const result = checkHost(state);
-    if (result != result_ok) return result;
+    if (result != result_ok) {
+        releaseHostAdmission(&admission);
+        return result;
+    }
 
-    state.shutting_down = true;
+    state.shutting_down.store(true, .release);
     if (state.creation_depth != 0) {
         state.deinitialize_requested = true;
+        releaseHostAdmission(&admission);
         return result_ok;
     }
-    deinitializeHost(state);
+    deinitializeHost(state, 1);
+    releaseHostAdmission(&admission);
+    allocator.destroy(state);
     return result_ok;
 }
 
@@ -634,6 +872,11 @@ pub export fn winghostty_host_create_surface(
         .parent = parent_hwnd,
         .options = owned,
     };
+    registerSurface(surface) catch {
+        surface.options.deinit();
+        allocator.destroy(surface);
+        return result_out_of_memory;
+    };
     state.creation_depth += 1;
     surface.creation_in_progress = true;
     const hwnd = CreateWindowExW(
@@ -659,7 +902,7 @@ pub export fn winghostty_host_create_surface(
     };
     surface.hwnd = hwnd;
 
-    if (state.shutting_down) {
+    if (state.shutting_down.load(.acquire)) {
         return finishUnregisteredSurfaceCreation(
             state,
             surface,
@@ -710,14 +953,22 @@ pub export fn winghostty_host_create_surface(
     surface.creation_in_progress = false;
     state.creation_depth -= 1;
 
-    if (surface.destroying or surface.invalidated or state.shutting_down) {
-        const was_invalidated = surface.invalidated;
-        const was_shutting_down = state.shutting_down;
-        if (!surface.destroying) surface.destroying = true;
-        destroySurfaceNow(surface);
+    if (surface.destroying.load(.acquire) or
+        surface.invalidated.load(.acquire) or
+        state.shutting_down.load(.acquire))
+    {
+        const was_invalidated = surface.invalidated.load(.acquire);
+        const was_shutting_down = state.shutting_down.load(.acquire);
+        if (!surface.destroying.load(.acquire)) {
+            surface.destroying.store(true, .release);
+        }
+        closeSurfaceAdmission(surface);
+        destroySurfaceNow(surface, 0);
+        allocator.destroy(surface);
         const deinitialize_requested = state.deinitialize_requested;
         if (deinitialize_requested and state.creation_depth == 0) {
-            deinitializeHost(state);
+            deinitializeHost(state, 0);
+            allocator.destroy(state);
         }
         return if (was_invalidated and !was_shutting_down)
             result_surface_invalidated
@@ -730,11 +981,26 @@ pub export fn winghostty_host_create_surface(
 }
 
 pub export fn winghostty_surface_destroy(surface: ?*Surface) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse return result_invalid_argument;
+    const state = admission.surface;
     const result = checkHost(state.host);
-    if (result != result_ok) return result;
-    if (state.destroying) return result_ok;
-    requestSurfaceDestroy(state);
+    if (result != result_ok) {
+        releaseSurfaceAdmission(&admission);
+        return result;
+    }
+    if (state.destroying.load(.acquire)) {
+        releaseSurfaceAdmission(&admission);
+        return result_ok;
+    }
+    if (state.creation_in_progress) {
+        state.destroying.store(true, .release);
+        releaseSurfaceAdmission(&admission);
+        return result_ok;
+    }
+    closeSurfaceAdmission(state);
+    destroySurfaceNow(state, 1);
+    releaseSurfaceAdmission(&admission);
+    allocator.destroy(state);
     return result_ok;
 }
 
@@ -828,13 +1094,15 @@ pub export fn winghostty_surface_set_font_scale(
 }
 
 pub export fn winghostty_surface_make_current(surface: ?*Surface) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse return result_invalid_argument;
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
     const result = checkRenderSurface(state);
     if (result != result_ok) return result;
     const render_result = claimRenderThread(state.host);
     if (render_result != result_ok) return render_result;
     const renderer = beginRendererOperation(state) orelse
-        return if (state.host.shutting_down)
+        return if (state.host.shutting_down.load(.acquire))
             result_shutting_down
         else
             result_surface_invalidated;
@@ -844,8 +1112,13 @@ pub export fn winghostty_surface_make_current(surface: ?*Surface) Result {
 }
 
 pub export fn winghostty_surface_clear_current(surface: ?*Surface) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
-    if (GetCurrentThreadId() != state.host.render_thread_id) {
+    var admission = admitClearSurface(surface) orelse return result_invalid_argument;
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
+    state.host.render_thread_mutex.lock();
+    const render_thread_id = state.host.render_thread_id;
+    state.host.render_thread_mutex.unlock();
+    if (GetCurrentThreadId() != render_thread_id) {
         return result_wrong_thread;
     }
     const renderer = beginClearRendererOperation(state) orelse
@@ -856,12 +1129,18 @@ pub export fn winghostty_surface_clear_current(surface: ?*Surface) Result {
 }
 
 pub export fn winghostty_surface_render(surface: ?*Surface) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
-    if (state.invalidated or state.destroying) return result_surface_invalidated;
+    var admission = admitSurface(surface) orelse return result_invalid_argument;
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
+    if (state.invalidated.load(.acquire) or
+        state.destroying.load(.acquire))
+    {
+        return result_surface_invalidated;
+    }
     const render_result = claimRenderThread(state.host);
     if (render_result != result_ok) return render_result;
     const renderer = beginRendererOperation(state) orelse
-        return if (state.host.shutting_down)
+        return if (state.host.shutting_down.load(.acquire))
             result_shutting_down
         else
             result_surface_invalidated;
@@ -884,12 +1163,18 @@ pub export fn winghostty_surface_render(surface: ?*Surface) Result {
 }
 
 pub export fn winghostty_surface_present(surface: ?*Surface) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
-    if (state.invalidated or state.destroying) return result_surface_invalidated;
+    var admission = admitSurface(surface) orelse return result_invalid_argument;
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
+    if (state.invalidated.load(.acquire) or
+        state.destroying.load(.acquire))
+    {
+        return result_surface_invalidated;
+    }
     const render_result = claimRenderThread(state.host);
     if (render_result != result_ok) return render_result;
     const renderer = beginRendererOperation(state) orelse
-        return if (state.host.shutting_down)
+        return if (state.host.shutting_down.load(.acquire))
             result_shutting_down
         else
             result_surface_invalidated;
@@ -1001,18 +1286,28 @@ pub export fn winghostty_surface_notify_fatal_error(
 }
 
 pub export fn winghostty_surface_get_hwnd(surface: ?*const Surface) ?HWND {
-    const state = surfaceState(@constCast(surface)) orelse return null;
-    if (checkSurface(state) != result_ok or state.destroying) return null;
+    var admission = admitSurface(@constCast(surface)) orelse return null;
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
+    if (checkSurface(state) != result_ok or
+        state.destroying.load(.acquire))
+    {
+        return null;
+    }
     return state.hwnd;
 }
 
 pub export fn winghostty_surface_get_hdc(surface: ?*const Surface) HDC {
-    const state = surfaceState(@constCast(surface)) orelse return null;
+    var admission = admitSurface(@constCast(surface)) orelse return null;
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
     return rendererHdc(state);
 }
 
 pub export fn winghostty_surface_get_hglrc(surface: ?*const Surface) HGLRC {
-    const state = surfaceState(@constCast(surface)) orelse return null;
+    var admission = admitSurface(@constCast(surface)) orelse return null;
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
     return rendererHglrc(state);
 }
 
@@ -1031,14 +1326,18 @@ pub export fn winghostty_host_get_render_thread_id(host: ?*const Host) DWORD {
 pub export fn winghostty_surface_get_last_error(
     surface: ?*const Surface,
 ) DWORD {
-    const state = surfaceState(@constCast(surface)) orelse return 0;
+    var admission = admitSurface(@constCast(surface)) orelse return 0;
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
     return loadRendererError(state);
 }
 
 pub export fn winghostty_surface_get_present_count(
     surface: ?*const Surface,
 ) u64 {
-    const state = surfaceState(@constCast(surface)) orelse return 0;
+    var admission = admitSurface(@constCast(surface)) orelse return 0;
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
     return state.present_count.load(.acquire);
 }
 
