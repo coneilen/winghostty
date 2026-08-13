@@ -1,4 +1,5 @@
 #include "../../include/winghostty/win32_host.h"
+#include <string.h>
 
 #define WM_HOST_API_TRIGGER (WM_APP + 1)
 #define WM_HOST_API_DONE (WM_APP + 2)
@@ -299,6 +300,58 @@ int main(void) {
     }
     if (GetParent(winghostty_surface_get_hwnd(first)) != context.parent ||
         !IsChild(context.parent, winghostty_surface_get_hwnd(first))) {
+        winghostty_surface_destroy(first);
+        winghostty_host_deinitialize(context.host);
+        DestroyWindow(context.parent);
+        return fail();
+    }
+
+    winghostty_cell_metrics cell_metrics = {8, 16, 8, 16, 13};
+    if (winghostty_surface_set_cell_metrics(first, &cell_metrics) != WINGHOSTTY_OK ||
+        winghostty_surface_notify_dpi_changed(first, 96) != WINGHOSTTY_OK) {
+        winghostty_surface_destroy(first);
+        winghostty_host_deinitialize(context.host);
+        DestroyWindow(context.parent);
+        return fail();
+    }
+    winghostty_cell_metrics scaled_metrics;
+    if (winghostty_surface_notify_dpi_changed(first, 120) != WINGHOSTTY_OK ||
+        winghostty_surface_get_cell_metrics(first, &scaled_metrics) != WINGHOSTTY_OK ||
+        scaled_metrics.cell_width != 10 ||
+        scaled_metrics.cell_height != 20 ||
+        winghostty_surface_notify_dpi_changed(first, 96) != WINGHOSTTY_OK) {
+        winghostty_surface_destroy(first);
+        winghostty_host_deinitialize(context.host);
+        DestroyWindow(context.parent);
+        return fail();
+    }
+    if (winghostty_surface_notify_terminal_text(
+            first,
+            "hello terminal",
+            14,
+            0,
+            14,
+            6,
+            14,
+            14
+        ) != WINGHOSTTY_OK) {
+        winghostty_surface_destroy(first);
+        winghostty_host_deinitialize(context.host);
+        DestroyWindow(context.parent);
+        return fail();
+    }
+    char copied[32] = {0};
+    uint64_t copied_length = 0;
+    if (winghostty_surface_copy_accessibility_range(
+            first,
+            6,
+            14,
+            copied,
+            sizeof(copied),
+            &copied_length
+        ) != WINGHOSTTY_OK ||
+        copied_length != 8 ||
+        memcmp(copied, "terminal", 8) != 0) {
         winghostty_surface_destroy(first);
         winghostty_host_deinitialize(context.host);
         DestroyWindow(context.parent);

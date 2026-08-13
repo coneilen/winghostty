@@ -21,7 +21,7 @@ WINGHOSTTY_LAYOUT_ASSERT(
     "rect width offset changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
-    sizeof(winghostty_callbacks) == 64,
+    sizeof(winghostty_callbacks) == 88,
     "callback ABI changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
@@ -29,7 +29,7 @@ WINGHOSTTY_LAYOUT_ASSERT(
     "fatal callback offset changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
-    sizeof(winghostty_surface_options) == 128,
+    sizeof(winghostty_surface_options) == 152,
     "surface options ABI changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
@@ -41,7 +41,7 @@ WINGHOSTTY_LAYOUT_ASSERT(
     "surface callbacks offset changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
-    offsetof(winghostty_surface_options, user_data) == 120,
+    offsetof(winghostty_surface_options, user_data) == 144,
     "surface user data offset changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
@@ -146,6 +146,40 @@ static void on_text(
     (void)length;
 }
 
+static void on_dpi_changed(
+    void *user_data,
+    winghostty_surface *surface,
+    uint32_t dpi,
+    float scale
+) {
+    (void)user_data;
+    (void)surface;
+    (void)dpi;
+    (void)scale;
+}
+
+static void on_metrics_changed(
+    void *user_data,
+    winghostty_surface *surface,
+    const winghostty_cell_metrics *metrics
+) {
+    (void)user_data;
+    (void)surface;
+    (void)metrics;
+}
+
+static void on_accessibility_selection(
+    void *user_data,
+    winghostty_surface *surface,
+    uint64_t start,
+    uint64_t end
+) {
+    (void)user_data;
+    (void)surface;
+    (void)start;
+    (void)end;
+}
+
 void winghostty_win32_host_compile_contract(void) {
     winghostty_host *host = 0;
     winghostty_surface *surface = 0;
@@ -166,6 +200,9 @@ void winghostty_win32_host_compile_contract(void) {
     options.callbacks.on_redraw = on_redraw;
     options.callbacks.on_focus = on_focus;
     options.callbacks.on_fatal_error = on_fatal_error;
+    options.callbacks.on_dpi_changed = on_dpi_changed;
+    options.callbacks.on_metrics_changed = on_metrics_changed;
+    options.callbacks.on_accessibility_selection = on_accessibility_selection;
     winghostty_surface_options_v2 options_v2;
     winghostty_surface_options_v2_init(&options_v2);
     options_v2.command = options.command;
@@ -193,6 +230,11 @@ void winghostty_win32_host_compile_contract(void) {
     (void)winghostty_surface_set_focus(surface, 1);
     (void)winghostty_surface_set_theme(surface, WINGHOSTTY_THEME_DARK);
     (void)winghostty_surface_set_font_scale(surface, 1.0f);
+    winghostty_cell_metrics metrics = {8, 16, 8, 16, 13};
+    (void)winghostty_surface_set_cell_metrics(surface, &metrics);
+    (void)winghostty_surface_get_cell_metrics(surface, &metrics);
+    (void)winghostty_surface_get_dpi(surface);
+    (void)winghostty_surface_notify_dpi_changed(surface, 120);
     (void)winghostty_surface_set_keyboard_layout(surface, 0);
     (void)winghostty_surface_ime_update(surface, "preedit", 7, 0);
     (void)winghostty_surface_paste_text(surface, "echo", 4, 1);
@@ -220,6 +262,42 @@ void winghostty_win32_host_compile_contract(void) {
         surface,
         WINGHOSTTY_WIN32_ERROR,
         "fatal"
+    );
+    (void)winghostty_surface_notify_accessibility_name(surface, "Terminal");
+    (void)winghostty_surface_notify_accessibility_text(
+        surface,
+        "hello",
+        5,
+        0,
+        5,
+        0,
+        0,
+        0
+    );
+    (void)winghostty_surface_notify_terminal_text(
+        surface,
+        "hello",
+        5,
+        0,
+        5,
+        0,
+        0,
+        0
+    );
+    (void)winghostty_surface_notify_accessibility_focus(surface, 1);
+    (void)winghostty_surface_set_accessibility_role(
+        surface,
+        WINGHOSTTY_ACCESSIBILITY_TERMINAL
+    );
+    char copied[8];
+    uint64_t copied_length = 0;
+    (void)winghostty_surface_copy_accessibility_range(
+        surface,
+        0,
+        5,
+        copied,
+        sizeof(copied),
+        &copied_length
     );
     (void)winghostty_host_drain(host, &drained);
     (void)winghostty_surface_destroy(surface);

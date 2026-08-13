@@ -40,6 +40,19 @@ typedef struct winghostty_rect {
     uint32_t height;
 } winghostty_rect;
 
+typedef struct winghostty_cell_metrics {
+    uint32_t font_width;
+    uint32_t font_height;
+    uint32_t cell_width;
+    uint32_t cell_height;
+    uint32_t baseline;
+} winghostty_cell_metrics;
+
+typedef enum winghostty_accessibility_role {
+    WINGHOSTTY_ACCESSIBILITY_TERMINAL = 0,
+    WINGHOSTTY_ACCESSIBILITY_EDIT = 1,
+} winghostty_accessibility_role;
+
 typedef struct winghostty_callbacks {
     void (*on_exit)(
         void *user_data,
@@ -73,6 +86,23 @@ typedef struct winghostty_callbacks {
         winghostty_surface *surface,
         winghostty_result error,
         const char *message
+    );
+    void (*on_dpi_changed)(
+        void *user_data,
+        winghostty_surface *surface,
+        uint32_t dpi,
+        float scale
+    );
+    void (*on_metrics_changed)(
+        void *user_data,
+        winghostty_surface *surface,
+        const winghostty_cell_metrics *metrics
+    );
+    void (*on_accessibility_selection)(
+        void *user_data,
+        winghostty_surface *surface,
+        uint64_t start,
+        uint64_t end
     );
 } winghostty_callbacks;
 
@@ -284,6 +314,19 @@ winghostty_result winghostty_surface_set_font_scale(
     winghostty_surface *surface,
     float font_scale
 );
+winghostty_result winghostty_surface_set_cell_metrics(
+    winghostty_surface *surface,
+    const winghostty_cell_metrics *metrics
+);
+winghostty_result winghostty_surface_get_cell_metrics(
+    const winghostty_surface *surface,
+    winghostty_cell_metrics *out_metrics
+);
+uint32_t winghostty_surface_get_dpi(const winghostty_surface *surface);
+winghostty_result winghostty_surface_notify_dpi_changed(
+    winghostty_surface *surface,
+    uint32_t dpi
+);
 winghostty_result winghostty_surface_set_keyboard_layout(
     winghostty_surface *surface,
     uintptr_t keyboard_layout
@@ -392,6 +435,46 @@ winghostty_result winghostty_surface_notify_fatal_error(
     winghostty_surface *surface,
     winghostty_result error,
     const char *message
+);
+winghostty_result winghostty_surface_notify_accessibility_name(
+    winghostty_surface *surface,
+    const char *name
+);
+winghostty_result winghostty_surface_notify_accessibility_text(
+    winghostty_surface *surface,
+    const char *text,
+    uint64_t text_length,
+    uint64_t visible_start,
+    uint64_t visible_end,
+    uint64_t selection_start,
+    uint64_t selection_end,
+    uint64_t caret
+);
+winghostty_result winghostty_surface_notify_terminal_text(
+    winghostty_surface *surface,
+    const char *text,
+    uint64_t text_length,
+    uint64_t visible_start,
+    uint64_t visible_end,
+    uint64_t selection_start,
+    uint64_t selection_end,
+    uint64_t caret
+);
+winghostty_result winghostty_surface_notify_accessibility_focus(
+    winghostty_surface *surface,
+    uint8_t focused
+);
+winghostty_result winghostty_surface_set_accessibility_role(
+    winghostty_surface *surface,
+    winghostty_accessibility_role role
+);
+winghostty_result winghostty_surface_copy_accessibility_range(
+    winghostty_surface *surface,
+    uint64_t start,
+    uint64_t end,
+    char *buffer,
+    uint64_t buffer_length,
+    uint64_t *out_written
 );
 
 HWND winghostty_surface_get_hwnd(const winghostty_surface *surface);

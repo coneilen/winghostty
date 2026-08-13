@@ -88,6 +88,15 @@ is enabled by default. Clipboard read/write supports Unicode text and
 `CF_HTML` writes. A surface's input options and strings are copied during
 creation.
 
+Per-monitor DPI is reported through `winghostty_surface_get_dpi`; callers can
+set base cell metrics and receive scaled metric/DPI callbacks. Each surface
+also owns an independent UI Automation provider with live terminal name,
+focus, role, UTF-8 text ranges, visible range, caret, and selection state.
+Accessibility snapshots are caller-owned and are pushed through the
+`notify_accessibility_*` functions. Providers disconnect before surface
+teardown, and retained providers return `UIA_E_ELEMENTNOTAVAILABLE` without
+invoking callbacks after destruction.
+
 ## Validation
 
 ```powershell

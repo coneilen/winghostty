@@ -44,7 +44,7 @@ pub fn build(b: *std.Build) !void {
     const emit_win32_host = b.option(
         bool,
         "emit-win32-host",
-        "Build the embeddable Win32 host API skeleton.",
+        "Build the embeddable Win32 host API.",
     ) orelse false;
     if (emit_win32_host) {
         const host_lib = b.addLibrary(.{
@@ -60,6 +60,8 @@ pub fn build(b: *std.Build) !void {
         host_lib.linkSystemLibrary("kernel32");
         host_lib.linkSystemLibrary("user32");
         host_lib.linkSystemLibrary("imm32");
+        host_lib.linkSystemLibrary("oleaut32");
+        host_lib.linkSystemLibrary("uiautomationcore");
         b.installArtifact(host_lib);
         const host_header = b.addInstallFile(
             b.path("include/winghostty/win32_host.h"),

@@ -36,7 +36,7 @@ try {
     Invoke-DevWindows @(
         "zig", "cc", "-target", "x86_64-windows-msvc",
         $object, $library, "-luser32", "-lgdi32", "-lopengl32", "-lkernel32",
-        "-limm32", "-o", $executable
+        "-limm32", "-loleaut32", "-luiautomationcore", "-o", $executable
     )
     & $executable
     if ($LASTEXITCODE -ne 0) {

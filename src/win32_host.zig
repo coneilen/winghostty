@@ -2,6 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const win32_types = @import("apprt/win32_types.zig");
+const host_metrics = @import("win32_host_metrics.zig");
+const host_uia = @import("win32_host_uia.zig");
 const win32_context = @import("renderer/win32_context.zig");
 const win32_presentation = @import("renderer/win32_presentation.zig");
 const paste_protection = @import("apprt/win32_paste_protection.zig");
@@ -35,6 +37,8 @@ const CREATESTRUCTW = win32_types.CREATESTRUCTW;
 const PAINTSTRUCT = win32_types.PAINTSTRUCT;
 const RECT = win32_types.RECT;
 const POINT = win32_types.POINT;
+const CellMetrics = host_metrics.BaseMetrics;
+const ScaledMetrics = host_metrics.Metrics;
 
 const allocator: Allocator = std.heap.c_allocator;
 
@@ -45,6 +49,8 @@ const WM_PAINT: u32 = 0x000F;
 const WM_ERASEBKGND: u32 = 0x0014;
 const WM_SETFOCUS: u32 = 0x0007;
 const WM_KILLFOCUS: u32 = 0x0008;
+const WM_GETOBJECT: u32 = 0x003D;
+const WM_DPICHANGED: u32 = 0x02E0;
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_KEYUP: u32 = 0x0101;
 const WM_CHAR: u32 = 0x0102;
@@ -172,6 +178,7 @@ extern "user32" fn SetWindowPos(
     flags: UINT,
 ) callconv(.winapi) BOOL;
 extern "user32" fn ShowWindow(hwnd: HWND, command: i32) callconv(.winapi) BOOL;
+extern "user32" fn GetDpiForWindow(hwnd: HWND) callconv(.winapi) u32;
 extern "user32" fn GetKeyState(virtual_key: i32) callconv(.winapi) i16;
 extern "user32" fn GetKeyboardLayout(thread_id: DWORD) callconv(.winapi) ?*anyopaque;
 extern "user32" fn GetKeyboardState(state: *[256]u8) callconv(.winapi) BOOL;
@@ -272,6 +279,9 @@ pub const NotificationCallback = *const fn (?*anyopaque, *Surface, [*:0]const u8
 pub const RedrawCallback = *const fn (?*anyopaque, *Surface) callconv(.c) void;
 pub const FocusCallback = *const fn (?*anyopaque, *Surface, u8) callconv(.c) void;
 pub const FatalErrorCallback = *const fn (?*anyopaque, *Surface, Result, [*:0]const u8) callconv(.c) void;
+pub const DpiChangedCallback = *const fn (?*anyopaque, *Surface, u32, f32) callconv(.c) void;
+pub const MetricsChangedCallback = *const fn (?*anyopaque, *Surface, *const CellMetrics) callconv(.c) void;
+pub const AccessibilitySelectionCallback = *const fn (?*anyopaque, *Surface, u64, u64) callconv(.c) void;
 
 pub const Callbacks = extern struct {
     on_exit: ?ExitCallback,
@@ -282,6 +292,9 @@ pub const Callbacks = extern struct {
     on_redraw: ?RedrawCallback,
     on_focus: ?FocusCallback,
     on_fatal_error: ?FatalErrorCallback,
+    on_dpi_changed: ?DpiChangedCallback,
+    on_metrics_changed: ?MetricsChangedCallback,
+    on_accessibility_selection: ?AccessibilitySelectionCallback,
 };
 
 pub const KeyEvent = extern struct {
@@ -482,6 +495,10 @@ const SurfaceState = struct {
     last_error: std.atomic.Value(DWORD) = .init(0),
     present_count: std.atomic.Value(u64) = .init(0),
     invalidated: std.atomic.Value(bool) = .init(false),
+    base_metrics: CellMetrics = .{},
+    metrics: ScaledMetrics = host_metrics.calculate(.{}, 96, 1),
+    dpi: u32 = host_metrics.default_dpi,
+    uia: ?*host_uia.SurfaceProvider = null,
     creation_in_progress: bool = false,
     destroying: std.atomic.Value(bool) = .init(false),
     retired: bool = false,
@@ -506,7 +523,6 @@ const SurfaceState = struct {
     wheel_remainder_y: i32 = 0,
     active_dispatches: usize = 0,
     storage_retained: bool = false,
-    active_dispatches: usize = 0,
 };
 
 const HostState = struct {
@@ -816,6 +832,92 @@ fn disableClearAdmissionAndWait(
     state.admission.mutex.unlock();
 }
 
+fn getDpi(hwnd: HWND) u32 {
+    const value = GetDpiForWindow(hwnd);
+    return if (value == 0) host_metrics.default_dpi else value;
+}
+
+fn metricsFor(surface: *const SurfaceState) ScaledMetrics {
+    return host_metrics.calculate(
+        surface.base_metrics,
+        surface.dpi,
+        surface.options.font_scale,
+    );
+}
+
+fn notifyMetrics(surface: *SurfaceState) void {
+    if (surface.destroying.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return;
+    }
+    if (surface.options.callbacks.on_metrics_changed) |callback| {
+        beginDispatch(surface);
+        defer endDispatch(surface);
+        const metrics: CellMetrics = .{
+            .font_width = surface.metrics.font_width,
+            .font_height = surface.metrics.font_height,
+            .cell_width = surface.metrics.cell_width,
+            .cell_height = surface.metrics.cell_height,
+            .baseline = surface.metrics.baseline,
+        };
+        callback(
+            surface.options.user_data,
+            surfaceHandle(surface),
+            &metrics,
+        );
+    }
+}
+
+fn updateDpi(surface: *SurfaceState, dpi: u32) void {
+    if (surface.destroying.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return;
+    }
+    const normalized = host_metrics.normalizeDpi(dpi);
+    if (surface.dpi == normalized) return;
+    surface.dpi = normalized;
+    surface.metrics = metricsFor(surface);
+    if (surface.uia) |provider| {
+        provider.updateMetrics(.{
+            .cell_width = @floatFromInt(surface.metrics.cell_width),
+            .cell_height = @floatFromInt(surface.metrics.cell_height),
+        });
+    }
+    if (surface.options.callbacks.on_dpi_changed) |callback| {
+        beginDispatch(surface);
+        defer endDispatch(surface);
+        callback(
+            surface.options.user_data,
+            surfaceHandle(surface),
+            normalized,
+            host_metrics.dpiScale(normalized),
+        );
+    }
+    notifyMetrics(surface);
+    if (surface.hwnd) |hwnd| _ = InvalidateRect(hwnd, null, 0);
+}
+
+fn accessibilitySelection(
+    ctx: *anyopaque,
+    start: usize,
+    end: usize,
+) void {
+    const surface: *SurfaceState = @ptrCast(@alignCast(ctx));
+    if (surface.destroying.load(.acquire) or
+        surface.invalidated.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return;
+    }
+    if (surface.options.callbacks.on_accessibility_selection) |callback| {
+        beginDispatch(surface);
+        defer endDispatch(surface);
+        callback(surface.options.user_data, surfaceHandle(surface), start, end);
+    }
+}
+
 fn checkHost(host: *HostState) Result {
     if (host.shutting_down.load(.acquire)) return result_shutting_down;
     if (GetCurrentThreadId() != host.thread_id) return result_wrong_thread;
@@ -1059,6 +1161,7 @@ fn notifyFocus(surface: *SurfaceState, focused: bool) void {
         return;
     }
     surface.focused = focused;
+    if (surface.uia) |provider| provider.updateFocus(focused);
     if (surface.options.callbacks.on_focus) |callback| {
         beginDispatch(surface);
         defer endDispatch(surface);
@@ -1541,6 +1644,23 @@ fn surfaceWindowProc(
     defer if (surface) |value| endDispatch(value);
     if (message == WM_UNICHAR and wparam == UNICODE_NOCHAR) return 1;
     switch (message) {
+        WM_GETOBJECT => {
+            if (surface) |value| {
+                if (value.uia) |provider| {
+                    if (host_uia.returnProvider(hwnd, wparam, lparam, provider)) |result| {
+                        return result;
+                    }
+                }
+            }
+            return DefWindowProcW(hwnd, message, wparam, lparam);
+        },
+        WM_DPICHANGED => {
+            if (surface) |value| {
+                const next_dpi: u32 = @as(u32, @intCast(wparam)) & 0xffff;
+                updateDpi(value, next_dpi);
+            }
+            return 0;
+        },
         WM_SETFOCUS => {
             if (surface) |value| notifyFocus(value, true);
             return 0;
@@ -1783,6 +1903,11 @@ fn destroySurfaceNow(
         retainRetiredSurface(surface.host, surface);
     }
     waitSurfaceAdmissions(surface, remaining_admissions);
+    if (surface.uia) |provider| {
+        _ = provider.disconnect();
+        _ = host_uia.SurfaceProvider.Release(&provider.base);
+        surface.uia = null;
+    }
     destroyRenderer(surface);
     if (surface.hwnd) |hwnd| {
         setUserData(hwnd, null);
@@ -1799,6 +1924,11 @@ fn cleanupUnregisteredSurface(
     hwnd: ?HWND,
 ) void {
     surface.destroying.store(true, .release);
+    if (surface.uia) |provider| {
+        _ = provider.disconnect();
+        _ = host_uia.SurfaceProvider.Release(&provider.base);
+        surface.uia = null;
+    }
     if (hwnd) |value| {
         setUserData(value, null);
         _ = DestroyWindow(value);
@@ -1900,6 +2030,9 @@ fn defaultSurfaceOptions() SurfaceOptions {
             .on_redraw = null,
             .on_focus = null,
             .on_fatal_error = null,
+            .on_dpi_changed = null,
+            .on_metrics_changed = null,
+            .on_accessibility_selection = null,
         },
         .user_data = null,
         .input_callbacks = .{
@@ -2078,6 +2211,31 @@ fn createSurface(
         );
     };
     surface.hwnd = hwnd;
+    surface.dpi = getDpi(hwnd);
+    surface.metrics = metricsFor(surface);
+    surface.uia = host_uia.SurfaceProvider.create(
+        allocator,
+        hwnd,
+        .{
+            .name = "Terminal",
+            .text = "",
+            .visible = surface.options.visible != 0,
+            .metrics = .{
+                .cell_width = @floatFromInt(surface.metrics.cell_width),
+                .cell_height = @floatFromInt(surface.metrics.cell_height),
+            },
+            .callback_ctx = surface,
+            .on_selection = accessibilitySelection,
+        },
+    ) catch {
+        return finishUnregisteredSurfaceCreation(
+            state,
+            surface,
+            hwnd,
+            result_out_of_memory,
+            &host_admission,
+        );
+    };
 
     if (state.shutting_down.load(.acquire)) {
         return finishUnregisteredSurfaceCreation(
@@ -2286,6 +2444,7 @@ pub export fn winghostty_surface_set_visible(
     state.options_mutex.lock();
     state.options.visible = next_visible;
     state.options_mutex.unlock();
+    if (state.uia) |provider| provider.updateVisibility(next_visible != 0);
     const hwnd = state.hwnd orelse {
         releaseSurfaceAdmission(&admission);
         return result_shutting_down;
@@ -2368,9 +2527,91 @@ pub export fn winghostty_surface_set_font_scale(
     state.options_mutex.lock();
     state.options.font_scale = font_scale;
     state.options_mutex.unlock();
+    state.metrics = metricsFor(state);
+    if (state.uia) |provider| {
+        provider.updateMetrics(.{
+            .cell_width = @floatFromInt(state.metrics.cell_width),
+            .cell_height = @floatFromInt(state.metrics.cell_height),
+        });
+    }
+    notifyMetrics(state);
     const hwnd = state.hwnd;
     releaseSurfaceAdmission(&admission);
     if (hwnd) |value| _ = InvalidateRect(value, null, 0);
+    return result_ok;
+}
+
+pub export fn winghostty_surface_set_cell_metrics(
+    surface: ?*Surface,
+    metrics: ?*const CellMetrics,
+) Result {
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
+    const next = metrics orelse return result_invalid_argument;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    if (next.font_width == 0 or next.font_height == 0 or
+        next.cell_width == 0 or next.cell_height == 0 or
+        next.baseline > next.font_height)
+    {
+        return result_invalid_argument;
+    }
+    state.base_metrics = next.*;
+    state.metrics = metricsFor(state);
+    if (state.uia) |provider| {
+        provider.updateMetrics(.{
+            .cell_width = @floatFromInt(state.metrics.cell_width),
+            .cell_height = @floatFromInt(state.metrics.cell_height),
+        });
+    }
+    notifyMetrics(state);
+    if (state.hwnd) |hwnd| _ = InvalidateRect(hwnd, null, 0);
+    return result_ok;
+}
+
+pub export fn winghostty_surface_get_cell_metrics(
+    surface: ?*const Surface,
+    out_metrics: ?*CellMetrics,
+) Result {
+    var admission = admitSurface(@constCast(surface)) orelse
+        return unavailableSurfaceResult(@constCast(surface));
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
+    const output = out_metrics orelse return result_invalid_argument;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    output.* = .{
+        .font_width = state.metrics.font_width,
+        .font_height = state.metrics.font_height,
+        .cell_width = state.metrics.cell_width,
+        .cell_height = state.metrics.cell_height,
+        .baseline = state.metrics.baseline,
+    };
+    return result_ok;
+}
+
+pub export fn winghostty_surface_get_dpi(surface: ?*const Surface) u32 {
+    var admission = admitSurface(@constCast(surface)) orelse return 0;
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
+    if (checkSurface(state) != result_ok) return 0;
+    return state.dpi;
+}
+
+pub export fn winghostty_surface_notify_dpi_changed(
+    surface: ?*Surface,
+    dpi: u32,
+) Result {
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    if (dpi == 0) return result_invalid_argument;
+    updateDpi(state, dpi);
     return result_ok;
 }
 
@@ -2801,6 +3042,15 @@ pub export fn winghostty_surface_notify_title(
         releaseSurfaceAdmission(&admission);
         return result;
     }
+    if (state.uia) |provider| {
+        provider.updateName(std.mem.span(value)) catch |err| {
+            releaseSurfaceAdmission(&admission);
+            return switch (err) {
+                error.OutOfMemory => result_out_of_memory,
+                else => result_surface_invalidated,
+            };
+        };
+    }
     const callback = state.options.callbacks.on_title;
     const user_data = state.options.user_data;
     const handle = surfaceHandle(state);
@@ -2951,6 +3201,149 @@ pub export fn winghostty_surface_notify_fatal_error(
         beginDispatch(state);
         defer endDispatch(state);
         callback_value(user_data, handle, result_code, value);
+    }
+    return result_ok;
+}
+
+pub export fn winghostty_surface_notify_accessibility_name(
+    surface: ?*Surface,
+    name: ?[*:0]const u8,
+) Result {
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const value = name orelse return result_invalid_argument;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    if (state.uia) |provider| {
+        provider.updateName(std.mem.span(value)) catch |err| return switch (err) {
+            error.OutOfMemory => result_out_of_memory,
+            else => result_surface_invalidated,
+        };
+    }
+    return result_ok;
+}
+
+pub export fn winghostty_surface_notify_accessibility_text(
+    surface: ?*Surface,
+    text: ?[*]const u8,
+    text_length: u64,
+    visible_start: u64,
+    visible_end: u64,
+    selection_start: u64,
+    selection_end: u64,
+    caret: u64,
+) Result {
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    const length = std.math.cast(usize, text_length) orelse return result_invalid_argument;
+    const value = if (text) |ptr|
+        ptr[0..length]
+    else if (length == 0)
+        &.{}
+    else
+        return result_invalid_argument;
+    const visible = host_uia.Range{
+        .start = std.math.cast(usize, visible_start) orelse return result_invalid_argument,
+        .end = std.math.cast(usize, visible_end) orelse return result_invalid_argument,
+    };
+    const selection = host_uia.Range{
+        .start = std.math.cast(usize, selection_start) orelse return result_invalid_argument,
+        .end = std.math.cast(usize, selection_end) orelse return result_invalid_argument,
+    };
+    if (state.uia) |provider| {
+        provider.updateText(
+            value[0..length],
+            visible,
+            selection,
+            std.math.cast(usize, caret) orelse return result_invalid_argument,
+        ) catch |err| return switch (err) {
+            error.OutOfMemory => result_out_of_memory,
+            error.InvalidUtf8 => result_invalid_argument,
+            else => result_surface_invalidated,
+        };
+    }
+    return result_ok;
+}
+
+pub export fn winghostty_surface_notify_terminal_text(
+    surface: ?*Surface,
+    text: ?[*]const u8,
+    text_length: u64,
+    visible_start: u64,
+    visible_end: u64,
+    selection_start: u64,
+    selection_end: u64,
+    caret: u64,
+) Result {
+    return winghostty_surface_notify_accessibility_text(
+        surface,
+        text,
+        text_length,
+        visible_start,
+        visible_end,
+        selection_start,
+        selection_end,
+        caret,
+    );
+}
+
+pub export fn winghostty_surface_notify_accessibility_focus(
+    surface: ?*Surface,
+    focused: u8,
+) Result {
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    if (state.uia) |provider| provider.updateFocus(focused != 0);
+    return result_ok;
+}
+
+pub export fn winghostty_surface_set_accessibility_role(
+    surface: ?*Surface,
+    role: i32,
+) Result {
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    const value: host_uia.Role = switch (role) {
+        0 => .terminal,
+        1 => .edit,
+        else => return result_invalid_argument,
+    };
+    if (state.uia) |provider| provider.updateRole(value);
+    return result_ok;
+}
+
+pub export fn winghostty_surface_copy_accessibility_range(
+    surface: ?*Surface,
+    start: u64,
+    end: u64,
+    buffer: ?[*]u8,
+    buffer_length: u64,
+    out_written: ?*u64,
+) Result {
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const output_length = out_written orelse return result_invalid_argument;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    const range = host_uia.Range{
+        .start = std.math.cast(usize, start) orelse return result_invalid_argument,
+        .end = std.math.cast(usize, end) orelse return result_invalid_argument,
+    };
+    const copy = if (state.uia) |provider|
+        provider.copyRangeUtf8(range, allocator) catch |err| return switch (err) {
+            error.OutOfMemory => result_out_of_memory,
+            else => result_surface_invalidated,
+        }
+    else
+        return result_surface_invalidated;
+    defer allocator.free(copy);
+    output_length.* = copy.len;
+    const capacity = std.math.cast(usize, buffer_length) orelse return result_invalid_argument;
+    if (copy.len > capacity) return result_invalid_argument;
+    if (copy.len != 0) {
+        const destination = buffer orelse return result_invalid_argument;
+        @memcpy(destination[0..copy.len], copy);
     }
     return result_ok;
 }
