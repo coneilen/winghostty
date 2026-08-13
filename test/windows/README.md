@@ -259,7 +259,9 @@ enters the public host, mutation, notification, renderer, and getter APIs
 while destruction is in progress, and verifies stale handles cannot affect
 replacement objects after allocator address reuse. It also has a parent
 `WM_PARENTNOTIFY` handler that calls host deinitialization during child
-destruction and verifies deferred teardown completes without a deadlock.
+destruction and verifies deferred teardown completes without a deadlock. A
+1024-cycle numeric-handle run measures process-heap busy blocks/bytes to catch
+registry and retired-token growth beyond USER/GDI accounting.
 
 ```powershell
 .\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\test\windows\run-win32-host-renderer.ps1

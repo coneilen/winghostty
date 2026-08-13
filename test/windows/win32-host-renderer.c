@@ -47,6 +47,13 @@ typedef struct teardown_stress {
     volatile LONG failures;
 } teardown_stress;
 
+typedef struct process_heap_usage {
+    SIZE_T busy_blocks;
+    SIZE_T busy_bytes;
+} process_heap_usage;
+
+static int read_process_heap_usage(process_heap_usage *usage);
+
 static LRESULT CALLBACK parent_window_proc(
     HWND hwnd,
     UINT message,
@@ -325,6 +332,25 @@ static int fail(const char *message) {
 
 static int check(int condition, const char *message) {
     return condition ? 0 : fail(message);
+}
+
+static int read_process_heap_usage(process_heap_usage *usage) {
+    HANDLE heap = GetProcessHeap();
+    PROCESS_HEAP_ENTRY entry = {0};
+    usage->busy_blocks = 0;
+    usage->busy_bytes = 0;
+    if (heap == NULL || !HeapLock(heap)) {
+        return 0;
+    }
+    while (HeapWalk(heap, &entry)) {
+        if ((entry.wFlags & PROCESS_HEAP_ENTRY_BUSY) != 0) {
+            ++usage->busy_blocks;
+            usage->busy_bytes += entry.cbData;
+        }
+    }
+    DWORD error = GetLastError();
+    HeapUnlock(heap);
+    return error == ERROR_NO_MORE_ITEMS;
 }
 
 static int current_matches(winghostty_surface *surface) {
@@ -645,8 +671,8 @@ static int run_handle_reuse_contract(HWND parent) {
         if (new_host) winghostty_host_deinitialize(new_host);
         return fail("stale-handle replacement setup failed");
     }
-    if (check(old_host != new_host, "host token address was reused") ||
-        check(old_surface != new_surface, "surface token address was reused") ||
+    if (check(old_host != new_host, "host handle ID was reused") ||
+        check(old_surface != new_surface, "surface handle ID was reused") ||
         check_stale_host(old_host, parent) != 0 ||
         check_stale_surface(old_surface) != 0 ||
         check(
@@ -717,6 +743,68 @@ static int run_reentrant_parent_deinitialize_contract(test_state *state) {
     state->deinit_on_child_destroy = 0;
     state->host = NULL;
     state->surface = NULL;
+    return 0;
+}
+
+static int run_numeric_handle_heap_contract(HWND parent) {
+    winghostty_surface_options options;
+    winghostty_surface_options_init(&options);
+    options.visible = 0;
+    options.bounds.width = 32;
+    options.bounds.height = 24;
+
+    for (int i = 0; i < 16; ++i) {
+        winghostty_host *host = NULL;
+        winghostty_surface *surface = NULL;
+        if (winghostty_host_initialize(&host) != WINGHOSTTY_OK ||
+            winghostty_host_create_surface(
+                host,
+                parent,
+                &options,
+                &surface
+            ) != WINGHOSTTY_OK ||
+            surface == NULL ||
+            winghostty_surface_destroy(surface) != WINGHOSTTY_OK ||
+            winghostty_host_deinitialize(host) != WINGHOSTTY_OK) {
+            if (host != NULL) winghostty_host_deinitialize(host);
+            return fail("numeric-handle heap warmup failed");
+        }
+    }
+
+    process_heap_usage before;
+    process_heap_usage after;
+    if (!read_process_heap_usage(&before)) {
+        return fail("process heap measurement failed before high-cycle test");
+    }
+
+    for (int i = 0; i < 1024; ++i) {
+        winghostty_host *host = NULL;
+        winghostty_surface *surface = NULL;
+        if (winghostty_host_initialize(&host) != WINGHOSTTY_OK ||
+            winghostty_host_create_surface(
+                host,
+                parent,
+                &options,
+                &surface
+            ) != WINGHOSTTY_OK ||
+            surface == NULL ||
+            winghostty_surface_destroy(surface) != WINGHOSTTY_OK ||
+            winghostty_host_deinitialize(host) != WINGHOSTTY_OK) {
+            if (host != NULL) winghostty_host_deinitialize(host);
+            return fail("numeric-handle high-cycle teardown failed");
+        }
+    }
+
+    if (!read_process_heap_usage(&after)) {
+        return fail("process heap measurement failed after high-cycle test");
+    }
+    if (check(
+            after.busy_blocks <= before.busy_blocks + 16 &&
+                after.busy_bytes <= before.busy_bytes + (2 * 1024 * 1024),
+            "numeric handle registry/process heap grew across high-cycle teardown"
+        )) {
+        return 1;
+    }
     return 0;
 }
 
@@ -836,6 +924,10 @@ int main(void) {
         return 1;
     }
     if (run_reentrant_parent_deinitialize_contract(&state) != 0) {
+        DestroyWindow(state.parent);
+        return 1;
+    }
+    if (run_numeric_handle_heap_contract(state.parent) != 0) {
         DestroyWindow(state.parent);
         return 1;
     }
