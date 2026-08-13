@@ -75,6 +75,9 @@ explicit WGL context/presentation adapter. Input callbacks are delivered
 synchronously from the caller's message loop thread. Keyboard events retain
 virtual-key, scan-code, repeat/dead-key state, modifier state, and the copied
 layout name; text callbacks are UTF-8 and preserve surrogate pairs.
+Mouse input requests leave tracking whenever mouse/input callbacks are
+enabled, reports client-space wheel coordinates, and maps left, right,
+middle, and X-button double-click messages to `click_count == 2`.
 
 `winghostty_surface_paste_text` validates UTF-8 and uses the host's paste
 protection classifier. Unsafe text requires `allow_unsafe` and bracketed paste

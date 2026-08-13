@@ -14,7 +14,10 @@
 #define WM_LBUTTONDOWN 0x0201
 #define WM_LBUTTONUP 0x0202
 #define WM_LBUTTONDBLCLK 0x0203
+#define WM_RBUTTONDBLCLK 0x0206
+#define WM_MBUTTONDBLCLK 0x0209
 #define WM_MOUSEWHEEL 0x020A
+#define WM_XBUTTONDBLCLK 0x020D
 #define WM_MOUSELEAVE 0x02A3
 
 typedef struct input_context {
@@ -40,6 +43,8 @@ typedef struct input_context {
     LONG deinit_on_ime;
     LONG deinit_on_mouse;
     LONG deinit_callbacks;
+    LONG legacy_deinit_callbacks;
+    int legacy_deinit_kind;
     int destroyed;
     winghostty_host *callback_host;
     int copied_layout;
@@ -50,12 +55,91 @@ typedef struct input_context {
     int saw_wheel;
     int wheel_x;
     int wheel_y;
-    int saw_double_click;
+    unsigned double_click_buttons;
+    int saw_mouse_leave;
     int saw_link_click;
     int saw_selection_drag;
     char pasted[128];
     char clipboard[128];
 } input_context;
+
+static void record(input_context *context, void *user_data);
+
+static void maybe_deinit_legacy(input_context *context, int kind) {
+    if (context->legacy_deinit_kind != kind) return;
+    context->legacy_deinit_kind = 0;
+    InterlockedIncrement(&context->legacy_deinit_callbacks);
+    (void)winghostty_host_deinitialize(context->callback_host);
+}
+
+static void on_legacy_exit(
+    void *user_data,
+    winghostty_surface *surface,
+    int32_t status
+) {
+    input_context *context = (input_context *)user_data;
+    (void)surface;
+    (void)status;
+    record(context, user_data);
+    maybe_deinit_legacy(context, 1);
+}
+
+static void on_legacy_title(
+    void *user_data,
+    winghostty_surface *surface,
+    const char *title
+) {
+    input_context *context = (input_context *)user_data;
+    (void)surface;
+    (void)title;
+    record(context, user_data);
+    maybe_deinit_legacy(context, 2);
+}
+
+static void on_legacy_cwd(
+    void *user_data,
+    winghostty_surface *surface,
+    const char *cwd
+) {
+    input_context *context = (input_context *)user_data;
+    (void)surface;
+    (void)cwd;
+    record(context, user_data);
+    maybe_deinit_legacy(context, 3);
+}
+
+static void on_legacy_bell(void *user_data, winghostty_surface *surface) {
+    input_context *context = (input_context *)user_data;
+    (void)surface;
+    record(context, user_data);
+    maybe_deinit_legacy(context, 4);
+}
+
+static void on_legacy_notification(
+    void *user_data,
+    winghostty_surface *surface,
+    const char *notification
+) {
+    input_context *context = (input_context *)user_data;
+    (void)surface;
+    (void)notification;
+    record(context, user_data);
+    maybe_deinit_legacy(context, 5);
+}
+
+static void on_legacy_fatal(
+    void *user_data,
+    winghostty_surface *surface,
+    winghostty_result error,
+    const char *message
+) {
+    input_context *context = (input_context *)user_data;
+    (void)surface;
+    (void)error;
+    (void)message;
+    record(context, user_data);
+    maybe_deinit_legacy(context, 6);
+}
 
 static void record(input_context *context, void *user_data) {
     if (GetCurrentThreadId() != context->ui_thread) {
@@ -159,7 +243,10 @@ static void on_mouse(
         context->wheel_x = event->x;
         context->wheel_y = event->y;
     }
-    if (event->click_count == 2) context->saw_double_click = 1;
+    if (event->click_count == 2 && event->button < 32) {
+        context->double_click_buttons |= 1u << event->button;
+    }
+    if (event->kind == WINGHOSTTY_MOUSE_LEAVE) context->saw_mouse_leave = 1;
     if (context->deinit_on_mouse) {
         context->deinit_on_mouse = 0;
         InterlockedIncrement(&context->deinit_callbacks);
@@ -276,6 +363,56 @@ static int fail_line(int line) {
 
 #define fail() fail_line(__LINE__)
 
+static int run_legacy_deinit_case(
+    input_context *context,
+    const winghostty_surface_options_v2 *template_options,
+    int kind
+) {
+    winghostty_host *host = NULL;
+    winghostty_surface *surface = NULL;
+    winghostty_surface_options_v2 options = *template_options;
+    options.focus = 0;
+    context->callback_host = NULL;
+    context->legacy_deinit_kind = kind;
+    if (winghostty_host_initialize(&host) != WINGHOSTTY_OK) return 1;
+    context->callback_host = host;
+    if (winghostty_host_create_surface_v2(
+            host,
+            context->parent,
+            &options,
+            &surface
+        ) != WINGHOSTTY_OK) {
+        return 1;
+    }
+    switch (kind) {
+        case 1:
+            (void)winghostty_surface_notify_exit(surface, 0);
+            break;
+        case 2:
+            (void)winghostty_surface_notify_title(surface, "title");
+            break;
+        case 3:
+            (void)winghostty_surface_notify_cwd(surface, "C:\\");
+            break;
+        case 4:
+            (void)winghostty_surface_notify_bell(surface);
+            break;
+        case 5:
+            (void)winghostty_surface_notify_notification(surface, "notification");
+            break;
+        case 6:
+            (void)winghostty_surface_notify_fatal_error(
+                surface,
+                WINGHOSTTY_WIN32_ERROR,
+                "fatal"
+            );
+            break;
+        default:
+            return 1;
+    }
+    return context->legacy_deinit_kind == 0 ? 0 : 1;
+}
+
 int main(void) {
     const wchar_t class_name[] = L"WinghosttyHostApiInput";
     WNDCLASSW parent_class = {
@@ -368,6 +505,14 @@ int main(void) {
     SendMessageW(first_hwnd, WM_LBUTTONUP, 0, MAKELPARAM(80, 48));
     if (GetCapture() != NULL) return fail();
     SendMessageW(first_hwnd, WM_LBUTTONDBLCLK, MK_LBUTTON, MAKELPARAM(24, 32));
+    SendMessageW(first_hwnd, WM_RBUTTONDBLCLK, MK_RBUTTON, MAKELPARAM(24, 32));
+    SendMessageW(first_hwnd, WM_MBUTTONDBLCLK, MK_MBUTTON, MAKELPARAM(24, 32));
+    SendMessageW(
+        first_hwnd,
+        WM_XBUTTONDBLCLK,
+        MAKEWPARAM(0, 1),
+        MAKELPARAM(24, 32)
+    );
     POINT wheel_point = {80, 48};
     if (!ClientToScreen(first_hwnd, &wheel_point)) return fail();
     SendMessageW(
@@ -419,6 +564,8 @@ int main(void) {
     second_options.focus = 0;
     second_options.bounds.x = 400;
     second_options.input.keyboard_layout = NULL;
+    second_options.input.links_enabled = 0;
+    second_options.input.selection_enabled = 0;
     winghostty_surface *second = NULL;
     if (winghostty_host_create_surface_v2(
             host,
@@ -429,15 +576,19 @@ int main(void) {
         winghostty_surface_set_focus(second, 1) != WINGHOSTTY_OK) {
         return fail();
     }
+    context.saw_mouse_leave = 0;
+    HWND second_hwnd = winghostty_surface_get_hwnd(second);
+    SendMessageW(second_hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(8, 8));
+    SendMessageW(second_hwnd, WM_MOUSELEAVE, 0, 0);
+    if (!context.saw_mouse_leave) return fail();
     LONG keys_before_unfocused = context.keys;
     SendMessageW(first_hwnd, WM_KEYDOWN, 'B', 1u << 16);
     if (context.keys != keys_before_unfocused) return fail();
-    SendMessageW(winghostty_surface_get_hwnd(second), WM_KEYDOWN, 'C', 1u << 16);
+    SendMessageW(second_hwnd, WM_KEYDOWN, 'C', 1u << 16);
     if (context.keys == keys_before_unfocused) return fail();
 
     context.destroy_on_key = 1;
     context.destroyed = 0;
-    HWND second_hwnd = winghostty_surface_get_hwnd(second);
     SendMessageW(second_hwnd, WM_KEYDOWN, 'D', 1u << 16);
     context.destroy_on_key = 0;
     if (!context.destroyed ||
@@ -470,7 +621,10 @@ int main(void) {
         !context.saw_dead_composition ||
         context.wheel_x != 80 ||
         context.wheel_y != 48 ||
-        !context.saw_double_click ||
+        !context.saw_mouse_leave ||
+        (context.double_click_buttons & ((1u << 1) | (1u << 2) | (1u << 3) |
+            (1u << 4))) !=
+            ((1u << 1) | (1u << 2) | (1u << 3) | (1u << 4)) ||
         !context.copied_layout ||
         context.pastes != 2 ||
         context.clipboard_reads !=
@@ -549,6 +703,20 @@ int main(void) {
         MAKELPARAM(8, 8)
     );
     if (context.deinit_callbacks != 3) return fail();
+
+    callback_options = options;
+    callback_options.callbacks.on_exit = on_legacy_exit;
+    callback_options.callbacks.on_title = on_legacy_title;
+    callback_options.callbacks.on_cwd = on_legacy_cwd;
+    callback_options.callbacks.on_bell = on_legacy_bell;
+    callback_options.callbacks.on_notification = on_legacy_notification;
+    callback_options.callbacks.on_fatal_error = on_legacy_fatal;
+    for (int kind = 1; kind <= 6; kind++) {
+        if (run_legacy_deinit_case(&context, &callback_options, kind) != 0) {
+            return fail();
+        }
+    }
+    if (context.legacy_deinit_callbacks != 6) return fail();
 
     DestroyWindow(context.parent);
     UnregisterClassW(class_name, parent_class.hInstance);

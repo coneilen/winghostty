@@ -63,11 +63,14 @@ const WM_LBUTTONUP: u32 = 0x0202;
 const WM_LBUTTONDBLCLK: u32 = 0x0203;
 const WM_RBUTTONDOWN: u32 = 0x0204;
 const WM_RBUTTONUP: u32 = 0x0205;
+const WM_RBUTTONDBLCLK: u32 = 0x0206;
 const WM_MBUTTONDOWN: u32 = 0x0207;
 const WM_MBUTTONUP: u32 = 0x0208;
+const WM_MBUTTONDBLCLK: u32 = 0x0209;
 const WM_MOUSEWHEEL: u32 = 0x020A;
 const WM_XBUTTONDOWN: u32 = 0x020B;
 const WM_XBUTTONUP: u32 = 0x020C;
+const WM_XBUTTONDBLCLK: u32 = 0x020D;
 const WM_MOUSEHWHEEL: u32 = 0x020E;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_INPUTLANGCHANGE: u32 = 0x0051;
@@ -481,6 +484,8 @@ const SurfaceState = struct {
     invalidated: std.atomic.Value(bool) = .init(false),
     creation_in_progress: bool = false,
     destroying: std.atomic.Value(bool) = .init(false),
+    retired: bool = false,
+    retired_next: ?*SurfaceState = null,
     focused: bool = false,
     ime_composing: bool = false,
     dead_key_active: bool = false,
@@ -500,6 +505,7 @@ const SurfaceState = struct {
     wheel_remainder_x: i32 = 0,
     wheel_remainder_y: i32 = 0,
     active_dispatches: usize = 0,
+    storage_retained: bool = false,
     active_dispatches: usize = 0,
 };
 
@@ -509,6 +515,7 @@ const HostState = struct {
     surfaces: std.ArrayListUnmanaged(*SurfaceState) = .empty,
     admission: AdmissionState = .{},
     shutting_down: std.atomic.Value(bool) = .init(false),
+    retired_surfaces: ?*SurfaceState = null,
     deinitialize_requested: bool = false,
     creation_depth: usize = 0,
     destroy_surface_depth: usize = 0,
@@ -969,6 +976,7 @@ fn endDispatch(surface: *SurfaceState) void {
     std.debug.assert(surface.host.active_dispatches > 0);
     surface.active_dispatches -= 1;
     surface.host.active_dispatches -= 1;
+    maybeFinalizeRetiredSurface(surface);
     maybeFinishHostDeinitialize(surface.host);
 }
 
@@ -980,8 +988,37 @@ fn maybeFinishHostDeinitialize(state: *HostState) void {
     {
         state.deinitialize_requested = false;
         deinitializeHost(state, 1);
+        allocator.destroy(state);
     }
 }
+
+fn retainRetiredSurface(host: *HostState, surface: *SurfaceState) void {
+    if (surface.storage_retained) return;
+    surface.storage_retained = true;
+    surface.retired_next = host.retired_surfaces;
+    host.retired_surfaces = surface;
+}
+
+fn maybeFinalizeRetiredSurface(surface: *SurfaceState) void {
+    if (!surface.storage_retained or surface.active_dispatches != 0) return;
+    surface.admission.mutex.lock();
+    const admitted = surface.admission.admitted;
+    const clear_admitted = surface.admission.clear_admitted;
+    surface.admission.mutex.unlock();
+    if (admitted != 0 or clear_admitted != 0) return;
+
+    var link: *?*SurfaceState = &surface.host.retired_surfaces;
+    while (link.*) |value| {
+        if (value == surface) {
+            link.* = value.retired_next;
+            break;
+        }
+        link = &value.retired_next;
+    }
+    surface.storage_retained = false;
+    surface.retired_next = null;
+    deinitSurfaceResources(surface);
+    allocator.destroy(surface);
 
 fn registerSurfaceClass() void {
     const class: WNDCLASSEXW = .{
@@ -1256,9 +1293,9 @@ fn cellCoordinate(value: i32, cell: u32) i32 {
 fn mouseButton(message: UINT, wparam: WPARAM) u32 {
     return switch (message) {
         WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK => 1,
-        WM_RBUTTONDOWN, WM_RBUTTONUP => 2,
-        WM_MBUTTONDOWN, WM_MBUTTONUP => 3,
-        WM_XBUTTONDOWN, WM_XBUTTONUP => if (((wparam >> 16) & 0xffff) == 2) 5 else 4,
+        WM_RBUTTONDOWN, WM_RBUTTONUP, WM_RBUTTONDBLCLK => 2,
+        WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MBUTTONDBLCLK => 3,
+        WM_XBUTTONDOWN, WM_XBUTTONUP, WM_XBUTTONDBLCLK => if (((wparam >> 16) & 0xffff) == 2) 5 else 4,
         else => 0,
     };
 }
@@ -1271,11 +1308,40 @@ fn mouseKind(message: UINT) u32 {
         WM_MBUTTONDOWN,
         WM_XBUTTONDOWN,
         WM_LBUTTONDBLCLK,
+        WM_RBUTTONDBLCLK,
+        WM_MBUTTONDBLCLK,
+        WM_XBUTTONDBLCLK,
         => mouse_button_down,
         WM_LBUTTONUP, WM_RBUTTONUP, WM_MBUTTONUP, WM_XBUTTONUP => mouse_button_up,
         WM_MOUSEWHEEL, WM_MOUSEHWHEEL => mouse_wheel,
         WM_MOUSELEAVE => mouse_leave,
         else => mouse_move,
+    };
+}
+
+fn isMouseButtonDown(message: UINT) bool {
+    return switch (message) {
+        WM_LBUTTONDOWN,
+        WM_RBUTTONDOWN,
+        WM_MBUTTONDOWN,
+        WM_XBUTTONDOWN,
+        WM_LBUTTONDBLCLK,
+        WM_RBUTTONDBLCLK,
+        WM_MBUTTONDBLCLK,
+        WM_XBUTTONDBLCLK,
+        => true,
+        else => false,
+    };
+}
+
+fn isMouseDoubleClick(message: UINT) bool {
+    return switch (message) {
+        WM_LBUTTONDBLCLK,
+        WM_RBUTTONDBLCLK,
+        WM_MBUTTONDBLCLK,
+        WM_XBUTTONDBLCLK,
+        => true,
+        else => false,
     };
 }
 
@@ -1586,18 +1652,23 @@ fn surfaceWindowProc(
         WM_LBUTTONDBLCLK,
         WM_RBUTTONDOWN,
         WM_RBUTTONUP,
+        WM_RBUTTONDBLCLK,
         WM_MBUTTONDOWN,
         WM_MBUTTONUP,
+        WM_MBUTTONDBLCLK,
         WM_XBUTTONDOWN,
         WM_XBUTTONUP,
+        WM_XBUTTONDBLCLK,
         WM_MOUSEWHEEL,
         WM_MOUSEHWHEEL,
         WM_MOUSELEAVE,
         => {
             if (surface) |value| {
+                if (isMouseButtonDown(message)) {
+                    value.click_count = if (isMouseDoubleClick(message)) 2 else 1;
+                }
                 if (message == WM_LBUTTONDOWN or message == WM_LBUTTONDBLCLK) {
                     _ = SetFocus(hwnd);
-                    value.click_count = if (message == WM_LBUTTONDBLCLK) 2 else 1;
                     if (value.options.input.selection_enabled != 0) {
                         _ = SetCapture(hwnd);
                         const x = signedWord(@as(usize, @bitCast(lparam)));
@@ -1628,7 +1699,11 @@ fn surfaceWindowProc(
                     }
                 }
                 emitMouseMessage(value, hwnd, message, wparam, lparam);
-                if (message == WM_MOUSEMOVE and value.options.input.links_enabled != 0) {
+                if (message == WM_MOUSEMOVE and
+                    (value.options.input_callbacks.on_mouse != null or
+                        value.options.input.selection_enabled != 0 or
+                        value.options.input.links_enabled != 0))
+                {
                     var tracking = TrackMouseEventArgs{
                         .cbSize = @sizeOf(TrackMouseEventArgs),
                         .dwFlags = TME_LEAVE,
@@ -1697,8 +1772,14 @@ fn destroySurfaceNow(
     surface: *SurfaceState,
     remaining_admissions: usize,
 ) void {
+    if (surface.retired) return;
     surface.destroying.store(true, .release);
+    surface.invalidated.store(true, .release);
+    surface.retired = true;
     removeSurface(surface.host, surface);
+    if (remaining_admissions == 0 or surface.active_dispatches != 0) {
+        retainRetiredSurface(surface.host, surface);
+    }
     waitSurfaceAdmissions(surface, remaining_admissions);
     destroyRenderer(surface);
     if (surface.hwnd) |hwnd| {
@@ -1709,7 +1790,6 @@ fn destroySurfaceNow(
     disableClearAdmissionAndWait(surface, remaining_admissions);
     unregisterSurface(surface);
     freeRendererStorage(surface);
-    deinitSurfaceResources(surface);
 }
 
 fn cleanupUnregisteredSurface(
@@ -1723,7 +1803,11 @@ fn cleanupUnregisteredSurface(
         surface.hwnd = null;
     }
     closeSurfaceAdmission(surface);
-    destroySurfaceNow(surface, 0);
+    destroyRenderer(surface);
+    disableClearAdmissionAndWait(surface, 0);
+    unregisterSurface(surface);
+    freeRendererStorage(surface);
+    deinitSurfaceResources(surface);
     allocator.destroy(surface);
 }
 
@@ -1766,10 +1850,15 @@ fn deinitializeHost(
         const surface = state.surfaces.items[state.surfaces.items.len - 1];
         closeSurfaceAdmission(surface);
         destroySurfaceNow(surface, 0);
-        allocator.destroy(surface);
     }
     state.surfaces.deinit(allocator);
     unregisterHost(state);
+    var retired = state.retired_surfaces;
+    while (retired) |surface| {
+        retired = surface.retired_next;
+        deinitSurfaceResources(surface);
+        allocator.destroy(surface);
+    }
 }
 
 fn finishDeferredHostDeinitialize(
@@ -1778,7 +1867,8 @@ fn finishDeferredHostDeinitialize(
 ) bool {
     if (!state.deinitialize_requested or
         state.creation_depth != 0 or
-        state.destroy_surface_depth != 0)
+        state.destroy_surface_depth != 0 or
+        state.active_dispatches != 0)
     {
         return false;
     }
@@ -2053,7 +2143,6 @@ fn createSurface(
         }
         closeSurfaceAdmission(surface);
         destroySurfaceNow(surface, 0);
-        allocator.destroy(surface);
         const deinitialize_requested = state.deinitialize_requested;
         if (deinitialize_requested and state.creation_depth == 0) {
             deinitializeHost(state, 1);
@@ -2131,8 +2220,14 @@ pub export fn winghostty_surface_destroy(surface: ?*Surface) Result {
     host.destroy_surface_depth -= 1;
     const host_deinitialized = finishDeferredHostDeinitialize(host, 1);
     releaseSurfaceAdmission(&admission);
+    if (!host_deinitialized and
+        !state.storage_retained and
+        state.active_dispatches == 0)
+    {
+        deinitSurfaceResources(state);
+        allocator.destroy(state);
+    }
     if (host_deinitialized) allocator.destroy(host);
-    allocator.destroy(state);
     return result_ok;
 }
 
@@ -2683,7 +2778,11 @@ pub export fn winghostty_surface_notify_exit(
     const user_data = state.options.user_data;
     const handle = surfaceHandle(state);
     releaseSurfaceAdmission(&admission);
-    if (callback) |value| value(user_data, handle, status);
+    if (callback) |value| {
+        beginDispatch(state);
+        defer endDispatch(state);
+        value(user_data, handle, status);
+    }
     return result_ok;
 }
 
@@ -2704,7 +2803,11 @@ pub export fn winghostty_surface_notify_title(
     const user_data = state.options.user_data;
     const handle = surfaceHandle(state);
     releaseSurfaceAdmission(&admission);
-    if (callback) |callback_value| callback_value(user_data, handle, value);
+    if (callback) |callback_value| {
+        beginDispatch(state);
+        defer endDispatch(state);
+        callback_value(user_data, handle, value);
+    }
     return result_ok;
 }
 
@@ -2725,7 +2828,11 @@ pub export fn winghostty_surface_notify_cwd(
     const user_data = state.options.user_data;
     const handle = surfaceHandle(state);
     releaseSurfaceAdmission(&admission);
-    if (callback) |callback_value| callback_value(user_data, handle, value);
+    if (callback) |callback_value| {
+        beginDispatch(state);
+        defer endDispatch(state);
+        callback_value(user_data, handle, value);
+    }
     return result_ok;
 }
 
@@ -2742,7 +2849,11 @@ pub export fn winghostty_surface_notify_bell(surface: ?*Surface) Result {
     const user_data = state.options.user_data;
     const handle = surfaceHandle(state);
     releaseSurfaceAdmission(&admission);
-    if (callback) |value| value(user_data, handle);
+    if (callback) |value| {
+        beginDispatch(state);
+        defer endDispatch(state);
+        value(user_data, handle);
+    }
     return result_ok;
 }
 
@@ -2763,7 +2874,11 @@ pub export fn winghostty_surface_notify_notification(
     const user_data = state.options.user_data;
     const handle = surfaceHandle(state);
     releaseSurfaceAdmission(&admission);
-    if (callback) |callback_value| callback_value(user_data, handle, value);
+    if (callback) |callback_value| {
+        beginDispatch(state);
+        defer endDispatch(state);
+        callback_value(user_data, handle, value);
+    }
     return result_ok;
 }
 
@@ -2780,7 +2895,11 @@ pub export fn winghostty_surface_notify_redraw(surface: ?*Surface) Result {
     const user_data = state.options.user_data;
     const handle = surfaceHandle(state);
     releaseSurfaceAdmission(&admission);
-    if (callback) |value| value(user_data, handle);
+    if (callback) |value| {
+        beginDispatch(state);
+        defer endDispatch(state);
+        value(user_data, handle);
+    }
     return result_ok;
 }
 
@@ -2800,7 +2919,11 @@ pub export fn winghostty_surface_notify_focus(
     const user_data = state.options.user_data;
     const handle = surfaceHandle(state);
     releaseSurfaceAdmission(&admission);
-    if (callback) |value| value(user_data, handle, if (focused == 0) 0 else 1);
+    if (callback) |value| {
+        beginDispatch(state);
+        defer endDispatch(state);
+        value(user_data, handle, if (focused == 0) 0 else 1);
+    }
     return result_ok;
 }
 
@@ -2822,7 +2945,11 @@ pub export fn winghostty_surface_notify_fatal_error(
     const user_data = state.options.user_data;
     const handle = surfaceHandle(state);
     releaseSurfaceAdmission(&admission);
-    if (callback) |callback_value| callback_value(user_data, handle, result_code, value);
+    if (callback) |callback_value| {
+        beginDispatch(state);
+        defer endDispatch(state);
+        callback_value(user_data, handle, result_code, value);
+    }
     return result_ok;
 }
 
@@ -2928,4 +3055,21 @@ test "SurfaceOptions copies caller-owned strings" {
     try std.testing.expectEqualStrings("cmd.exe", owned.command.?);
     try std.testing.expectEqualStrings("C:\\", owned.cwd.?);
     try std.testing.expectEqualStrings("A=B", owned.environment.?);
+}
+
+test "retired surface retention survives allocator failure" {
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    try std.testing.expectError(error.OutOfMemory, failing.allocator().alloc(u8, 1));
+
+    var host: HostState = undefined;
+    host.retired_surfaces = null;
+    var first: SurfaceState = undefined;
+    var second: SurfaceState = undefined;
+    retainRetiredSurface(&host, &first);
+    retainRetiredSurface(&host, &second);
+    try std.testing.expectEqual(@as(?*SurfaceState, &second), host.retired_surfaces);
+    try std.testing.expectEqual(@as(?*SurfaceState, &first), second.retired_next);
 }
