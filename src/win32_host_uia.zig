@@ -51,6 +51,8 @@ pub const SelectionCallback = *const fn (
     start: usize,
     end: usize,
 ) void;
+pub const SelectionContextRetain = *const fn (ctx: *anyopaque) void;
+pub const SelectionContextRelease = *const fn (ctx: *anyopaque) void;
 
 pub const Config = struct {
     name: []const u8 = "Terminal",
@@ -64,6 +66,8 @@ pub const Config = struct {
     metrics: Metrics = .{},
     screen_origin_query: ?ScreenOriginQuery = null,
     callback_ctx: ?*anyopaque = null,
+    callback_ctx_retain: ?SelectionContextRetain = null,
+    callback_ctx_release: ?SelectionContextRelease = null,
     on_selection: ?SelectionCallback = null,
 };
 
@@ -289,6 +293,8 @@ pub const SurfaceProvider = struct {
     disconnected: std.atomic.Value(bool),
     screen_origin_query: ?ScreenOriginQuery,
     callback_ctx: ?*anyopaque,
+    callback_ctx_retain: ?SelectionContextRetain,
+    callback_ctx_release: ?SelectionContextRelease,
     on_selection: ?SelectionCallback,
 
     const simple_vtbl: com.IRawElementProviderSimpleVtbl = .{
@@ -379,8 +385,13 @@ pub const SurfaceProvider = struct {
             .disconnected = std.atomic.Value(bool).init(false),
             .screen_origin_query = config.screen_origin_query,
             .callback_ctx = config.callback_ctx,
+            .callback_ctx_retain = config.callback_ctx_retain,
+            .callback_ctx_release = config.callback_ctx_release,
             .on_selection = config.on_selection,
         };
+        if (config.callback_ctx) |ctx| {
+            if (config.callback_ctx_retain) |retain| retain(ctx);
+        }
         return self;
     }
 
@@ -422,9 +433,16 @@ pub const SurfaceProvider = struct {
     pub fn detach(self: *SurfaceProvider) void {
         self.detached.store(true, .release);
         self.callback_lock.lock();
+        const callback_ctx = self.callback_ctx;
+        const callback_ctx_release = self.callback_ctx_release;
         self.on_selection = null;
         self.callback_ctx = null;
+        self.callback_ctx_retain = null;
+        self.callback_ctx_release = null;
         self.callback_lock.unlock();
+        if (callback_ctx) |ctx| {
+            if (callback_ctx_release) |release_ctx| release_ctx(ctx);
+        }
     }
 
     pub fn disconnect(self: *SurfaceProvider) com.HRESULT {
@@ -653,6 +671,17 @@ pub const SurfaceProvider = struct {
     }
 
     fn destroyStorage(self: *SurfaceProvider) void {
+        self.callback_lock.lock();
+        const callback_ctx = self.callback_ctx;
+        const callback_ctx_release = self.callback_ctx_release;
+        self.callback_ctx = null;
+        self.callback_ctx_retain = null;
+        self.callback_ctx_release = null;
+        self.on_selection = null;
+        self.callback_lock.unlock();
+        if (callback_ctx) |ctx| {
+            if (callback_ctx_release) |release_ctx| release_ctx(ctx);
+        }
         self.state_lock.lock();
         self.snapshot.deinit(self.alloc);
         self.alloc.free(self.name);
@@ -686,7 +715,7 @@ pub const SurfaceProvider = struct {
         return SurfaceTextRangeProvider.create(self.alloc, self, range) catch null;
     }
 
-    fn setSelectedRange(self: *SurfaceProvider, range: Range) com.HRESULT {
+    pub fn setSelectedRange(self: *SurfaceProvider, range: Range) com.HRESULT {
         var call = self.beginCall() orelse return com.UIA_E_ELEMENTNOTAVAILABLE;
         defer call.deinit();
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
@@ -701,11 +730,14 @@ pub const SurfaceProvider = struct {
         self.state_lock.unlock();
         var callback: ?SelectionCallback = null;
         var callback_ctx: ?*anyopaque = null;
+        var callback_ctx_release: ?SelectionContextRelease = null;
         self.callback_lock.lock();
         if (!self.detached.load(.acquire)) {
             callback = self.on_selection;
             callback_ctx = self.callback_ctx;
+            callback_ctx_release = self.callback_ctx_release;
             if (callback != null and callback_ctx != null) {
+                if (self.callback_ctx_retain) |retain| retain(callback_ctx.?);
                 self.callback_inflight += 1;
             }
         }
@@ -716,6 +748,7 @@ pub const SurfaceProvider = struct {
                 self.callback_lock.lock();
                 self.callback_inflight -= 1;
                 self.callback_lock.unlock();
+                if (callback_ctx_release) |release_ctx| release_ctx(ctx);
             }
         }
         raiseAutomationEvent(self, 20014);

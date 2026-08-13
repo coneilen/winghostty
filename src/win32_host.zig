@@ -308,6 +308,12 @@ const SelectionDispatch = struct {
         return self;
     }
 
+    fn retain(self: *SelectionDispatch) void {
+        self.lock.lock();
+        self.refs += 1;
+        self.lock.unlock();
+    }
+
     fn release(self: *SelectionDispatch) void {
         self.lock.lock();
         self.refs -= 1;
@@ -330,6 +336,16 @@ const SelectionDispatch = struct {
         self.lock.lock();
         defer self.lock.unlock();
         return self.active;
+    }
+
+    fn retainContext(ctx: *anyopaque) void {
+        const self: *SelectionDispatch = @ptrCast(@alignCast(ctx));
+        self.retain();
+    }
+
+    fn releaseContext(ctx: *anyopaque) void {
+        const self: *SelectionDispatch = @ptrCast(@alignCast(ctx));
+        self.release();
     }
 
     fn invoke(self: *SelectionDispatch, start: usize, end: usize) void {
@@ -359,6 +375,28 @@ const SelectionMessage = struct {
     start: usize,
     end: usize,
 };
+
+const SelectionDispatchTestGate = struct {
+    entered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    allow: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+var selection_dispatch_test_gate: ?*SelectionDispatchTestGate = null;
+
+fn gatedAccessibilitySelection(
+    ctx: *anyopaque,
+    start: usize,
+    end: usize,
+) void {
+    const dispatch: *SelectionDispatch = @ptrCast(@alignCast(ctx));
+    const gate = selection_dispatch_test_gate orelse {
+        dispatch.invoke(start, end);
+        return;
+    };
+    gate.entered.store(true, .release);
+    while (!gate.allow.load(.acquire)) std.Thread.yield() catch {};
+    dispatch.invoke(start, end);
+}
 
 pub const ExitCallback = *const fn (?*anyopaque, *Surface, i32) callconv(.c) void;
 pub const TitleCallback = *const fn (?*anyopaque, *Surface, [*:0]const u8) callconv(.c) void;
@@ -2498,6 +2536,8 @@ fn createSurface(
                 .cell_height = @floatFromInt(surface.metrics.cell_height),
             },
             .callback_ctx = surface.selection_dispatch,
+            .callback_ctx_retain = SelectionDispatch.retainContext,
+            .callback_ctx_release = SelectionDispatch.releaseContext,
             .on_selection = accessibilitySelection,
         },
     ) catch {
@@ -3752,4 +3792,34 @@ test "selection dispatch retains state across owner-thread teardown" {
     dispatch.deactivate();
     try std.testing.expect(!retained.isActive());
     retained.release();
+}
+
+test "provider-owned selection dispatch survives teardown before invoke" {
+    var dispatch = try SelectionDispatch.create(@ptrFromInt(1));
+    var provider = try host_uia.SurfaceProvider.create(
+        std.testing.allocator,
+        @ptrFromInt(1),
+        .{
+            .callback_ctx = dispatch,
+            .callback_ctx_retain = SelectionDispatch.retainContext,
+            .callback_ctx_release = SelectionDispatch.releaseContext,
+            .on_selection = gatedAccessibilitySelection,
+        },
+    );
+    var gate = SelectionDispatchTestGate{};
+    selection_dispatch_test_gate = &gate;
+    defer selection_dispatch_test_gate = null;
+
+    const selection_thread = try std.Thread.spawn(.{}, struct {
+        fn run(value: *host_uia.SurfaceProvider) void {
+            _ = value.setSelectedRange(.{ .start = 0, .end = 0 });
+        }
+    }.run, .{provider});
+    while (!gate.entered.load(.acquire)) std.Thread.yield() catch {};
+
+    provider.detach();
+    dispatch.deactivate();
+    gate.allow.store(true, .release);
+    selection_thread.join();
+    _ = host_uia.SurfaceProvider.Release(&provider.base);
 }

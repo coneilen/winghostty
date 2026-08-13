@@ -95,7 +95,9 @@ callbacks, and teardown; provider options advertise COM-threaded access.
 UIA selection callbacks synchronously marshal through the surface window to the
 host owner thread, so embedding callbacks and all `DestroyWindow`/host teardown
 remain owner-thread-only. Provider release defers final storage reclamation
-while a COM-threaded callback is still in flight.
+while a COM-threaded callback is still in flight, and the provider retains a
+strong dispatch-context reference until every copied callback context has
+returned.
 Each child tracks its screen-space origin for `RangeFromPoint` and bounding
 rectangles and refreshes it after moves, DPI changes, and bounds updates.
 Text geometry uses Unicode display-cell columns (including combining and
