@@ -8165,6 +8165,18 @@ Assert-WorkflowContract `
     -Pattern '(?ms)- name: CMD Zig cache cross-drive regression check\s+shell: pwsh\s+run: ./test/windows/zig-cache-cmd-cross-drive\.ps1' `
     -Description 'Windows CI executes the forced cross-drive CMD cache regression'
 Assert-WorkflowContract `
+    -Path $testWorkflow `
+    -Pattern '(?ms)- name: Win32 host API external compile contract\s+shell: pwsh\s+run: ./test/windows/compile-win32-host-api\.ps1.*?- name: Win32 host API lifecycle smoke\s+shell: pwsh\s+run: ./test/windows/run-win32-host-api-smoke\.ps1' `
+    -Description 'Windows CI compiles and exercises the external Win32 host API boundary'
+Assert-WorkflowContract `
+    -Path (Join-Path $repoRoot 'src\win32_host.zig') `
+    -Pattern '(?s)pub export fn winghostty_host_initialize.*?pub export fn winghostty_host_deinitialize.*?pub export fn winghostty_host_create_surface.*?pub export fn winghostty_surface_destroy' `
+    -Description 'Win32 host API owns explicit initialize/create/destroy lifecycle exports'
+Assert-WorkflowContractAbsent `
+    -Path (Join-Path $repoRoot 'src\win32_host.zig') `
+    -Pattern '(?i)GraphCode|App\.zig|Surface\.zig|apprt\.win32' `
+    -Description 'Win32 host API boundary does not import GraphCode or product surface types'
+Assert-WorkflowContract `
     -Path (Join-Path $repoRoot 'scripts\dev-windows.ps1') `
     -Pattern '(?s)\. \(Join-Path \$PSScriptRoot "zig-cache\.ps1"\).*?Set-WinghosttyZigCacheEnvironment' `
     -Description 'PowerShell Windows bootstrap centralizes Zig cache isolation'

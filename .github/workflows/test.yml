@@ -98,6 +98,14 @@ jobs:
         shell: pwsh
         run: ./test/windows/zig-cache-offline-build.ps1
 
+      - name: Win32 host API external compile contract
+        shell: pwsh
+        run: ./test/windows/compile-win32-host-api.ps1
+
+      - name: Win32 host API lifecycle smoke
+        shell: pwsh
+        run: ./test/windows/run-win32-host-api-smoke.ps1
+
       - name: Zig version
         run: zig version
 

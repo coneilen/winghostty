@@ -1,7 +1,9 @@
 # Winghostty baseline
 
 This is the reproducible pre-extraction baseline for the Windows fork. It
-does not add a host API or GraphCode product code.
+It does not add GraphCode product code or extract the original renderer and
+terminal implementation. The standalone `win32_host` API skeleton is the
+explicit lifecycle boundary for later extraction work.
 
 ## Compatibility tuple
 

@@ -41,6 +41,32 @@ pub fn build(b: *std.Build) !void {
         b,
         file_version orelse app_zon_version,
     );
+    const emit_win32_host = b.option(
+        bool,
+        "emit-win32-host",
+        "Build the embeddable Win32 host API skeleton.",
+    ) orelse false;
+    if (emit_win32_host) {
+        const host_lib = b.addLibrary(.{
+            .name = "winghostty-win32-host",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/win32_host.zig"),
+                .target = config.target,
+                .optimize = config.optimize,
+            }),
+            .linkage = .static,
+        });
+        host_lib.linkLibC();
+        host_lib.linkSystemLibrary("kernel32");
+        host_lib.linkSystemLibrary("user32");
+        b.installArtifact(host_lib);
+        const host_header = b.addInstallFile(
+            b.path("include/winghostty/win32_host.h"),
+            "include/winghostty/win32_host.h",
+        );
+        b.getInstallStep().dependOn(&host_header.step);
+        return;
+    }
     const test_filters = b.option(
         [][]const u8,
         "test-filter",
