@@ -47,6 +47,8 @@ const WM_NCCREATE: u32 = 0x0081;
 const WM_NCDESTROY: u32 = 0x0082;
 const WM_PAINT: u32 = 0x000F;
 const WM_ERASEBKGND: u32 = 0x0014;
+const WM_MOVE: u32 = 0x0003;
+const WM_WINDOWPOSCHANGED: u32 = 0x0047;
 const WM_SETFOCUS: u32 = 0x0007;
 const WM_KILLFOCUS: u32 = 0x0008;
 const WM_GETOBJECT: u32 = 0x003D;
@@ -177,6 +179,10 @@ extern "user32" fn SetWindowPos(
     height: i32,
     flags: UINT,
 ) callconv(.winapi) BOOL;
+extern "user32" fn ClientToScreen(
+    hwnd: HWND,
+    point: *POINT,
+) callconv(.winapi) BOOL;
 extern "user32" fn ShowWindow(hwnd: HWND, command: i32) callconv(.winapi) BOOL;
 extern "user32" fn GetDpiForWindow(hwnd: HWND) callconv(.winapi) u32;
 extern "user32" fn GetKeyState(virtual_key: i32) callconv(.winapi) i16;
@@ -283,6 +289,17 @@ pub const DpiChangedCallback = *const fn (?*anyopaque, *Surface, u32, f32) callc
 pub const MetricsChangedCallback = *const fn (?*anyopaque, *Surface, *const CellMetrics) callconv(.c) void;
 pub const AccessibilitySelectionCallback = *const fn (?*anyopaque, *Surface, u64, u64) callconv(.c) void;
 
+pub const LegacyCallbacks = extern struct {
+    on_exit: ?ExitCallback,
+    on_title: ?TitleCallback,
+    on_cwd: ?CwdCallback,
+    on_bell: ?BellCallback,
+    on_notification: ?NotificationCallback,
+    on_redraw: ?RedrawCallback,
+    on_focus: ?FocusCallback,
+    on_fatal_error: ?FatalErrorCallback,
+};
+
 pub const Callbacks = extern struct {
     on_exit: ?ExitCallback,
     on_title: ?TitleCallback,
@@ -380,7 +397,7 @@ pub const LegacySurfaceOptions = extern struct {
     focus: u8,
     theme: Theme,
     font_scale: f32,
-    callbacks: Callbacks,
+    callbacks: LegacyCallbacks,
     user_data: ?*anyopaque,
 };
 
@@ -498,8 +515,10 @@ const SurfaceState = struct {
     base_metrics: CellMetrics = .{},
     metrics: ScaledMetrics = host_metrics.calculate(.{}, 96, 1),
     dpi: u32 = host_metrics.default_dpi,
+    screen_origin: POINT = .{ .x = 0, .y = 0 },
     uia: ?*host_uia.SurfaceProvider = null,
     creation_in_progress: bool = false,
+    pin_count: usize = 0,
     destroying: std.atomic.Value(bool) = .init(false),
     retired: bool = false,
     retired_next: ?*SurfaceState = null,
@@ -535,6 +554,7 @@ const HostState = struct {
     deinitialize_requested: bool = false,
     creation_depth: usize = 0,
     destroy_surface_depth: usize = 0,
+    active_operations: usize = 0,
     render_thread_mutex: std.Thread.Mutex = .{},
     render_thread_id: DWORD = 0,
     active_dispatches: usize = 0,
@@ -631,6 +651,20 @@ fn surfaceStateFromId(id: usize) ?*SurfaceState {
         return null;
     }
     return state;
+}
+
+fn hostState(handle: ?*Host) ?*HostState {
+    const pointer = handle orelse return null;
+    admission_registry_mutex.lock();
+    defer admission_registry_mutex.unlock();
+    return hostStateFromId(@intFromPtr(pointer));
+}
+
+fn surfaceState(handle: ?*Surface) ?*SurfaceState {
+    const pointer = handle orelse return null;
+    admission_registry_mutex.lock();
+    defer admission_registry_mutex.unlock();
+    return surfaceStateFromId(@intFromPtr(pointer));
 }
 
 const HostAdmission = struct {
@@ -845,6 +879,48 @@ fn metricsFor(surface: *const SurfaceState) ScaledMetrics {
     );
 }
 
+fn beginSurfaceOperation(surface: *SurfaceState) bool {
+    if (surface.destroying.load(.acquire) or
+        surface.invalidated.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return false;
+    }
+    surface.pin_count += 1;
+    surface.host.active_operations += 1;
+    return true;
+}
+
+fn endSurfaceOperation(surface: *SurfaceState) void {
+    const host = surface.host;
+    surface.pin_count -= 1;
+    host.active_operations -= 1;
+    const destroy = surface.pin_count == 0 and
+        surface.destroying.load(.acquire) and
+        !surface.creation_in_progress;
+    if (destroy) destroySurfaceNow(surface, 0);
+    maybeFinishHostDeinitialize(host);
+}
+
+fn updateUiaMetrics(surface: *SurfaceState) void {
+    if (surface.uia) |provider| {
+        provider.updateMetrics(.{
+            .cell_width = @floatFromInt(surface.metrics.cell_width),
+            .cell_height = @floatFromInt(surface.metrics.cell_height),
+            .origin_x = @floatFromInt(surface.screen_origin.x),
+            .origin_y = @floatFromInt(surface.screen_origin.y),
+        });
+    }
+}
+
+fn updateScreenOrigin(surface: *SurfaceState) void {
+    const hwnd = surface.hwnd orelse return;
+    var origin: POINT = .{ .x = 0, .y = 0 };
+    if (ClientToScreen(hwnd, &origin) == 0) return;
+    surface.screen_origin = origin;
+    updateUiaMetrics(surface);
+}
+
 fn notifyMetrics(surface: *SurfaceState) void {
     if (surface.destroying.load(.acquire) or
         surface.host.shutting_down.load(.acquire))
@@ -879,12 +955,7 @@ fn updateDpi(surface: *SurfaceState, dpi: u32) void {
     if (surface.dpi == normalized) return;
     surface.dpi = normalized;
     surface.metrics = metricsFor(surface);
-    if (surface.uia) |provider| {
-        provider.updateMetrics(.{
-            .cell_width = @floatFromInt(surface.metrics.cell_width),
-            .cell_height = @floatFromInt(surface.metrics.cell_height),
-        });
-    }
+    updateScreenOrigin(surface);
     if (surface.options.callbacks.on_dpi_changed) |callback| {
         beginDispatch(surface);
         defer endDispatch(surface);
@@ -895,7 +966,17 @@ fn updateDpi(surface: *SurfaceState, dpi: u32) void {
             host_metrics.dpiScale(normalized),
         );
     }
+    if (surface.destroying.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return;
+    }
     notifyMetrics(surface);
+    if (surface.destroying.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return;
+    }
     if (surface.hwnd) |hwnd| _ = InvalidateRect(hwnd, null, 0);
 }
 
@@ -1086,7 +1167,8 @@ fn maybeFinishHostDeinitialize(state: *HostState) void {
     if (state.deinitialize_requested and
         state.creation_depth == 0 and
         state.destroy_surface_depth == 0 and
-        state.active_dispatches == 0)
+        state.active_dispatches == 0 and
+        state.active_operations == 0)
     {
         state.deinitialize_requested = false;
         deinitializeHost(state, 1);
@@ -1121,6 +1203,7 @@ fn maybeFinalizeRetiredSurface(surface: *SurfaceState) void {
     surface.retired_next = null;
     deinitSurfaceResources(surface);
     allocator.destroy(surface);
+}
 
 fn registerSurfaceClass() void {
     const class: WNDCLASSEXW = .{
@@ -1152,6 +1235,14 @@ fn setUserData(hwnd: HWND, surface: ?*SurfaceState) void {
     else
         0;
     _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, value);
+}
+
+fn detachSurfaceProvider(surface: *SurfaceState) void {
+    if (surface.uia) |provider| {
+        _ = provider.disconnect();
+        _ = host_uia.SurfaceProvider.Release(&provider.base);
+        surface.uia = null;
+    }
 }
 
 fn notifyFocus(surface: *SurfaceState, focused: bool) void {
@@ -1661,6 +1752,10 @@ fn surfaceWindowProc(
             }
             return 0;
         },
+        WM_MOVE, WM_WINDOWPOSCHANGED => {
+            if (surface) |value| updateScreenOrigin(value);
+            return DefWindowProcW(hwnd, message, wparam, lparam);
+        },
         WM_SETFOCUS => {
             if (surface) |value| notifyFocus(value, true);
             return 0;
@@ -2061,6 +2156,58 @@ fn defaultSurfaceOptions() SurfaceOptions {
     };
 }
 
+pub export fn winghostty_surface_options_v2_init(options: *SurfaceOptions) void {
+    options.* = .{
+        .size = @sizeOf(SurfaceOptions),
+        .version = 2,
+        .command = null,
+        .cwd = null,
+        .environment = null,
+        .bounds = .{ .x = 0, .y = 0, .width = 800, .height = 600 },
+        .visible = 1,
+        .focus = 0,
+        .theme = theme_system,
+        .font_scale = 1.0,
+        .callbacks = .{
+            .on_exit = null,
+            .on_title = null,
+            .on_cwd = null,
+            .on_bell = null,
+            .on_notification = null,
+            .on_redraw = null,
+            .on_focus = null,
+            .on_fatal_error = null,
+            .on_dpi_changed = null,
+            .on_metrics_changed = null,
+            .on_accessibility_selection = null,
+        },
+        .user_data = null,
+        .input_callbacks = .{
+            .on_key = null,
+            .on_text = null,
+            .on_ime_start = null,
+            .on_ime_update = null,
+            .on_ime_end = null,
+            .on_mouse = null,
+            .on_selection = null,
+            .on_link = null,
+            .on_paste = null,
+            .on_clipboard_read = null,
+            .on_clipboard_write = null,
+        },
+        .input = .{
+            .cell_width = 8,
+            .cell_height = 16,
+            .selection_enabled = 1,
+            .links_enabled = 1,
+            .paste_protection = 1,
+            .bracketed_paste = 1,
+            .reserved = .{0} ** 4,
+            .keyboard_layout = null,
+        },
+    };
+}
+
 pub export fn winghostty_surface_options_init(options: *LegacySurfaceOptions) void {
     const full = defaultSurfaceOptions();
     options.* = .{
@@ -2072,13 +2219,18 @@ pub export fn winghostty_surface_options_init(options: *LegacySurfaceOptions) vo
         .focus = full.focus,
         .theme = full.theme,
         .font_scale = full.font_scale,
-        .callbacks = full.callbacks,
+        .callbacks = .{
+            .on_exit = full.callbacks.on_exit,
+            .on_title = full.callbacks.on_title,
+            .on_cwd = full.callbacks.on_cwd,
+            .on_bell = full.callbacks.on_bell,
+            .on_notification = full.callbacks.on_notification,
+            .on_redraw = full.callbacks.on_redraw,
+            .on_focus = full.callbacks.on_focus,
+            .on_fatal_error = full.callbacks.on_fatal_error,
+        },
         .user_data = full.user_data,
     };
-}
-
-pub export fn winghostty_surface_options_v2_init(options: *SurfaceOptions) void {
-    options.* = defaultSurfaceOptions();
 }
 
 pub export fn winghostty_host_initialize(out_host: ?*?*Host) Result {
@@ -2138,7 +2290,14 @@ fn legacyToV2(source: *const LegacySurfaceOptions) SurfaceOptions {
     result.focus = source.focus;
     result.theme = source.theme;
     result.font_scale = source.font_scale;
-    result.callbacks = source.callbacks;
+    result.callbacks.on_exit = source.callbacks.on_exit;
+    result.callbacks.on_title = source.callbacks.on_title;
+    result.callbacks.on_cwd = source.callbacks.on_cwd;
+    result.callbacks.on_bell = source.callbacks.on_bell;
+    result.callbacks.on_notification = source.callbacks.on_notification;
+    result.callbacks.on_redraw = source.callbacks.on_redraw;
+    result.callbacks.on_focus = source.callbacks.on_focus;
+    result.callbacks.on_fatal_error = source.callbacks.on_fatal_error;
     result.user_data = source.user_data;
     return result;
 }
@@ -2207,7 +2366,7 @@ fn createSurface(
             surface,
             null,
             result_win32_error,
-            &host_admission,
+            host_admission,
         );
     };
     surface.hwnd = hwnd;
@@ -2233,9 +2392,10 @@ fn createSurface(
             surface,
             hwnd,
             result_out_of_memory,
-            &host_admission,
+            host_admission,
         );
     };
+    updateScreenOrigin(surface);
 
     if (state.shutting_down.load(.acquire)) {
         return finishUnregisteredSurfaceCreation(
@@ -2243,7 +2403,7 @@ fn createSurface(
             surface,
             hwnd,
             result_shutting_down,
-            &host_admission,
+            host_admission,
         );
     }
 
@@ -2253,7 +2413,7 @@ fn createSurface(
             surface,
             hwnd,
             result_out_of_memory,
-            &host_admission,
+            host_admission,
         );
     };
     renderer.* = win32_context.Context.init(hwnd) catch |err| {
@@ -2271,7 +2431,7 @@ fn createSurface(
                 error.CreateContextFailed => result_context_error,
                 else => result_renderer_error,
             },
-            &host_admission,
+            host_admission,
         );
     };
     surface.renderer = renderer;
@@ -2282,7 +2442,7 @@ fn createSurface(
             surface,
             hwnd,
             result_out_of_memory,
-            &host_admission,
+            host_admission,
         );
     };
 
@@ -2306,7 +2466,7 @@ fn createSurface(
         const deinitialize_requested = state.deinitialize_requested;
         if (deinitialize_requested and state.creation_depth == 0) {
             deinitializeHost(state, 1);
-            releaseHostAdmission(&host_admission);
+            releaseHostAdmission(host_admission);
             allocator.destroy(state);
         }
         return if (was_invalidated and !was_shutting_down)
@@ -2327,13 +2487,16 @@ pub export fn winghostty_host_create_surface(
 ) Result {
     const output = out_surface orelse return result_invalid_argument;
     output.* = null;
-    const state = hostState(host) orelse return result_invalid_argument;
+    var host_admission = admitHost(host) orelse
+        return unavailableHostResult(host);
+    defer releaseHostAdmission(&host_admission);
+    const state = host_admission.state;
     const parent_hwnd = parent orelse return result_invalid_argument;
     const source = options orelse return result_invalid_argument;
     const thread_result = checkHost(state);
     if (thread_result != result_ok) return thread_result;
     var v2 = legacyToV2(source);
-    return createSurface(state, parent_hwnd, &v2, output);
+    return createSurface(state, parent_hwnd, &v2, output, &host_admission);
 }
 
 pub export fn winghostty_host_create_surface_v2(
@@ -2344,7 +2507,10 @@ pub export fn winghostty_host_create_surface_v2(
 ) Result {
     const output = out_surface orelse return result_invalid_argument;
     output.* = null;
-    const state = hostState(host) orelse return result_invalid_argument;
+    var host_admission = admitHost(host) orelse
+        return unavailableHostResult(host);
+    defer releaseHostAdmission(&host_admission);
+    const state = host_admission.state;
     const parent_hwnd = parent orelse return result_invalid_argument;
     const source = options orelse return result_invalid_argument;
     const thread_result = checkHost(state);
@@ -2352,7 +2518,7 @@ pub export fn winghostty_host_create_surface_v2(
     if (source.version != 2 or source.size < @sizeOf(SurfaceOptions)) {
         return result_invalid_argument;
     }
-    return createSurface(state, parent_hwnd, source, output);
+    return createSurface(state, parent_hwnd, source, output, &host_admission);
 }
 
 pub export fn winghostty_surface_destroy(surface: ?*Surface) Result {
@@ -2528,12 +2694,7 @@ pub export fn winghostty_surface_set_font_scale(
     state.options.font_scale = font_scale;
     state.options_mutex.unlock();
     state.metrics = metricsFor(state);
-    if (state.uia) |provider| {
-        provider.updateMetrics(.{
-            .cell_width = @floatFromInt(state.metrics.cell_width),
-            .cell_height = @floatFromInt(state.metrics.cell_height),
-        });
-    }
+    updateScreenOrigin(state);
     notifyMetrics(state);
     const hwnd = state.hwnd;
     releaseSurfaceAdmission(&admission);
@@ -2552,6 +2713,8 @@ pub export fn winghostty_surface_set_cell_metrics(
     const next = metrics orelse return result_invalid_argument;
     const result = checkSurface(state);
     if (result != result_ok) return result;
+    if (!beginSurfaceOperation(state)) return result_surface_invalidated;
+    defer endSurfaceOperation(state);
     if (next.font_width == 0 or next.font_height == 0 or
         next.cell_width == 0 or next.cell_height == 0 or
         next.baseline > next.font_height)
@@ -2560,13 +2723,13 @@ pub export fn winghostty_surface_set_cell_metrics(
     }
     state.base_metrics = next.*;
     state.metrics = metricsFor(state);
-    if (state.uia) |provider| {
-        provider.updateMetrics(.{
-            .cell_width = @floatFromInt(state.metrics.cell_width),
-            .cell_height = @floatFromInt(state.metrics.cell_height),
-        });
-    }
+    updateScreenOrigin(state);
     notifyMetrics(state);
+    if (state.destroying.load(.acquire) or
+        state.host.shutting_down.load(.acquire))
+    {
+        return result_ok;
+    }
     if (state.hwnd) |hwnd| _ = InvalidateRect(hwnd, null, 0);
     return result_ok;
 }

@@ -45,7 +45,11 @@ pub fn scaleMetric(value: u32, dpi: u32, font_scale: f32) u32 {
         @as(f64, @floatFromInt(default_dpi)) *
         @as(f64, font_scale);
     if (!std.math.isFinite(scaled)) return 0;
-    return @max(@as(u32, 1), @as(u32, @intFromFloat(@round(scaled))));
+    const rounded = @round(scaled);
+    if (rounded >= @as(f64, @floatFromInt(std.math.maxInt(u32)))) {
+        return std.math.maxInt(u32);
+    }
+    return @max(@as(u32, 1), @as(u32, @intFromFloat(rounded)));
 }
 
 pub fn calculate(base: BaseMetrics, dpi: u32, font_scale: f32) Metrics {
@@ -112,4 +116,10 @@ test "cell bounds saturate instead of wrapping" {
     const bounds = boundsForCells(std.math.maxInt(u32), 2, metrics);
     try std.testing.expectEqual(std.math.maxInt(u32), bounds.width);
     try std.testing.expectEqual(@as(u32, 64), bounds.height);
+}
+
+test "finite oversized metrics saturate before integer conversion" {
+    const metrics = calculate(.{}, 96, std.math.floatMax(f32));
+    try std.testing.expectEqual(std.math.maxInt(u32), metrics.cell_width);
+    try std.testing.expectEqual(std.math.maxInt(u32), metrics.cell_height);
 }

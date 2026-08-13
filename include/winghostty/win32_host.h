@@ -87,6 +87,42 @@ typedef struct winghostty_callbacks {
         winghostty_result error,
         const char *message
     );
+} winghostty_callbacks;
+
+typedef struct winghostty_callbacks_v2 {
+    void (*on_exit)(
+        void *user_data,
+        winghostty_surface *surface,
+        int32_t status
+    );
+    void (*on_title)(
+        void *user_data,
+        winghostty_surface *surface,
+        const char *title
+    );
+    void (*on_cwd)(
+        void *user_data,
+        winghostty_surface *surface,
+        const char *cwd
+    );
+    void (*on_bell)(void *user_data, winghostty_surface *surface);
+    void (*on_notification)(
+        void *user_data,
+        winghostty_surface *surface,
+        const char *notification
+    );
+    void (*on_redraw)(void *user_data, winghostty_surface *surface);
+    void (*on_focus)(
+        void *user_data,
+        winghostty_surface *surface,
+        uint8_t focused
+    );
+    void (*on_fatal_error)(
+        void *user_data,
+        winghostty_surface *surface,
+        winghostty_result error,
+        const char *message
+    );
     void (*on_dpi_changed)(
         void *user_data,
         winghostty_surface *surface,
@@ -104,7 +140,7 @@ typedef struct winghostty_callbacks {
         uint64_t start,
         uint64_t end
     );
-} winghostty_callbacks;
+} winghostty_callbacks_v2;
 
 typedef enum winghostty_key_action {
     WINGHOSTTY_KEY_RELEASE = 0,
@@ -266,7 +302,7 @@ typedef struct winghostty_surface_options_v2 {
     uint8_t focus;
     winghostty_theme theme;
     float font_scale;
-    winghostty_callbacks callbacks;
+    winghostty_callbacks_v2 callbacks;
     void *user_data;
     winghostty_input_callbacks input_callbacks;
     winghostty_input_options input;

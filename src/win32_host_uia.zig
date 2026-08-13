@@ -54,6 +54,17 @@ pub const Config = struct {
     on_selection: ?SelectionCallback = null,
 };
 
+fn boundingRectangle(metrics: Metrics, line_index: usize, line_width: usize) com.UiaRect {
+    return .{
+        .left = metrics.origin_x,
+        .top = metrics.origin_y +
+            metrics.cell_height * @as(f64, @floatFromInt(line_index)),
+        .width = metrics.cell_width *
+            @as(f64, @floatFromInt(@max(line_width, 1))),
+        .height = metrics.cell_height,
+    };
+}
+
 const Snapshot = struct {
     text: []u8,
     utf16_for_byte: []usize,
@@ -190,7 +201,6 @@ pub const SurfaceProvider = struct {
         config: Config,
     ) !*SurfaceProvider {
         const name = try alloc.dupe(u8, config.name);
-        errdefer alloc.free(name);
         const snapshot = snapshotFromUtf8(
             alloc,
             config.text,
@@ -298,8 +308,10 @@ pub const SurfaceProvider = struct {
 
     pub fn updateRole(self: *SurfaceProvider, role: Role) void {
         if (!self.available()) return;
+        const previous = self.role;
+        if (previous == role) return;
         self.role = role;
-        raiseAutomationEvent(self, 20005);
+        raiseRoleChanged(self, previous, role);
     }
 
     pub fn updateMetrics(self: *SurfaceProvider, metrics: Metrics) void {
@@ -381,6 +393,14 @@ pub const SurfaceProvider = struct {
         const wide = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, text) catch return null;
         defer self.alloc.free(wide);
         return com.SysAllocStringLen(wide.ptr, @intCast(wide.len));
+    }
+
+    fn controlType(role: Role) i32 {
+        return if (role == .edit) 50004 else 50030;
+    }
+
+    fn localizedControlType(role: Role) []const u8 {
+        return if (role == .edit) "edit" else "terminal document";
     }
 
     fn selectedRange(self: *const SurfaceProvider) Range {
@@ -467,11 +487,11 @@ pub const SurfaceProvider = struct {
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         switch (property) {
             30003 => out.* = com.VARIANT.fromI4(
-                if (self.role == .edit) 50004 else 50030,
+                controlType(self.role),
             ),
             30004 => {
-                const text = if (self.role == .edit) "edit" else "terminal document";
-                const bstr = self.propertyBstr(text) orelse return com.E_OUTOFMEMORY;
+                const bstr = self.propertyBstr(localizedControlType(self.role)) orelse
+                    return com.E_OUTOFMEMORY;
                 out.* = com.VARIANT.fromBstr(bstr);
             },
             30005 => {
@@ -993,12 +1013,16 @@ const SurfaceTextRangeProvider = struct {
                 @as(usize, 1),
                 line_end - line_start,
             );
+            const rectangle = boundingRectangle(
+                self.snapshot.metrics,
+                line_index,
+                line_width,
+            );
             const values = [_]f64{
-                self.snapshot.metrics.origin_x,
-                self.snapshot.metrics.origin_y +
-                    self.snapshot.metrics.cell_height * @as(f64, @floatFromInt(line_index)),
-                self.snapshot.metrics.cell_width * @as(f64, @floatFromInt(line_width)),
-                self.snapshot.metrics.cell_height,
+                rectangle.left,
+                rectangle.top,
+                rectangle.width,
+                rectangle.height,
             };
             for (values, 0..) |item, component| {
                 var scalar = item;
@@ -1154,6 +1178,31 @@ fn raiseNameChanged(self: *SurfaceProvider) void {
     );
 }
 
+fn raiseRoleChanged(self: *SurfaceProvider, previous: Role, next: Role) void {
+    if (!self.available() or IsWindow(self.hwnd) == 0 or
+        com.UiaClientsAreListening() == 0) return;
+    _ = com.UiaRaiseAutomationPropertyChangedEvent(
+        &self.base,
+        30003,
+        com.VARIANT.fromI4(SurfaceProvider.controlType(previous)),
+        com.VARIANT.fromI4(SurfaceProvider.controlType(next)),
+    );
+    const old_value = self.propertyBstr(
+        SurfaceProvider.localizedControlType(previous),
+    ) orelse return;
+    defer com.SysFreeString(old_value);
+    const new_value = self.propertyBstr(
+        SurfaceProvider.localizedControlType(next),
+    ) orelse return;
+    defer com.SysFreeString(new_value);
+    _ = com.UiaRaiseAutomationPropertyChangedEvent(
+        &self.base,
+        30004,
+        com.VARIANT.fromBstr(old_value),
+        com.VARIANT.fromBstr(new_value),
+    );
+}
+
 pub fn handleGetObject(
     alloc: std.mem.Allocator,
     hwnd: com.HWND,
@@ -1221,4 +1270,88 @@ test "selection update clamps ranges and is rejected after detach" {
     provider.updateSelection(.{ .start = 0, .end = 1 }, 1);
     try std.testing.expectEqual(Range{ .start = 2, .end = 5 }, provider.selectionRange());
     _ = SurfaceProvider.Release(&provider.base);
+}
+
+test "range geometry tracks independent screen-space origins" {
+    var first = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(1), .{
+        .text = "AB",
+        .metrics = .{
+            .cell_width = 10,
+            .cell_height = 20,
+            .origin_x = 100,
+            .origin_y = 200,
+        },
+    });
+    defer _ = SurfaceProvider.Release(&first.base);
+    var second = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(2), .{
+        .text = "AB",
+        .metrics = .{
+            .cell_width = 10,
+            .cell_height = 20,
+            .origin_x = 500,
+            .origin_y = 700,
+        },
+    });
+    defer _ = SurfaceProvider.Release(&second.base);
+
+    var first_range: ?*com.ITextRangeProvider = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        first.textRangeFromPoint(.{ .x = 111, .y = 205 }, &first_range),
+    );
+    const first_value = SurfaceTextRangeProvider.fromBase(first_range.?);
+    try std.testing.expectEqual(Range{ .start = 1, .end = 1 }, first_value.range);
+    _ = SurfaceTextRangeProvider.Release(first_range.?);
+
+    var second_range: ?*com.ITextRangeProvider = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        second.textRangeFromPoint(.{ .x = 501, .y = 705 }, &second_range),
+    );
+    const second_value = SurfaceTextRangeProvider.fromBase(second_range.?);
+    try std.testing.expectEqual(Range{ .start = 0, .end = 0 }, second_value.range);
+    _ = SurfaceTextRangeProvider.Release(second_range.?);
+
+    const first_rect = boundingRectangle(first.snapshot.metrics, 0, 2);
+    const second_rect = boundingRectangle(second.snapshot.metrics, 0, 2);
+    try std.testing.expectEqual(@as(f64, 100), first_rect.left);
+    try std.testing.expectEqual(@as(f64, 500), second_rect.left);
+    try std.testing.expectEqual(@as(f64, 200), first_rect.top);
+    try std.testing.expectEqual(@as(f64, 700), second_rect.top);
+}
+
+test "role mapping exposes control type and localized control type" {
+    var provider = try SurfaceProvider.create(
+        std.testing.allocator,
+        @ptrFromInt(1),
+        .{},
+    );
+    defer _ = SurfaceProvider.Release(&provider.base);
+    provider.updateFocus(true);
+    provider.updateRole(.edit);
+    try std.testing.expectEqual(Role.edit, provider.role);
+    try std.testing.expect(provider.focused.load(.acquire));
+    try std.testing.expectEqual(@as(i32, 50030), SurfaceProvider.controlType(.terminal));
+    try std.testing.expectEqual(@as(i32, 50004), SurfaceProvider.controlType(.edit));
+    try std.testing.expectEqualStrings(
+        "terminal document",
+        SurfaceProvider.localizedControlType(.terminal),
+    );
+    try std.testing.expectEqualStrings("edit", SurfaceProvider.localizedControlType(.edit));
+}
+
+test "provider creation cleans up name exactly once on allocation failure" {
+    for (1..4) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        try std.testing.expectError(
+            error.OutOfMemory,
+            SurfaceProvider.create(failing.allocator(), @ptrFromInt(1), .{
+                .name = "Terminal",
+                .text = "text",
+            }),
+        );
+    }
 }

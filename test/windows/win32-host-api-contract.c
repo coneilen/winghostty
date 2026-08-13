@@ -21,7 +21,7 @@ WINGHOSTTY_LAYOUT_ASSERT(
     "rect width offset changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
-    sizeof(winghostty_callbacks) == 88,
+    sizeof(winghostty_callbacks) == 64,
     "callback ABI changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
@@ -29,7 +29,7 @@ WINGHOSTTY_LAYOUT_ASSERT(
     "fatal callback offset changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
-    sizeof(winghostty_surface_options) == 152,
+    sizeof(winghostty_surface_options) == 128,
     "surface options ABI changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
@@ -41,7 +41,7 @@ WINGHOSTTY_LAYOUT_ASSERT(
     "surface callbacks offset changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
-    offsetof(winghostty_surface_options, user_data) == 144,
+    offsetof(winghostty_surface_options, user_data) == 120,
     "surface user data offset changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
@@ -53,15 +53,27 @@ WINGHOSTTY_LAYOUT_ASSERT(
     "input options ABI changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
-    sizeof(winghostty_surface_options_v2) == 248,
+    sizeof(winghostty_callbacks_v2) == 88,
+    "callback v2 ABI changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    sizeof(winghostty_surface_options_v2) == 272,
     "surface options v2 ABI changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
-    offsetof(winghostty_surface_options_v2, input_callbacks) == 136,
+    offsetof(winghostty_surface_options_v2, callbacks) == 64,
+    "surface callbacks v2 offset changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    offsetof(winghostty_surface_options_v2, user_data) == 152,
+    "surface user data v2 offset changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    offsetof(winghostty_surface_options_v2, input_callbacks) == 160,
     "input options offset changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
-    offsetof(winghostty_surface_options_v2, input) == 224,
+    offsetof(winghostty_surface_options_v2, input) == 248,
     "input options offset changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(sizeof(winghostty_key_event) == 48, "key event ABI changed");
@@ -184,6 +196,7 @@ void winghostty_win32_host_compile_contract(void) {
     winghostty_host *host = 0;
     winghostty_surface *surface = 0;
     winghostty_surface_options options;
+    winghostty_surface_options_v2 options_v2;
     winghostty_rect bounds = {0, 0, 800, 600};
     uint32_t drained = 0;
 
@@ -213,7 +226,18 @@ void winghostty_win32_host_compile_contract(void) {
     options_v2.focus = options.focus;
     options_v2.theme = options.theme;
     options_v2.font_scale = options.font_scale;
-    options_v2.callbacks = options.callbacks;
+    options_v2.callbacks.on_exit = on_exit;
+    options_v2.callbacks.on_title = on_title;
+    options_v2.callbacks.on_cwd = on_cwd;
+    options_v2.callbacks.on_bell = on_bell;
+    options_v2.callbacks.on_notification = on_notification;
+    options_v2.callbacks.on_redraw = on_redraw;
+    options_v2.callbacks.on_focus = on_focus;
+    options_v2.callbacks.on_fatal_error = on_fatal_error;
+    options_v2.callbacks.on_dpi_changed = on_dpi_changed;
+    options_v2.callbacks.on_metrics_changed = on_metrics_changed;
+    options_v2.callbacks.on_accessibility_selection =
+        on_accessibility_selection;
     options_v2.user_data = options.user_data;
     options_v2.input_callbacks.on_key = on_key;
     options_v2.input_callbacks.on_text = on_text;

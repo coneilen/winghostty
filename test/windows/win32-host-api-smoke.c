@@ -20,6 +20,8 @@ typedef struct smoke_context {
     int loop_active;
     int destroy_on_focus;
     int deinit_on_focus;
+    int destroy_on_dpi;
+    int deinit_on_metrics;
     int deinit_on_parent_notify;
     int parent_notify_called;
     int reentrant_called;
@@ -106,6 +108,36 @@ static void on_focus(void *user_data, winghostty_surface *surface, uint8_t focus
     }
 }
 
+static void on_dpi_changed(
+    void *user_data,
+    winghostty_surface *surface,
+    uint32_t dpi,
+    float scale
+) {
+    smoke_context *context = (smoke_context *)user_data;
+    (void)dpi;
+    (void)scale;
+    record_callback(context, user_data);
+    if (context->destroy_on_dpi && !context->reentrant_called) {
+        context->reentrant_called = 1;
+        context->reentrant_result = winghostty_surface_destroy(surface);
+    }
+}
+
+static void on_metrics_changed(
+    void *user_data,
+    winghostty_surface *surface,
+    const winghostty_cell_metrics *metrics
+) {
+    smoke_context *context = (smoke_context *)user_data;
+    (void)metrics;
+    record_callback(context, user_data);
+    if (context->deinit_on_metrics && !context->reentrant_called) {
+        context->reentrant_called = 1;
+        context->reentrant_result = winghostty_host_deinitialize(context->host);
+    }
+}
+
 static int run_message_loop(void) {
     MSG message;
     for (;;) {
@@ -169,14 +201,16 @@ int main(void) {
     SetActiveWindow(context.parent);
     SetFocus(context.parent);
 
-    winghostty_surface_options options;
-    winghostty_surface_options_init(&options);
+    winghostty_surface_options_v2 options;
+    winghostty_surface_options_v2_init(&options);
     options.visible = 1;
     options.focus = 1;
     options.bounds.width = 400;
     options.bounds.height = 300;
     options.callbacks.on_redraw = on_redraw;
     options.callbacks.on_focus = on_focus;
+    options.callbacks.on_dpi_changed = on_dpi_changed;
+    options.callbacks.on_metrics_changed = on_metrics_changed;
     options.user_data = &context;
     context.surface_destroyed = 0;
 
@@ -191,6 +225,99 @@ int main(void) {
         DestroyWindow(context.parent);
         return fail();
     }
+
+    winghostty_surface_options legacy_options;
+    winghostty_surface_options_init(&legacy_options);
+    legacy_options.command = command;
+    legacy_options.cwd = cwd;
+    legacy_options.environment = environment;
+    legacy_options.bounds = options.bounds;
+    winghostty_surface *legacy_surface = NULL;
+    if (winghostty_host_create_surface(
+            context.host,
+            context.parent,
+            &legacy_options,
+            &legacy_surface
+        ) != WINGHOSTTY_OK ||
+        !legacy_surface ||
+        winghostty_surface_destroy(legacy_surface) != WINGHOSTTY_OK) {
+        if (context.host) winghostty_host_deinitialize(context.host);
+        DestroyWindow(context.parent);
+        return fail();
+    }
+
+    winghostty_surface_options_v2 invalid_v2 = options;
+    invalid_v2.size -= 1;
+    winghostty_surface *invalid_surface = NULL;
+    if (winghostty_host_create_surface_v2(
+            context.host,
+            context.parent,
+            &invalid_v2,
+            &invalid_surface
+        ) != WINGHOSTTY_INVALID_ARGUMENT ||
+        invalid_surface != NULL) {
+        winghostty_host_deinitialize(context.host);
+        DestroyWindow(context.parent);
+        return fail();
+    }
+
+    context.destroy_on_dpi = 1;
+    winghostty_surface *dpi_destroy_surface = NULL;
+    context.reentrant_called = 0;
+    context.reentrant_result = WINGHOSTTY_INVALID_ARGUMENT;
+    if (winghostty_host_create_surface_v2(
+            context.host,
+            context.parent,
+            &options,
+            &dpi_destroy_surface
+        ) != WINGHOSTTY_OK ||
+        !dpi_destroy_surface ||
+        winghostty_surface_notify_dpi_changed(dpi_destroy_surface, 120) != WINGHOSTTY_OK ||
+        !context.reentrant_called ||
+        context.reentrant_result != WINGHOSTTY_OK) {
+        if (context.host) winghostty_host_deinitialize(context.host);
+        DestroyWindow(context.parent);
+        return fail();
+    }
+    context.destroy_on_dpi = 0;
+    context.reentrant_called = 0;
+
+    if (winghostty_host_initialize(&context.host) != WINGHOSTTY_OK) {
+        DestroyWindow(context.parent);
+        return fail();
+    }
+    context.deinit_on_metrics = 1;
+    winghostty_surface *metrics_deinit_surface = NULL;
+    context.reentrant_result = WINGHOSTTY_INVALID_ARGUMENT;
+    if (winghostty_host_create_surface_v2(
+            context.host,
+            context.parent,
+            &options,
+            &metrics_deinit_surface
+        ) != WINGHOSTTY_OK ||
+        !metrics_deinit_surface) {
+        if (context.host) winghostty_host_deinitialize(context.host);
+        DestroyWindow(context.parent);
+        return fail();
+    }
+    winghostty_cell_metrics callback_metrics = {8, 16, 8, 16, 13};
+    if (winghostty_surface_set_cell_metrics(
+            metrics_deinit_surface,
+            &callback_metrics
+        ) != WINGHOSTTY_OK ||
+        !context.reentrant_called ||
+        context.reentrant_result != WINGHOSTTY_OK) {
+        DestroyWindow(context.parent);
+        return fail();
+    }
+    context.deinit_on_metrics = 0;
+    context.host = NULL;
+    context.reentrant_called = 0;
+
+    if (winghostty_host_initialize(&context.host) != WINGHOSTTY_OK) {
+        DestroyWindow(context.parent);
+        return fail();
+    }
     context.loop_active = 0;
 
     context.deinit_on_parent_notify = 1;
@@ -199,7 +326,7 @@ int main(void) {
     options.focus = 0;
     winghostty_surface *parent_notify_surface = NULL;
     const winghostty_result parent_notify_create_result =
-        winghostty_host_create_surface(
+        winghostty_host_create_surface_v2(
             context.host,
             context.parent,
             &options,
@@ -227,7 +354,7 @@ int main(void) {
     context.destroy_on_focus = 1;
     winghostty_surface *reentrant_destroy_surface = NULL;
     const winghostty_result destroy_create_result =
-        winghostty_host_create_surface(
+        winghostty_host_create_surface_v2(
             context.host,
             context.parent,
             &options,
@@ -258,7 +385,7 @@ int main(void) {
     context.deinit_on_focus = 1;
     winghostty_surface *reentrant_deinit_surface = NULL;
     const winghostty_result deinit_create_result =
-        winghostty_host_create_surface(
+        winghostty_host_create_surface_v2(
             context.host,
             context.parent,
             &options,
@@ -287,7 +414,7 @@ int main(void) {
     options.focus = 0;
     options.user_data = &context;
     winghostty_surface *first = NULL;
-    if (winghostty_host_create_surface(
+    if (winghostty_host_create_surface_v2(
             context.host,
             context.parent,
             &options,
@@ -410,7 +537,7 @@ int main(void) {
     options.callbacks.on_focus = on_focus;
     options.user_data = &context;
     winghostty_surface *second = NULL;
-    if (winghostty_host_create_surface(
+    if (winghostty_host_create_surface_v2(
             context.host,
             context.parent,
             &options,
