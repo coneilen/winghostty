@@ -16,13 +16,22 @@ typedef struct test_state {
 
 typedef struct render_call {
     winghostty_surface *surface;
+    winghostty_surface *other_surface;
     winghostty_result make_current_result;
+    winghostty_result other_present_result;
     winghostty_result clear_current_result;
     winghostty_result render_result;
     winghostty_result present_result;
     winghostty_result ui_call_result;
     DWORD thread_id;
+    int current_after_make;
+    int current_after_other_present;
+    int current_after_render;
+    int current_after_clear;
 } render_call;
+
+static int current_matches(winghostty_surface *surface);
+static int current_is_clear(void);
 
 static LRESULT CALLBACK parent_window_proc(
     HWND hwnd,
@@ -66,9 +75,15 @@ static DWORD WINAPI render_thread(void *parameter) {
     call->thread_id = GetCurrentThreadId();
     call->make_current_result =
         winghostty_surface_make_current(call->surface);
+    call->current_after_make = current_matches(call->surface);
+    call->other_present_result =
+        winghostty_surface_present(call->other_surface);
+    call->current_after_other_present = current_matches(call->surface);
+    call->render_result = winghostty_surface_render(call->surface);
+    call->current_after_render = current_matches(call->surface);
     call->clear_current_result =
         winghostty_surface_clear_current(call->surface);
-    call->render_result = winghostty_surface_render(call->surface);
+    call->current_after_clear = current_is_clear();
     call->present_result = winghostty_surface_present(call->surface);
 
     winghostty_rect bounds = {0, 0, 11, 11};
@@ -84,6 +99,15 @@ static int fail(const char *message) {
 
 static int check(int condition, const char *message) {
     return condition ? 0 : fail(message);
+}
+
+static int current_matches(winghostty_surface *surface) {
+    return wglGetCurrentContext() == winghostty_surface_get_hglrc(surface) &&
+        wglGetCurrentDC() == winghostty_surface_get_hdc(surface);
+}
+
+static int current_is_clear(void) {
+    return wglGetCurrentContext() == NULL && wglGetCurrentDC() == NULL;
 }
 
 static HWND create_parent(void) {
@@ -217,14 +241,44 @@ static int run_renderer_contract(test_state *state) {
         return 1;
     }
 
+    winghostty_surface *second = NULL;
+    if (winghostty_host_create_surface(
+            state->host,
+            state->parent,
+            &options,
+            &second
+        ) != WINGHOSTTY_OK ||
+        second == NULL) {
+        return fail("second surface creation failed");
+    }
+    HWND second_hwnd = winghostty_surface_get_hwnd(second);
+    if (check(
+            winghostty_surface_get_hdc(second) !=
+                winghostty_surface_get_hdc(state->surface),
+            "surfaces unexpectedly share an HDC"
+        ) ||
+        check(
+            winghostty_surface_get_hglrc(second) !=
+                winghostty_surface_get_hglrc(state->surface),
+            "surfaces unexpectedly share an HGLRC"
+        )) {
+        return 1;
+    }
+
     render_call call = {
         .surface = state->surface,
+        .other_surface = second,
         .make_current_result = WINGHOSTTY_INVALID_ARGUMENT,
+        .other_present_result = WINGHOSTTY_INVALID_ARGUMENT,
         .clear_current_result = WINGHOSTTY_INVALID_ARGUMENT,
         .render_result = WINGHOSTTY_INVALID_ARGUMENT,
         .present_result = WINGHOSTTY_INVALID_ARGUMENT,
         .ui_call_result = WINGHOSTTY_INVALID_ARGUMENT,
         .thread_id = 0,
+        .current_after_make = 0,
+        .current_after_other_present = 0,
+        .current_after_render = 0,
+        .current_after_clear = 0,
     };
     HANDLE thread = CreateThread(NULL, 0, render_thread, &call, 0, NULL);
     if (check(thread != NULL, "render thread creation failed")) return 1;
@@ -243,7 +297,21 @@ static int run_renderer_contract(test_state *state) {
         return fail("makeCurrent failed");
     }
     if (check(call.clear_current_result == WINGHOSTTY_OK, "clearCurrent failed") ||
+        check(call.current_after_make, "makeCurrent did not bind surface A") ||
+        check(
+            call.other_present_result == WINGHOSTTY_OK,
+            "surface B presentation failed"
+        ) ||
+        check(
+            call.current_after_other_present,
+            "surface B presentation did not restore surface A"
+        ) ||
         check(call.render_result == WINGHOSTTY_OK, "render/presentation failed") ||
+        check(
+            call.current_after_render,
+            "surface A render lost its persistent context"
+        ) ||
+        check(call.current_after_clear, "clearCurrent did not clear WGL state") ||
         check(call.present_result == WINGHOSTTY_OK, "explicit presentation failed") ||
         check(call.ui_call_result == WINGHOSTTY_WRONG_THREAD, "UI affinity was not enforced") ||
         check(
@@ -253,6 +321,10 @@ static int run_renderer_contract(test_state *state) {
         check(
             winghostty_surface_get_present_count(state->surface) == 2,
             "presentation count did not advance"
+        ) ||
+        check(
+            winghostty_surface_get_present_count(second) == 1,
+            "surface B presentation count did not advance"
         )) {
         return 1;
     }
@@ -264,17 +336,6 @@ static int run_renderer_contract(test_state *state) {
         return 1;
     }
 
-    winghostty_surface *second = NULL;
-    if (winghostty_host_create_surface(
-            state->host,
-            state->parent,
-            &options,
-            &second
-        ) != WINGHOSTTY_OK ||
-        second == NULL) {
-        return fail("second surface creation failed");
-    }
-    HWND second_hwnd = winghostty_surface_get_hwnd(second);
     if (winghostty_surface_destroy(second) != WINGHOSTTY_OK ||
         IsWindow(second_hwnd)) {
         return fail("synchronous second-surface teardown failed");

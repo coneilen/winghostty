@@ -125,7 +125,8 @@ winghostty_result winghostty_surface_set_font_scale(
  * UI-thread-affine. The first render-context operation claims the host's
  * render thread; subsequent render operations must use that same thread. A
  * pending teardown may be released by calling clear_current from the owning
- * render thread.
+ * render thread. Scoped rendering and presentation preserve any prior WGL
+ * binding, including another surface's persistent context.
  */
 winghostty_result winghostty_surface_make_current(winghostty_surface *surface);
 winghostty_result winghostty_surface_clear_current(winghostty_surface *surface);

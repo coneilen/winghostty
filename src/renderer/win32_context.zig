@@ -96,6 +96,7 @@ pub const Error = error{
     SetPixelFormatFailed,
     CreateContextFailed,
     MakeCurrentFailed,
+    RestoreCurrentFailed,
     SwapBuffersFailed,
     WrongThread,
     Destroying,
@@ -114,8 +115,21 @@ pub const RenderState = struct {
     height: u32 = 1,
 };
 
+const CurrentBinding = struct {
+    hdc: HDC,
+    hglrc: HGLRC,
+
+    fn matches(self: CurrentBinding, context: *const Context) bool {
+        return self.hdc == context.hdc and self.hglrc == context.hglrc;
+    }
+
+    fn isBound(self: CurrentBinding) bool {
+        return self.hdc != null and self.hglrc != null;
+    }
+};
+
 /// A WGL device/context pair. `render` is scoped: it claims the render
-/// thread, makes the context current, presents, and releases it before
+/// thread, binds as needed, presents, and restores the prior binding before
 /// returning. The explicit current/clear methods are available for callers
 /// that need to issue their own OpenGL commands.
 pub const Context = struct {
@@ -200,11 +214,17 @@ pub const Context = struct {
 
     pub fn makeCurrent(self: *Context) Error!void {
         try self.claimRenderThread();
-        if (self.persistent_current) return;
+        const current = currentBinding();
+        if (self.persistent_current) {
+            if (!current.matches(self) and
+                wglMakeCurrent(self.hdc, self.hglrc) == 0)
+            {
+                return error.MakeCurrentFailed;
+            }
+            return;
+        }
         self.beginOperation() catch |err| return err;
-        if (wglGetCurrentContext() != self.hglrc or
-            wglGetCurrentDC() != self.hdc)
-        {
+        if (!current.matches(self)) {
             if (wglMakeCurrent(self.hdc, self.hglrc) == 0) {
                 self.endOperation();
                 return error.MakeCurrentFailed;
@@ -214,14 +234,15 @@ pub const Context = struct {
     }
 
     pub fn clearCurrent(self: *Context) void {
-        if (!self.persistent_current) return;
-        if (wglGetCurrentContext() == self.hglrc and
-            wglGetCurrentDC() == self.hdc)
-        {
+        const actual_current = currentBinding().matches(self);
+        if (!self.persistent_current and !actual_current) return;
+        if (actual_current) {
             _ = wglMakeCurrent(null, null);
         }
-        self.persistent_current = false;
-        self.endOperation();
+        if (self.persistent_current) {
+            self.persistent_current = false;
+            self.endOperation();
+        }
     }
 
     pub fn present(self: *Context) Error!void {
@@ -229,15 +250,21 @@ pub const Context = struct {
         self.beginOperation() catch |err| return err;
         defer self.endOperation();
 
-        if (wglGetCurrentContext() != self.hglrc or
-            wglGetCurrentDC() != self.hdc)
-        {
+        const previous = currentBinding();
+        const rebound = !previous.matches(self);
+        if (rebound) {
             if (wglMakeCurrent(self.hdc, self.hglrc) == 0) {
                 return error.MakeCurrentFailed;
             }
-            defer _ = wglMakeCurrent(null, null);
         }
-        if (SwapBuffers(self.hdc) == 0) return error.SwapBuffersFailed;
+        var operation_error: ?Error = null;
+        if (SwapBuffers(self.hdc) == 0) operation_error = error.SwapBuffersFailed;
+        if (rebound) {
+            restoreCurrent(previous) catch |err| {
+                if (operation_error == null) operation_error = err;
+            };
+        }
+        if (operation_error) |err| return err;
     }
 
     pub fn render(self: *Context, state: RenderState) Error!void {
@@ -245,12 +272,10 @@ pub const Context = struct {
         self.beginOperation() catch |err| return err;
         defer self.endOperation();
 
-        const owns_current = !self.persistent_current;
-        if (owns_current and wglMakeCurrent(self.hdc, self.hglrc) == 0) {
+        const previous = currentBinding();
+        const rebound = !previous.matches(self);
+        if (rebound and wglMakeCurrent(self.hdc, self.hglrc) == 0) {
             return error.MakeCurrentFailed;
-        }
-        defer {
-            if (owns_current) _ = wglMakeCurrent(null, null);
         }
 
         const width: i32 = @intCast(@min(state.width, @as(u32, std.math.maxInt(i32))));
@@ -278,7 +303,29 @@ pub const Context = struct {
         glVertex2f(-1.0, 1.0 - mark_height);
         glEnd();
 
-        if (SwapBuffers(self.hdc) == 0) return error.SwapBuffersFailed;
+        var operation_error: ?Error = null;
+        if (SwapBuffers(self.hdc) == 0) operation_error = error.SwapBuffersFailed;
+        if (rebound) {
+            restoreCurrent(previous) catch |err| {
+                if (operation_error == null) operation_error = err;
+            };
+        }
+        if (operation_error) |err| return err;
+    }
+
+    fn currentBinding() CurrentBinding {
+        return .{
+            .hdc = wglGetCurrentDC(),
+            .hglrc = wglGetCurrentContext(),
+        };
+    }
+
+    fn restoreCurrent(previous: CurrentBinding) Error!void {
+        const restored = if (previous.isBound())
+            wglMakeCurrent(previous.hdc, previous.hglrc)
+        else
+            wglMakeCurrent(null, null);
+        if (restored == 0) return error.RestoreCurrentFailed;
     }
 
     fn beginOperation(self: *Context) Error!void {

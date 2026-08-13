@@ -23,6 +23,9 @@ independent of GraphCode product types.
   other thread return `WINGHOSTTY_WRONG_THREAD`. `render` provides a scoped
   clear-and-swap frame, while `make_current`/`clear_current` allow an embedder
   to issue its complete OpenGL renderer between lifecycle calls.
+- Scoped render and presentation save and restore the prior WGL binding, so a
+  persistent context on one surface remains current across another surface's
+  temporary operation.
 - Destroy is synchronous. It disables callbacks before destroying the child
   window, drains no caller messages, and frees copied options before
   returning; no callbacks occur after completion.

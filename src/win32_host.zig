@@ -300,7 +300,9 @@ fn rendererResult(surface: *SurfaceState, err: win32_context.Error) Result {
         error.WrongThread => result_wrong_thread,
         error.Destroying => result_shutting_down,
         error.SwapBuffersFailed => result_present_error,
-        error.MakeCurrentFailed => result_context_error,
+        error.MakeCurrentFailed,
+        error.RestoreCurrentFailed,
+        => result_context_error,
         else => result_renderer_error,
     };
 }
