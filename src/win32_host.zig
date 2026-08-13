@@ -137,6 +137,21 @@ pub const Rect = extern struct {
 pub const Host = opaque {};
 pub const Surface = opaque {};
 
+const HandleKind = enum {
+    host,
+    surface,
+};
+
+const HandleToken = struct {
+    magic: u64,
+    generation: u64,
+    kind: HandleKind,
+    state: ?*anyopaque,
+};
+
+const host_token_magic: u64 = 0x57494e47484f5354;
+const surface_token_magic: u64 = 0x57494e4753555246;
+
 pub const ExitCallback = *const fn (?*anyopaque, *Surface, i32) callconv(.c) void;
 pub const TitleCallback = *const fn (?*anyopaque, *Surface, [*:0]const u8) callconv(.c) void;
 pub const CwdCallback = *const fn (?*anyopaque, *Surface, [*:0]const u8) callconv(.c) void;
@@ -219,6 +234,8 @@ const AdmissionState = struct {
 };
 
 const SurfaceState = struct {
+    token: *HandleToken,
+    generation: u64,
     host: *HostState,
     parent: HWND,
     hwnd: ?HWND = null,
@@ -239,6 +256,8 @@ const SurfaceState = struct {
 };
 
 const HostState = struct {
+    token: *HandleToken,
+    generation: u64,
     thread_id: DWORD,
     surfaces: std.ArrayListUnmanaged(*SurfaceState) = .empty,
     admission: AdmissionState = .{},
@@ -250,8 +269,9 @@ const HostState = struct {
 };
 
 var admission_registry_mutex: std.Thread.Mutex = .{};
-var host_registry: std.AutoHashMapUnmanaged(usize, *HostState) = .empty;
-var surface_registry: std.AutoHashMapUnmanaged(usize, *SurfaceState) = .empty;
+var host_registry: std.AutoHashMapUnmanaged(usize, *HandleToken) = .empty;
+var surface_registry: std.AutoHashMapUnmanaged(usize, *HandleToken) = .empty;
+var next_handle_generation: std.atomic.Value(u64) = .init(1);
 
 fn duplicate(value: ?[*:0]const u8) !?[:0]u8 {
     const source = value orelse return null;
@@ -259,11 +279,49 @@ fn duplicate(value: ?[*:0]const u8) !?[:0]u8 {
 }
 
 fn hostHandle(host: *HostState) *Host {
-    return @ptrCast(host);
+    return @ptrCast(host.token);
 }
 
 fn surfaceHandle(surface: *SurfaceState) *Surface {
-    return @ptrCast(surface);
+    return @ptrCast(surface.token);
+}
+
+fn nextHandleGeneration() u64 {
+    return next_handle_generation.fetchAdd(1, .monotonic);
+}
+
+fn hostStateFromToken(token: *HandleToken) ?*HostState {
+    if (token.magic != host_token_magic or token.kind != .host) return null;
+    const raw_state = token.state orelse return null;
+    const state: *HostState = @ptrCast(@alignCast(raw_state));
+    if (state.token != token or state.generation != token.generation) return null;
+    return state;
+}
+
+fn surfaceStateFromToken(token: *HandleToken) ?*SurfaceState {
+    if (token.magic != surface_token_magic or token.kind != .surface) {
+        return null;
+    }
+    const raw_state = token.state orelse return null;
+    const state: *SurfaceState = @ptrCast(@alignCast(raw_state));
+    if (state.token != token or state.generation != token.generation) return null;
+    return state;
+}
+
+fn allocateHandleToken(
+    kind: HandleKind,
+    magic: u64,
+    state: *anyopaque,
+) !*HandleToken {
+    // Retired tokens stay allocated so their addresses can never be reused.
+    const token = try allocator.create(HandleToken);
+    token.* = .{
+        .magic = magic,
+        .generation = nextHandleGeneration(),
+        .kind = kind,
+        .state = state,
+    };
+    return token;
 }
 
 const HostAdmission = struct {
@@ -282,8 +340,9 @@ fn unavailableHostResult(handle: ?*Host) Result {
     const pointer = handle orelse return result_invalid_argument;
     admission_registry_mutex.lock();
     defer admission_registry_mutex.unlock();
-    const state = host_registry.get(@intFromPtr(pointer)) orelse
+    const token = host_registry.get(@intFromPtr(pointer)) orelse
         return result_invalid_argument;
+    const state = hostStateFromToken(token) orelse return result_invalid_argument;
     state.admission.mutex.lock();
     const accepting = state.admission.accepting;
     state.admission.mutex.unlock();
@@ -294,7 +353,9 @@ fn unavailableSurfaceResult(handle: ?*Surface) Result {
     const pointer = handle orelse return result_invalid_argument;
     admission_registry_mutex.lock();
     defer admission_registry_mutex.unlock();
-    const surface = surface_registry.get(@intFromPtr(pointer)) orelse
+    const token = surface_registry.get(@intFromPtr(pointer)) orelse
+        return result_invalid_argument;
+    const surface = surfaceStateFromToken(token) orelse
         return result_invalid_argument;
     surface.admission.mutex.lock();
     const accepting = surface.admission.accepting;
@@ -315,44 +376,33 @@ fn unavailableSurfaceResult(handle: ?*Surface) Result {
 fn registerHost(state: *HostState) !void {
     admission_registry_mutex.lock();
     defer admission_registry_mutex.unlock();
-    try host_registry.put(allocator, @intFromPtr(state), state);
+    try host_registry.put(allocator, @intFromPtr(state.token), state.token);
 }
 
 fn registerSurface(state: *SurfaceState) !void {
     admission_registry_mutex.lock();
     defer admission_registry_mutex.unlock();
-    try surface_registry.put(allocator, @intFromPtr(state), state);
+    try surface_registry.put(allocator, @intFromPtr(state.token), state.token);
 }
 
 fn unregisterHost(state: *HostState) void {
     admission_registry_mutex.lock();
     defer admission_registry_mutex.unlock();
-    _ = host_registry.remove(@intFromPtr(state));
-    if (host_registry.count() == 0 and surface_registry.count() == 0) {
-        host_registry.deinit(allocator);
-        surface_registry.deinit(allocator);
-        host_registry = .empty;
-        surface_registry = .empty;
-    }
+    state.token.state = null;
 }
 
 fn unregisterSurface(state: *SurfaceState) void {
     admission_registry_mutex.lock();
     defer admission_registry_mutex.unlock();
-    _ = surface_registry.remove(@intFromPtr(state));
-    if (host_registry.count() == 0 and surface_registry.count() == 0) {
-        host_registry.deinit(allocator);
-        surface_registry.deinit(allocator);
-        host_registry = .empty;
-        surface_registry = .empty;
-    }
+    state.token.state = null;
 }
 
 fn admitHost(handle: ?*Host) ?HostAdmission {
     const pointer = handle orelse return null;
     admission_registry_mutex.lock();
     defer admission_registry_mutex.unlock();
-    const state = host_registry.get(@intFromPtr(pointer)) orelse return null;
+    const token = host_registry.get(@intFromPtr(pointer)) orelse return null;
+    const state = hostStateFromToken(token) orelse return null;
     state.admission.mutex.lock();
     defer state.admission.mutex.unlock();
     if (!state.admission.accepting) return null;
@@ -364,13 +414,15 @@ fn admitSurface(handle: ?*Surface) ?SurfaceAdmission {
     const pointer = handle orelse return null;
     admission_registry_mutex.lock();
     defer admission_registry_mutex.unlock();
-    const surface = surface_registry.get(@intFromPtr(pointer)) orelse return null;
+    const token = surface_registry.get(@intFromPtr(pointer)) orelse return null;
+    const surface = surfaceStateFromToken(token) orelse return null;
     surface.admission.mutex.lock();
     defer surface.admission.mutex.unlock();
     if (!surface.admission.accepting) return null;
 
     const host = surface.host;
-    const host_admission = host_registry.get(@intFromPtr(host)) orelse return null;
+    const host_token = host_registry.get(@intFromPtr(host.token)) orelse return null;
+    const host_admission = hostStateFromToken(host_token) orelse return null;
     host_admission.admission.mutex.lock();
     defer host_admission.admission.mutex.unlock();
     if (!host_admission.admission.accepting) return null;
@@ -387,7 +439,8 @@ fn admitClearSurface(handle: ?*Surface) ?SurfaceAdmission {
     const pointer = handle orelse return null;
     admission_registry_mutex.lock();
     defer admission_registry_mutex.unlock();
-    const surface = surface_registry.get(@intFromPtr(pointer)) orelse return null;
+    const token = surface_registry.get(@intFromPtr(pointer)) orelse return null;
+    const surface = surfaceStateFromToken(token) orelse return null;
     surface.admission.mutex.lock();
     defer surface.admission.mutex.unlock();
     if (!surface.admission.clearable) return null;
@@ -435,7 +488,6 @@ fn closeHostAdmission(state: *HostState) void {
     state.admission.mutex.lock();
     state.admission.accepting = false;
     state.shutting_down.store(true, .release);
-    _ = host_registry.remove(@intFromPtr(state));
     state.admission.mutex.unlock();
     admission_registry_mutex.unlock();
 }
@@ -742,12 +794,12 @@ fn destroySurfaceNow(
     surface.destroying.store(true, .release);
     removeSurface(surface.host, surface);
     waitSurfaceAdmissions(surface, remaining_admissions);
+    destroyRenderer(surface);
     if (surface.hwnd) |hwnd| {
         setUserData(hwnd, null);
         _ = DestroyWindow(hwnd);
         surface.hwnd = null;
     }
-    destroyRenderer(surface);
     disableClearAdmissionAndWait(surface, remaining_admissions);
     unregisterSurface(surface);
     freeRendererStorage(surface);
@@ -833,8 +885,21 @@ pub export fn winghostty_host_initialize(out_host: ?*?*Host) Result {
     output.* = null;
 
     const host = allocator.create(HostState) catch return result_out_of_memory;
-    host.* = .{ .thread_id = GetCurrentThreadId() };
+    const token = allocateHandleToken(
+        .host,
+        host_token_magic,
+        @ptrCast(host),
+    ) catch {
+        allocator.destroy(host);
+        return result_out_of_memory;
+    };
+    host.* = .{
+        .token = token,
+        .generation = token.generation,
+        .thread_id = GetCurrentThreadId(),
+    };
     registerHost(host) catch {
+        token.state = null;
         allocator.destroy(host);
         return result_out_of_memory;
     };
@@ -899,12 +964,25 @@ pub export fn winghostty_host_create_surface(
         cleanup.deinit();
         return result_out_of_memory;
     };
+    const token = allocateHandleToken(
+        .surface,
+        surface_token_magic,
+        @ptrCast(surface),
+    ) catch {
+        var cleanup = owned;
+        cleanup.deinit();
+        allocator.destroy(surface);
+        return result_out_of_memory;
+    };
     surface.* = .{
+        .token = token,
+        .generation = token.generation,
         .host = state,
         .parent = parent_hwnd,
         .options = owned,
     };
     registerSurface(surface) catch {
+        token.state = null;
         surface.options.deinit();
         allocator.destroy(surface);
         return result_out_of_memory;

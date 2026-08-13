@@ -592,6 +592,64 @@ static int run_persistent_teardown_contract(HWND parent) {
     return 0;
 }
 
+static int run_handle_reuse_contract(HWND parent) {
+    winghostty_host *old_host = NULL;
+    winghostty_surface *old_surface = NULL;
+    winghostty_surface_options options;
+    winghostty_surface_options_init(&options);
+    options.visible = 0;
+    options.bounds.width = 80;
+    options.bounds.height = 40;
+
+    if (winghostty_host_initialize(&old_host) != WINGHOSTTY_OK ||
+        winghostty_host_create_surface(
+            old_host,
+            parent,
+            &options,
+            &old_surface
+        ) != WINGHOSTTY_OK ||
+        old_surface == NULL) {
+        if (old_host) winghostty_host_deinitialize(old_host);
+        return fail("stale-handle setup failed");
+    }
+    if (winghostty_surface_destroy(old_surface) != WINGHOSTTY_OK ||
+        winghostty_host_deinitialize(old_host) != WINGHOSTTY_OK) {
+        return fail("stale-handle source teardown failed");
+    }
+
+    winghostty_host *new_host = NULL;
+    winghostty_surface *new_surface = NULL;
+    if (winghostty_host_initialize(&new_host) != WINGHOSTTY_OK ||
+        winghostty_host_create_surface(
+            new_host,
+            parent,
+            &options,
+            &new_surface
+        ) != WINGHOSTTY_OK ||
+        new_surface == NULL) {
+        if (new_host) winghostty_host_deinitialize(new_host);
+        return fail("stale-handle replacement setup failed");
+    }
+    if (check(old_host != new_host, "host token address was reused") ||
+        check(old_surface != new_surface, "surface token address was reused") ||
+        check_stale_host(old_host, parent) != 0 ||
+        check_stale_surface(old_surface) != 0 ||
+        check(
+            IsWindow(winghostty_surface_get_hwnd(new_surface)),
+            "stale handle affected replacement surface"
+        )) {
+        winghostty_surface_destroy(new_surface);
+        winghostty_host_deinitialize(new_host);
+        return 1;
+    }
+
+    if (winghostty_surface_destroy(new_surface) != WINGHOSTTY_OK ||
+        winghostty_host_deinitialize(new_host) != WINGHOSTTY_OK) {
+        return fail("stale-handle replacement teardown failed");
+    }
+    return 0;
+}
+
 static int run_teardown_admission_contract(HWND parent, int destroy_surface) {
     winghostty_host *host = NULL;
     winghostty_surface *surface = NULL;
@@ -698,6 +756,10 @@ int main(void) {
         DestroyWindow(state.parent);
         return 1;
     }
+    if (run_handle_reuse_contract(state.parent) != 0) {
+        DestroyWindow(state.parent);
+        return 1;
+    }
     if (run_teardown_admission_contract(state.parent, 1) != 0 ||
         run_teardown_admission_contract(state.parent, 0) != 0) {
         DestroyWindow(state.parent);
@@ -755,6 +817,6 @@ int main(void) {
     }
 
     DestroyWindow(state.parent);
-    printf("Win32 host renderer contract passed: child HWND/HDC/HGLRC, affinity, presentation, teardown, 100 cycles.\n");
+    printf("Win32 host renderer contract passed: child HWND/HDC/HGLRC, affinity, presentation, stable handles, teardown, 100 cycles.\n");
     return 0;
 }

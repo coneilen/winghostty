@@ -34,6 +34,10 @@ independent of GraphCode product types.
   closes new admissions and waits for admitted calls and active operations
   before freeing the surface, host, or renderer; racing calls are rejected
   with an explicit invalid-state result.
+- Opaque host and surface handles are stable, generation-validated tokens
+  rather than state addresses. Retired tokens are never reused, so a stale
+  handle cannot admit or destroy a replacement object after allocator address
+  reuse.
 - If teardown is waiting for a persistent context owned by another render
   thread, that thread may call `winghostty_surface_clear_current` to release
   it and allow synchronous destruction to complete.
