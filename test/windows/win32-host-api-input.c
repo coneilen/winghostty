@@ -35,6 +35,7 @@ typedef struct input_context {
     LONG clipboard_reads;
     LONG clipboard_writes;
     LONG focus;
+    LONG link_reentrant_callbacks;
     LONG wrong_thread;
     LONG wrong_user_data;
     LONG callbacks_after_destroy;
@@ -58,6 +59,8 @@ typedef struct input_context {
     unsigned double_click_buttons;
     int saw_mouse_leave;
     int saw_link_click;
+    int saw_link_url_after_reentrant;
+    int link_reentrant_action;
     int saw_selection_drag;
     char pasted[128];
     char clipboard[128];
@@ -280,6 +283,32 @@ static void on_link(
         InterlockedIncrement(&context->links);
     }
     if (clicked) context->saw_link_click = 1;
+    if (context->link_reentrant_action != 0) {
+        const int action = context->link_reentrant_action;
+        context->link_reentrant_action = 0;
+        InterlockedIncrement(&context->link_reentrant_callbacks);
+        if (action == 1) {
+            for (int i = 0; i < 8; i++) {
+                (void)winghostty_surface_set_link(
+                    surface,
+                    "https://replacement.example/long-url-to-force-reuse"
+                );
+            }
+        } else if (action == 2) {
+            (void)winghostty_surface_clear_link(surface);
+            for (int i = 0; i < 8; i++) {
+                (void)winghostty_surface_set_link(
+                    surface,
+                    "https://replacement.example/long-url-to-force-reuse"
+                );
+            }
+        } else {
+            (void)winghostty_host_deinitialize(context->callback_host);
+        }
+        if (strcmp(url, "https://example.com") == 0) {
+            context->saw_link_url_after_reentrant = 1;
+        }
+    }
 }
 
 static void on_paste(
@@ -411,6 +440,47 @@ static int run_legacy_deinit_case(
             return 1;
     }
     return context->legacy_deinit_kind == 0 ? 0 : 1;
+}
+
+static int run_link_reentrant_case(
+    input_context *context,
+    const winghostty_surface_options_v2 *template_options,
+    int action
+) {
+    winghostty_host *host = NULL;
+    winghostty_surface *surface = NULL;
+    winghostty_surface_options_v2 options = *template_options;
+    options.focus = 0;
+    options.input.selection_enabled = 0;
+    options.input.links_enabled = 1;
+    context->callback_host = NULL;
+    context->link_reentrant_action = action;
+    context->saw_link_url_after_reentrant = 0;
+    if (winghostty_host_initialize(&host) != WINGHOSTTY_OK) return 1;
+    context->callback_host = host;
+    if (winghostty_host_create_surface_v2(
+            host,
+            context->parent,
+            &options,
+            &surface
+        ) != WINGHOSTTY_OK) {
+        return 1;
+    }
+    if (winghostty_surface_set_link(surface, "https://example.com") !=
+        WINGHOSTTY_OK) {
+        return 1;
+    }
+    SendMessageW(
+        winghostty_surface_get_hwnd(surface),
+        WM_MOUSEMOVE,
+        0,
+        MAKELPARAM(8, 8)
+    );
+    if (action != 3) (void)winghostty_host_deinitialize(host);
+    return context->link_reentrant_action == 0 &&
+        context->saw_link_url_after_reentrant
+        ? 0
+        : 1;
 }
 
 int main(void) {
@@ -717,6 +787,13 @@ int main(void) {
         }
     }
     if (context.legacy_deinit_callbacks != 6) return fail();
+
+    for (int action = 1; action <= 3; action++) {
+        if (run_link_reentrant_case(&context, &options, action) != 0) {
+            return fail();
+        }
+    }
+    if (context.link_reentrant_callbacks != 3) return fail();
 
     DestroyWindow(context.parent);
     UnregisterClassW(class_name, parent_class.hInstance);

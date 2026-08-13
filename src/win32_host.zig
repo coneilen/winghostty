@@ -1184,13 +1184,15 @@ fn emitLink(surface: *SurfaceState, hovered: bool, clicked: bool) void {
         return;
     }
     const url = surface.link_url orelse return;
+    const owned_url = allocator.dupeZ(u8, url) catch return;
+    defer allocator.free(owned_url);
     if (surface.options.input_callbacks.on_link) |callback| {
         beginDispatch(surface);
         defer endDispatch(surface);
         callback(
             surface.options.user_data,
             surfaceHandle(surface),
-            url,
+            owned_url,
             if (hovered) 1 else 0,
             if (clicked) 1 else 0,
         );
