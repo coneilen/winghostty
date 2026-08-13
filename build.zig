@@ -55,6 +55,7 @@ pub fn build(b: *std.Build) !void {
         if (b.lazyDependency("uucode", .{
             .target = config.target,
             .optimize = config.optimize,
+            .tables_path = b.path("src/build/uucode_host_tables.zig"),
             .build_config_path = b.path("src/build/uucode_config.zig"),
         })) |dep| {
             host_module.addImport("uucode", dep.module("uucode"));

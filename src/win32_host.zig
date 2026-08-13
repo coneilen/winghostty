@@ -643,6 +643,7 @@ const SurfaceState = struct {
     pin_count: usize = 0,
     destroying: std.atomic.Value(bool) = .init(false),
     retired: bool = false,
+    retain_until_host_teardown: bool = false,
     retired_next: ?*SurfaceState = null,
     focused: bool = false,
     ime_composing: bool = false,
@@ -799,6 +800,7 @@ const SurfaceAdmission = struct {
     host: ?*HostState = null,
     clear: bool = false,
     released: bool = false,
+    defer_finalize: bool = false,
 };
 
 fn unavailableHostResult(handle: ?*Host) Result {
@@ -851,12 +853,20 @@ fn unregisterHost(state: *HostState) void {
     admission_registry_mutex.lock();
     defer admission_registry_mutex.unlock();
     _ = host_registry.remove(state.handle.id);
+    if (host_registry.count() == 0) {
+        host_registry.deinit(allocator);
+        host_registry = .empty;
+    }
 }
 
 fn unregisterSurface(state: *SurfaceState) void {
     admission_registry_mutex.lock();
     defer admission_registry_mutex.unlock();
     _ = surface_registry.remove(state.handle.id);
+    if (surface_registry.count() == 0) {
+        surface_registry.deinit(allocator);
+        surface_registry = .empty;
+    }
 }
 
 fn admitHost(handle: ?*Host) ?HostAdmission {
@@ -911,16 +921,19 @@ fn admitClearSurface(handle: ?*Surface) ?SurfaceAdmission {
 
 fn releaseHostAdmission(admission: *HostAdmission) void {
     if (admission.released) return;
-    admission.state.admission.mutex.lock();
-    std.debug.assert(admission.state.admission.admitted > 0);
-    admission.state.admission.admitted -= 1;
-    admission.state.admission.done.broadcast();
-    admission.state.admission.mutex.unlock();
+    const state = admission.state;
+    state.admission.mutex.lock();
+    std.debug.assert(state.admission.admitted > 0);
+    state.admission.admitted -= 1;
+    state.admission.done.broadcast();
+    state.admission.mutex.unlock();
     admission.released = true;
+    maybeFinishHostDeinitialize(state);
 }
 
 fn releaseSurfaceAdmission(admission: *SurfaceAdmission) void {
     if (admission.released) return;
+    const host = admission.host;
     admission.surface.admission.mutex.lock();
     if (admission.clear) {
         std.debug.assert(admission.surface.admission.clear_admitted > 0);
@@ -931,14 +944,18 @@ fn releaseSurfaceAdmission(admission: *SurfaceAdmission) void {
     }
     admission.surface.admission.done.broadcast();
     admission.surface.admission.mutex.unlock();
-    if (admission.host) |host| {
-        host.admission.mutex.lock();
-        std.debug.assert(host.admission.admitted > 0);
-        host.admission.admitted -= 1;
-        host.admission.done.broadcast();
-        host.admission.mutex.unlock();
+    if (host) |value| {
+        value.admission.mutex.lock();
+        std.debug.assert(value.admission.admitted > 0);
+        value.admission.admitted -= 1;
+        value.admission.done.broadcast();
+        value.admission.mutex.unlock();
     }
     admission.released = true;
+    if (!admission.defer_finalize) {
+        maybeFinalizeRetiredSurface(admission.surface);
+    }
+    if (host) |value| maybeFinishHostDeinitialize(value);
 }
 
 fn closeHostAdmission(state: *HostState) void {
@@ -1297,8 +1314,12 @@ fn maybeFinishHostDeinitialize(state: *HostState) void {
         state.active_dispatches == 0 and
         state.active_operations == 0)
     {
+        state.admission.mutex.lock();
+        const admitted = state.admission.admitted;
+        state.admission.mutex.unlock();
+        if (admitted != 0) return;
         state.deinitialize_requested = false;
-        deinitializeHost(state, 1);
+        deinitializeHost(state, 0);
         allocator.destroy(state);
     }
 }
@@ -1311,7 +1332,12 @@ fn retainRetiredSurface(host: *HostState, surface: *SurfaceState) void {
 }
 
 fn maybeFinalizeRetiredSurface(surface: *SurfaceState) void {
-    if (!surface.storage_retained or surface.active_dispatches != 0) return;
+    if (!surface.storage_retained or
+        surface.active_dispatches != 0 or
+        surface.retain_until_host_teardown)
+    {
+        return;
+    }
     surface.admission.mutex.lock();
     const admitted = surface.admission.admitted;
     const clear_admitted = surface.admission.clear_admitted;
@@ -1328,6 +1354,7 @@ fn maybeFinalizeRetiredSurface(surface: *SurfaceState) void {
     }
     surface.storage_retained = false;
     surface.retired_next = null;
+    unregisterSurface(surface);
     deinitSurfaceResources(surface);
     allocator.destroy(surface);
 }
@@ -2113,8 +2140,8 @@ fn surfaceWindowProc(
         WM_NCDESTROY => {
             setUserData(hwnd, null);
             if (surface) |value| {
-                value.hwnd = null;
                 detachSurfaceProvider(value);
+                value.hwnd = null;
                 destroyRenderer(value);
                 if (!value.destroying.load(.acquire)) {
                     value.invalidated.store(true, .release);
@@ -2140,7 +2167,11 @@ fn destroySurfaceNow(
     surface: *SurfaceState,
     remaining_admissions: usize,
 ) void {
+    const reentrant_dispatch =
+        surface.active_dispatches != 0 and
+        GetCurrentThreadId() == surface.host.thread_id;
     if (surface.retired) return;
+    if (reentrant_dispatch) surface.retain_until_host_teardown = true;
     surface.destroying.store(true, .release);
     surface.invalidated.store(true, .release);
     surface.retired = true;
@@ -2148,7 +2179,9 @@ fn destroySurfaceNow(
     if (remaining_admissions == 0 or surface.active_dispatches != 0) {
         retainRetiredSurface(surface.host, surface);
     }
-    waitSurfaceAdmissions(surface, remaining_admissions);
+    if (!reentrant_dispatch) {
+        waitSurfaceAdmissions(surface, remaining_admissions);
+    }
     detachSurfaceProvider(surface);
     destroyRenderer(surface);
     if (surface.hwnd) |hwnd| {
@@ -2156,8 +2189,14 @@ fn destroySurfaceNow(
         _ = DestroyWindow(hwnd);
         surface.hwnd = null;
     }
-    disableClearAdmissionAndWait(surface, remaining_admissions);
-    unregisterSurface(surface);
+    if (reentrant_dispatch) {
+        surface.admission.mutex.lock();
+        surface.admission.clearable = false;
+        surface.admission.mutex.unlock();
+    } else {
+        disableClearAdmissionAndWait(surface, remaining_admissions);
+    }
+    if (!surface.storage_retained) unregisterSurface(surface);
     freeRendererStorage(surface);
 }
 
@@ -2201,8 +2240,10 @@ fn finishUnregisteredSurfaceCreation(
     state.creation_depth -= 1;
     const deinitialize_requested = state.deinitialize_requested;
     if (deinitialize_requested and state.creation_depth == 0 and
-        state.active_dispatches == 0)
+        state.active_dispatches == 0 and
+        state.active_operations == 0)
     {
+        state.deinitialize_requested = false;
         deinitializeHost(state, 1);
         releaseHostAdmission(host_admission);
         allocator.destroy(state);
@@ -2226,6 +2267,7 @@ fn deinitializeHost(
     var retired = state.retired_surfaces;
     while (retired) |surface| {
         retired = surface.retired_next;
+        unregisterSurface(surface);
         deinitSurfaceResources(surface);
         allocator.destroy(surface);
     }
@@ -2411,7 +2453,8 @@ pub export fn winghostty_host_deinitialize(host: ?*Host) Result {
     state.shutting_down.store(true, .release);
     if (state.creation_depth != 0 or
         state.destroy_surface_depth != 0 or
-        state.active_dispatches != 0)
+        state.active_dispatches != 0 or
+        state.active_operations != 0)
     {
         state.deinitialize_requested = true;
         releaseHostAdmission(&admission);
@@ -2513,6 +2556,15 @@ fn createSurface(
         );
     };
     surface.hwnd = hwnd;
+    if (state.shutting_down.load(.acquire)) {
+        return finishUnregisteredSurfaceCreation(
+            state,
+            surface,
+            hwnd,
+            result_shutting_down,
+            host_admission,
+        );
+    }
     surface.dpi = getDpi(hwnd);
     surface.metrics = metricsFor(surface);
     surface.selection_dispatch = SelectionDispatch.create(hwnd) catch {
@@ -2550,16 +2602,6 @@ fn createSurface(
         );
     };
     updateScreenOrigin(surface);
-
-    if (state.shutting_down.load(.acquire)) {
-        return finishUnregisteredSurfaceCreation(
-            state,
-            surface,
-            hwnd,
-            result_shutting_down,
-            host_admission,
-        );
-    }
 
     const renderer = allocator.create(win32_context.Context) catch {
         return finishUnregisteredSurfaceCreation(
@@ -2618,7 +2660,11 @@ fn createSurface(
         closeSurfaceAdmission(surface);
         destroySurfaceNow(surface, 0);
         const deinitialize_requested = state.deinitialize_requested;
-        if (deinitialize_requested and state.creation_depth == 0) {
+        if (deinitialize_requested and state.creation_depth == 0 and
+            state.active_operations == 0 and
+            state.active_dispatches == 0)
+        {
+            state.deinitialize_requested = false;
             deinitializeHost(state, 1);
             releaseHostAdmission(host_admission);
             allocator.destroy(state);
@@ -2679,6 +2725,7 @@ pub export fn winghostty_surface_destroy(surface: ?*Surface) Result {
     var admission = admitSurface(surface) orelse
         return unavailableSurfaceResult(surface);
     const state = admission.surface;
+    admission.defer_finalize = true;
     const result = checkHost(state.host);
     if (result != result_ok) {
         releaseSurfaceAdmission(&admission);

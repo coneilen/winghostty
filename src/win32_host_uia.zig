@@ -291,6 +291,7 @@ pub const SurfaceProvider = struct {
     visible: std.atomic.Value(bool),
     detached: std.atomic.Value(bool),
     disconnected: std.atomic.Value(bool),
+    connected: std.atomic.Value(bool),
     screen_origin_query: ?ScreenOriginQuery,
     callback_ctx: ?*anyopaque,
     callback_ctx_retain: ?SelectionContextRetain,
@@ -383,6 +384,7 @@ pub const SurfaceProvider = struct {
             .visible = std.atomic.Value(bool).init(config.visible),
             .detached = std.atomic.Value(bool).init(false),
             .disconnected = std.atomic.Value(bool).init(false),
+            .connected = std.atomic.Value(bool).init(false),
             .screen_origin_query = config.screen_origin_query,
             .callback_ctx = config.callback_ctx,
             .callback_ctx_retain = config.callback_ctx_retain,
@@ -446,14 +448,25 @@ pub const SurfaceProvider = struct {
     }
 
     pub fn disconnect(self: *SurfaceProvider) com.HRESULT {
-        self.detach();
         if (self.disconnected.load(.acquire)) return com.S_OK;
-        if (IsWindow(self.hwnd) == 0) {
+        if (!self.connected.load(.acquire)) {
+            self.detach();
             self.disconnected.store(true, .release);
             return com.S_OK;
         }
         const hr = com.UiaDisconnectProvider(&self.base);
-        if (hr == com.S_OK) self.disconnected.store(true, .release);
+        if (hr == com.S_OK or
+            hr == com.E_INVALIDARG or
+            hr == com.UIA_E_ELEMENTNOTAVAILABLE)
+        {
+            self.connected.store(false, .release);
+            self.disconnected.store(true, .release);
+            self.detach();
+            return com.S_OK;
+        } else {
+            self.connected.store(true, .release);
+            self.detach();
+        }
         return hr;
     }
 
@@ -1607,13 +1620,17 @@ fn iidEqual(a: *const com.GUID, b: *const com.GUID) bool {
 }
 
 fn raiseAutomationEvent(self: *SurfaceProvider, event_id: i32) void {
-    if (!self.available() or IsWindow(self.hwnd) == 0 or
+    if (!self.available() or
+        !self.connected.load(.acquire) or
+        IsWindow(self.hwnd) == 0 or
         com.UiaClientsAreListening() == 0) return;
     _ = com.UiaRaiseAutomationEvent(&self.base, event_id);
 }
 
 fn raiseNameChanged(self: *SurfaceProvider) void {
-    if (!self.available() or IsWindow(self.hwnd) == 0 or
+    if (!self.available() or
+        !self.connected.load(.acquire) or
+        IsWindow(self.hwnd) == 0 or
         com.UiaClientsAreListening() == 0) return;
     self.state_lock.lockShared();
     const bstr = self.propertyBstr(self.name);
@@ -1629,7 +1646,9 @@ fn raiseNameChanged(self: *SurfaceProvider) void {
 }
 
 fn raiseRoleChanged(self: *SurfaceProvider, previous: Role, next: Role) void {
-    if (!self.available() or IsWindow(self.hwnd) == 0 or
+    if (!self.available() or
+        !self.connected.load(.acquire) or
+        IsWindow(self.hwnd) == 0 or
         com.UiaClientsAreListening() == 0) return;
     _ = com.UiaRaiseAutomationPropertyChangedEvent(
         &self.base,
@@ -1673,7 +1692,14 @@ pub fn returnProvider(
     provider: *SurfaceProvider,
 ) ?com.LRESULT {
     if (lparam != com.UiaRootObjectId or !provider.available()) return null;
-    return com.UiaReturnRawElementProvider(hwnd, wparam, lparam, &provider.base);
+    const result = com.UiaReturnRawElementProvider(
+        hwnd,
+        wparam,
+        lparam,
+        &provider.base,
+    );
+    if (result != 0) provider.connected.store(true, .release);
+    return result;
 }
 
 test "UTF-16 offsets preserve supplementary characters" {
