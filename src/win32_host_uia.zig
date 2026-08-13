@@ -9,6 +9,15 @@ const std = @import("std");
 const com = @import("apprt/win32_uia/com.zig");
 
 extern "user32" fn IsWindow(hwnd: com.HWND) callconv(.winapi) com.BOOL;
+pub const ScreenOrigin = extern struct {
+    x: i32,
+    y: i32,
+};
+extern "user32" fn ClientToScreen(
+    hwnd: com.HWND,
+    point: *ScreenOrigin,
+) callconv(.winapi) com.BOOL;
+pub const ScreenOriginQuery = *const fn (com.HWND) ?ScreenOrigin;
 
 pub const Range = struct {
     start: usize,
@@ -50,6 +59,7 @@ pub const Config = struct {
     focused: bool = false,
     visible: bool = true,
     metrics: Metrics = .{},
+    screen_origin_query: ?ScreenOriginQuery = null,
     callback_ctx: ?*anyopaque = null,
     on_selection: ?SelectionCallback = null,
 };
@@ -63,6 +73,14 @@ fn boundingRectangle(metrics: Metrics, line_index: usize, line_width: usize) com
             @as(f64, @floatFromInt(@max(line_width, 1))),
         .height = metrics.cell_height,
     };
+}
+
+fn lineIndexAtByte(snapshot: *const Snapshot, byte_index: usize) usize {
+    var row: usize = 0;
+    for (snapshot.text[0..@min(byte_index, snapshot.text.len)]) |byte| {
+        if (byte == '\n') row += 1;
+    }
+    return row;
 }
 
 const Snapshot = struct {
@@ -150,6 +168,7 @@ pub const SurfaceProvider = struct {
     visible: std.atomic.Value(bool),
     detached: std.atomic.Value(bool),
     disconnected: std.atomic.Value(bool),
+    screen_origin_query: ?ScreenOriginQuery,
     callback_ctx: ?*anyopaque,
     on_selection: ?SelectionCallback,
 
@@ -233,6 +252,7 @@ pub const SurfaceProvider = struct {
             .visible = std.atomic.Value(bool).init(config.visible),
             .detached = std.atomic.Value(bool).init(false),
             .disconnected = std.atomic.Value(bool).init(false),
+            .screen_origin_query = config.screen_origin_query,
             .callback_ctx = config.callback_ctx,
             .on_selection = config.on_selection,
         };
@@ -340,6 +360,21 @@ pub const SurfaceProvider = struct {
 
     pub fn available(self: *const SurfaceProvider) bool {
         return !self.detached.load(.acquire);
+    }
+
+    fn refreshScreenOrigin(self: *SurfaceProvider) void {
+        if (self.screen_origin_query) |origin_query| {
+            if (origin_query(self.hwnd)) |origin| {
+                self.snapshot.metrics.origin_x = @floatFromInt(origin.x);
+                self.snapshot.metrics.origin_y = @floatFromInt(origin.y);
+            }
+            return;
+        }
+        var origin: ScreenOrigin = .{ .x = 0, .y = 0 };
+        if (ClientToScreen(self.hwnd, &origin) != 0) {
+            self.snapshot.metrics.origin_x = @floatFromInt(origin.x);
+            self.snapshot.metrics.origin_y = @floatFromInt(origin.y);
+        }
     }
 
     fn fromBase(value: *com.IRawElementProviderSimple) *SurfaceProvider {
@@ -655,6 +690,7 @@ pub const SurfaceProvider = struct {
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         if (!std.math.isFinite(point.x) or !std.math.isFinite(point.y)) return com.S_OK;
+        self.refreshScreenOrigin();
         const cell_height = @max(self.snapshot.metrics.cell_height, 1);
         const cell_width = @max(self.snapshot.metrics.cell_width, 1);
         const row = @as(usize, @intFromFloat(@max(
@@ -804,6 +840,7 @@ const SurfaceTextRangeProvider = struct {
         range: Range,
     ) !*SurfaceTextRangeProvider {
         const self = try alloc.create(SurfaceTextRangeProvider);
+        errdefer alloc.destroy(self);
         _ = SurfaceProvider.AddRef(&parent.base);
         errdefer _ = SurfaceProvider.Release(&parent.base);
         const copy = try snapshotFromUtf8(
@@ -855,6 +892,11 @@ const SurfaceTextRangeProvider = struct {
     }
     fn byteRange(self: *const SurfaceTextRangeProvider) Range {
         return self.snapshot.utf16RangeToBytes(self.range);
+    }
+
+    fn refreshGeometry(self: *SurfaceTextRangeProvider) void {
+        self.parent.refreshScreenOrigin();
+        self.snapshot.metrics = self.parent.snapshot.metrics;
     }
 
     fn lineBounds(self: *const SurfaceTextRangeProvider) Range {
@@ -997,7 +1039,13 @@ const SurfaceTextRangeProvider = struct {
         const self = fromBase(value);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        self.refreshGeometry();
+        if (self.range.start == self.range.end) {
+            out.* = com.SafeArrayCreateVector(com.VT_R8, 0, 0);
+            return if (out.* == null) com.E_OUTOFMEMORY else com.S_OK;
+        }
         const bytes = self.byteRange();
+        const document_row = lineIndexAtByte(&self.snapshot, bytes.start);
         var line_count: usize = 1;
         for (self.snapshot.text[bytes.start..bytes.end]) |byte| {
             if (byte == '\n') line_count += 1;
@@ -1015,7 +1063,7 @@ const SurfaceTextRangeProvider = struct {
             );
             const rectangle = boundingRectangle(
                 self.snapshot.metrics,
-                line_index,
+                document_row + line_index,
                 line_width,
             );
             const values = [_]f64{
@@ -1102,6 +1150,7 @@ const SurfaceTextRangeProvider = struct {
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         moved.* = 0;
         if (unit == com.TextUnit_Document) {
+            if (count == 0) return com.S_OK;
             const target = if (count > 0) self.snapshot.utf16_len else 0;
             const current = if (endpoint == com.TextPatternRangeEndpoint_Start) self.range.start else self.range.end;
             self.moveEndpoint(endpoint, target);
@@ -1320,6 +1369,28 @@ test "range geometry tracks independent screen-space origins" {
     try std.testing.expectEqual(@as(f64, 700), second_rect.top);
 }
 
+fn testScreenOriginQuery(_: com.HWND) ?ScreenOrigin {
+    return .{ .x = 300, .y = 400 };
+}
+
+test "geometry queries refresh screen-space origin" {
+    var provider = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(1), .{
+        .text = "AB",
+        .metrics = .{ .cell_width = 10, .cell_height = 20 },
+        .screen_origin_query = testScreenOriginQuery,
+    });
+    defer _ = SurfaceProvider.Release(&provider.base);
+
+    var range: ?*com.ITextRangeProvider = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        provider.textRangeFromPoint(.{ .x = 311, .y = 405 }, &range),
+    );
+    const value = SurfaceTextRangeProvider.fromBase(range.?);
+    try std.testing.expectEqual(Range{ .start = 1, .end = 1 }, value.range);
+    _ = SurfaceTextRangeProvider.Release(range.?);
+}
+
 test "role mapping exposes control type and localized control type" {
     var provider = try SurfaceProvider.create(
         std.testing.allocator,
@@ -1354,4 +1425,107 @@ test "provider creation cleans up name exactly once on allocation failure" {
             }),
         );
     }
+}
+
+test "bounding rectangles use document rows and empty degenerate ranges" {
+    var provider = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(1), .{
+        .text = "top\nmiddle\nbottom",
+        .metrics = .{
+            .cell_width = 10,
+            .cell_height = 20,
+            .origin_x = 50,
+            .origin_y = 100,
+        },
+    });
+    defer _ = SurfaceProvider.Release(&provider.base);
+
+    var range = try SurfaceTextRangeProvider.create(
+        std.testing.allocator,
+        provider,
+        .{ .start = 4, .end = 10 },
+    );
+    defer _ = SurfaceTextRangeProvider.Release(&range.base);
+
+    var rectangles: ?*com.SAFEARRAY = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        SurfaceTextRangeProvider.GetBoundingRectangles(&range.base, &rectangles),
+    );
+    var index: i32 = 1;
+    var top: f64 = 0;
+    try std.testing.expectEqual(
+        com.S_OK,
+        com.SafeArrayGetElement(rectangles.?, &index, &top),
+    );
+    try std.testing.expectEqual(@as(f64, 120), top);
+    _ = com.SafeArrayDestroy(rectangles);
+
+    var degenerate = try SurfaceTextRangeProvider.create(
+        std.testing.allocator,
+        provider,
+        .{ .start = 4, .end = 4 },
+    );
+    defer _ = SurfaceTextRangeProvider.Release(&degenerate.base);
+    var empty: ?*com.SAFEARRAY = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        SurfaceTextRangeProvider.GetBoundingRectangles(&degenerate.base, &empty),
+    );
+    try std.testing.expectEqual(@as(u32, 1), com.SafeArrayGetDim(empty.?));
+    var lower: i32 = 0;
+    var upper: i32 = 0;
+    try std.testing.expectEqual(
+        com.DISP_E_BADINDEX,
+        com.SafeArrayGetLBound(empty.?, 0, &lower),
+    );
+    try std.testing.expectEqual(
+        com.DISP_E_BADINDEX,
+        com.SafeArrayGetUBound(empty.?, 0, &upper),
+    );
+    _ = com.SafeArrayDestroy(empty);
+}
+
+test "range creation cleans up allocation failure after provider allocation" {
+    var provider = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(1), .{
+        .text = "text",
+    });
+    defer _ = SurfaceProvider.Release(&provider.base);
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 1 },
+    );
+    try std.testing.expectError(
+        error.OutOfMemory,
+        SurfaceTextRangeProvider.create(
+            failing.allocator(),
+            provider,
+            .{ .start = 0, .end = 1 },
+        ),
+    );
+}
+
+test "document MoveEndpointByUnit zero count is a no-op" {
+    var provider = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(1), .{
+        .text = "text",
+    });
+    defer _ = SurfaceProvider.Release(&provider.base);
+    var range = try SurfaceTextRangeProvider.create(
+        std.testing.allocator,
+        provider,
+        .{ .start = 2, .end = 3 },
+    );
+    defer _ = SurfaceTextRangeProvider.Release(&range.base);
+    var moved: i32 = -1;
+    try std.testing.expectEqual(
+        com.S_OK,
+        SurfaceTextRangeProvider.MoveEndpointByUnit(
+            &range.base,
+            com.TextPatternRangeEndpoint_Start,
+            com.TextUnit_Document,
+            0,
+            &moved,
+        ),
+    );
+    try std.testing.expectEqual(@as(i32, 0), moved);
+    try std.testing.expectEqual(Range{ .start = 2, .end = 3 }, range.range);
 }
