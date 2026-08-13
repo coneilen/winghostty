@@ -83,6 +83,19 @@ middle, and X-button double-click messages to `click_count == 2`.
 The URL passed to `on_link` remains valid for the full synchronous callback,
 including if the callback replaces or clears the link or deinitializes the
 host.
+The host also provides per-monitor DPI, logical font/cell metric scaling, and
+redraw/focus callback delivery. Each surface owns a server-side UI Automation
+provider with live terminal name, focus, role, UTF-16 text ranges, visible
+ranges, caret, selection, and update notifications. UIA state is detached
+before a surface is destroyed, so retained providers return
+`UIA_E_ELEMENTNOTAVAILABLE` and never call back into the embedding application
+after teardown.
+Each child tracks its screen-space origin for `RangeFromPoint` and bounding
+rectangles and refreshes it after moves, DPI changes, and bounds updates.
+Text geometry uses Unicode display-cell columns (including combining and
+wide characters), not UTF-8 byte offsets.
+Changing the role raises `ControlType` and `LocalizedControlType` property
+changes.
 
 `winghostty_surface_paste_text` validates UTF-8 and uses the host's paste
 protection classifier. Unsafe text requires `allow_unsafe` and bracketed paste
