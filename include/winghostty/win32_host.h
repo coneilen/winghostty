@@ -223,11 +223,29 @@ typedef struct winghostty_surface_options {
     float font_scale;
     winghostty_callbacks callbacks;
     void *user_data;
-    winghostty_input_callbacks input_callbacks;
-    winghostty_input_options input;
 } winghostty_surface_options;
 
+typedef struct winghostty_surface_options_v2 {
+    uint32_t size;
+    uint32_t version;
+    const char *command;
+    const char *cwd;
+    const char *environment;
+    winghostty_rect bounds;
+    uint8_t visible;
+    uint8_t focus;
+    winghostty_theme theme;
+    float font_scale;
+    winghostty_callbacks callbacks;
+    void *user_data;
+    winghostty_input_callbacks input_callbacks;
+    winghostty_input_options input;
+} winghostty_surface_options_v2;
+
+#define WINGHOSTTY_SURFACE_OPTIONS_VERSION_2 ((uint32_t)2)
+
 void winghostty_surface_options_init(winghostty_surface_options *options);
+void winghostty_surface_options_v2_init(winghostty_surface_options_v2 *options);
 
 winghostty_result winghostty_host_initialize(winghostty_host **out_host);
 winghostty_result winghostty_host_deinitialize(winghostty_host *host);
@@ -236,6 +254,12 @@ winghostty_result winghostty_host_create_surface(
     winghostty_host *host,
     HWND parent,
     const winghostty_surface_options *options,
+    winghostty_surface **out_surface
+);
+winghostty_result winghostty_host_create_surface_v2(
+    winghostty_host *host,
+    HWND parent,
+    const winghostty_surface_options_v2 *options,
     winghostty_surface **out_surface
 );
 winghostty_result winghostty_surface_destroy(winghostty_surface *surface);

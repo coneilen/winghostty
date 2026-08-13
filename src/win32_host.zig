@@ -75,6 +75,7 @@ const WM_CAPTURECHANGED: u32 = 0x0215;
 
 const WS_CHILD: u32 = 0x40000000;
 const WS_VISIBLE: u32 = 0x10000000;
+const CS_DBLCLKS: u32 = 0x0008;
 const SW_HIDE: i32 = 0;
 const SW_SHOW: i32 = 5;
 const SWP_NOZORDER: u32 = 0x0004;
@@ -86,6 +87,8 @@ const GCS_COMPSTR: u32 = 0x0008;
 const GCS_RESULTSTR: u32 = 0x0800;
 const WHEEL_DELTA: i32 = 120;
 const UNICODE_NOCHAR: WPARAM = 0xFFFF;
+const TME_LEAVE: u32 = 0x00000002;
+const TOUNICODE_NO_STATE_CHANGE: u32 = 0x00000004;
 const VK_SHIFT: i32 = 0x10;
 const VK_CONTROL: i32 = 0x11;
 const VK_MENU: i32 = 0x12;
@@ -97,6 +100,13 @@ const MK_MBUTTON: u32 = 0x0010;
 const MK_XBUTTON1: u32 = 0x0020;
 const MK_XBUTTON2: u32 = 0x0040;
 const max_input_text_bytes: u32 = 16 * 1024 * 1024;
+
+const TrackMouseEventArgs = extern struct {
+    cbSize: u32,
+    dwFlags: u32,
+    hwndTrack: HWND,
+    dwHoverTime: u32,
+};
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral(
     "WinghosttyEmbeddableSurface",
@@ -140,6 +150,10 @@ extern "user32" fn InvalidateRect(
     erase: BOOL,
 ) callconv(.winapi) BOOL;
 extern "user32" fn SetFocus(hwnd: ?HWND) callconv(.winapi) ?HWND;
+extern "user32" fn SetCapture(hwnd: HWND) callconv(.winapi) ?HWND;
+extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
+extern "user32" fn ScreenToClient(hwnd: HWND, point: *POINT) callconv(.winapi) BOOL;
+extern "user32" fn TrackMouseEvent(event: *TrackMouseEventArgs) callconv(.winapi) BOOL;
 extern "user32" fn SetWindowLongPtrW(
     hwnd: HWND,
     index: i32,
@@ -341,7 +355,22 @@ pub const InputOptions = extern struct {
     keyboard_layout: ?[*:0]const u8,
 };
 
+pub const LegacySurfaceOptions = extern struct {
+    command: ?[*:0]const u8,
+    cwd: ?[*:0]const u8,
+    environment: ?[*:0]const u8,
+    bounds: Rect,
+    visible: u8,
+    focus: u8,
+    theme: Theme,
+    font_scale: f32,
+    callbacks: Callbacks,
+    user_data: ?*anyopaque,
+};
+
 pub const SurfaceOptions = extern struct {
+    size: u32,
+    version: u32,
     command: ?[*:0]const u8,
     cwd: ?[*:0]const u8,
     environment: ?[*:0]const u8,
@@ -470,6 +499,8 @@ const SurfaceState = struct {
     keyboard_layout: ?*anyopaque = null,
     wheel_remainder_x: i32 = 0,
     wheel_remainder_y: i32 = 0,
+    active_dispatches: usize = 0,
+    active_dispatches: usize = 0,
 };
 
 const HostState = struct {
@@ -483,6 +514,7 @@ const HostState = struct {
     destroy_surface_depth: usize = 0,
     render_thread_mutex: std.Thread.Mutex = .{},
     render_thread_id: DWORD = 0,
+    active_dispatches: usize = 0,
 };
 
 var admission_registry_mutex: std.Thread.Mutex = .{};
@@ -927,10 +959,34 @@ fn loadRendererError(surface: *SurfaceState) DWORD {
     return surface.last_error.load(.acquire);
 }
 
+fn beginDispatch(surface: *SurfaceState) void {
+    surface.active_dispatches += 1;
+    surface.host.active_dispatches += 1;
+}
+
+fn endDispatch(surface: *SurfaceState) void {
+    std.debug.assert(surface.active_dispatches > 0);
+    std.debug.assert(surface.host.active_dispatches > 0);
+    surface.active_dispatches -= 1;
+    surface.host.active_dispatches -= 1;
+    maybeFinishHostDeinitialize(surface.host);
+}
+
+fn maybeFinishHostDeinitialize(state: *HostState) void {
+    if (state.deinitialize_requested and
+        state.creation_depth == 0 and
+        state.destroy_surface_depth == 0 and
+        state.active_dispatches == 0)
+    {
+        state.deinitialize_requested = false;
+        deinitializeHost(state, 1);
+    }
+}
+
 fn registerSurfaceClass() void {
     const class: WNDCLASSEXW = .{
         .cbSize = @sizeOf(WNDCLASSEXW),
-        .style = 0,
+        .style = CS_DBLCLKS,
         .lpfnWndProc = surfaceWindowProc,
         .cbClsExtra = 0,
         .cbWndExtra = 0,
@@ -960,9 +1016,15 @@ fn setUserData(hwnd: HWND, surface: ?*SurfaceState) void {
 }
 
 fn notifyFocus(surface: *SurfaceState, focused: bool) void {
-    if (surface.destroying.load(.acquire)) return;
+    if (surface.destroying.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return;
+    }
     surface.focused = focused;
     if (surface.options.callbacks.on_focus) |callback| {
+        beginDispatch(surface);
+        defer endDispatch(surface);
         callback(
             surface.options.user_data,
             surfaceHandle(surface),
@@ -972,15 +1034,27 @@ fn notifyFocus(surface: *SurfaceState, focused: bool) void {
 }
 
 fn notifyRedraw(surface: *SurfaceState) void {
-    if (surface.destroying.load(.acquire)) return;
+    if (surface.destroying.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return;
+    }
     if (surface.options.callbacks.on_redraw) |callback| {
+        beginDispatch(surface);
+        defer endDispatch(surface);
         callback(surface.options.user_data, surfaceHandle(surface));
     }
 }
 
 fn emitKey(surface: *SurfaceState, event: KeyEvent) void {
-    if (surface.destroying.load(.acquire)) return;
+    if (surface.destroying.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return;
+    }
     if (surface.options.input_callbacks.on_key) |callback| {
+        beginDispatch(surface);
+        defer endDispatch(surface);
         callback(
             surface.options.user_data,
             surfaceHandle(surface),
@@ -990,10 +1064,16 @@ fn emitKey(surface: *SurfaceState, event: KeyEvent) void {
 }
 
 fn emitText(surface: *SurfaceState, text: []const u8) void {
-    if (surface.destroying.load(.acquire)) return;
+    if (surface.destroying.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return;
+    }
     const owned = allocator.dupeZ(u8, text) catch return;
     defer allocator.free(owned);
     if (surface.options.input_callbacks.on_text) |callback| {
+        beginDispatch(surface);
+        defer endDispatch(surface);
         callback(
             surface.options.user_data,
             surfaceHandle(surface),
@@ -1004,10 +1084,16 @@ fn emitText(surface: *SurfaceState, text: []const u8) void {
 }
 
 fn emitImeUpdate(surface: *SurfaceState, text: []const u8, committed: bool) void {
-    if (surface.destroying.load(.acquire)) return;
+    if (surface.destroying.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return;
+    }
     const owned = allocator.dupeZ(u8, text) catch return;
     defer allocator.free(owned);
     if (surface.options.input_callbacks.on_ime_update) |callback| {
+        beginDispatch(surface);
+        defer endDispatch(surface);
         callback(
             surface.options.user_data,
             surfaceHandle(surface),
@@ -1019,14 +1105,24 @@ fn emitImeUpdate(surface: *SurfaceState, text: []const u8, committed: bool) void
 }
 
 fn emitMouse(surface: *SurfaceState, event: MouseEvent) void {
-    if (surface.destroying.load(.acquire)) return;
+    if (surface.destroying.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return;
+    }
     if (surface.options.input_callbacks.on_mouse) |callback| {
+        beginDispatch(surface);
+        defer endDispatch(surface);
         callback(surface.options.user_data, surfaceHandle(surface), &event);
     }
 }
 
 fn emitSelection(surface: *SurfaceState) void {
-    if (surface.destroying.load(.acquire)) return;
+    if (surface.destroying.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return;
+    }
     const event = SelectionEvent{
         .active = if (surface.selection_active) 1 else 0,
         .dragging = if (surface.selection_dragging) 1 else 0,
@@ -1038,14 +1134,22 @@ fn emitSelection(surface: *SurfaceState) void {
         .current_y = surface.selection_current_y,
     };
     if (surface.options.input_callbacks.on_selection) |callback| {
+        beginDispatch(surface);
+        defer endDispatch(surface);
         callback(surface.options.user_data, surfaceHandle(surface), &event);
     }
 }
 
 fn emitLink(surface: *SurfaceState, hovered: bool, clicked: bool) void {
-    if (surface.destroying.load(.acquire)) return;
+    if (surface.destroying.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return;
+    }
     const url = surface.link_url orelse return;
     if (surface.options.input_callbacks.on_link) |callback| {
+        beginDispatch(surface);
+        defer endDispatch(surface);
         callback(
             surface.options.user_data,
             surfaceHandle(surface),
@@ -1057,10 +1161,16 @@ fn emitLink(surface: *SurfaceState, hovered: bool, clicked: bool) void {
 }
 
 fn emitPaste(surface: *SurfaceState, text: []const u8, bracketed: bool) void {
-    if (surface.destroying.load(.acquire)) return;
+    if (surface.destroying.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return;
+    }
     const owned = allocator.dupeZ(u8, text) catch return;
     defer allocator.free(owned);
     if (surface.options.input_callbacks.on_paste) |callback| {
+        beginDispatch(surface);
+        defer endDispatch(surface);
         callback(
             surface.options.user_data,
             surfaceHandle(surface),
@@ -1072,10 +1182,16 @@ fn emitPaste(surface: *SurfaceState, text: []const u8, bracketed: bool) void {
 }
 
 fn emitClipboardRead(surface: *SurfaceState, format: u32, text: []const u8) void {
-    if (surface.destroying.load(.acquire)) return;
+    if (surface.destroying.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return;
+    }
     const owned = allocator.dupeZ(u8, text) catch return;
     defer allocator.free(owned);
     if (surface.options.input_callbacks.on_clipboard_read) |callback| {
+        beginDispatch(surface);
+        defer endDispatch(surface);
         callback(
             surface.options.user_data,
             surfaceHandle(surface),
@@ -1087,10 +1203,16 @@ fn emitClipboardRead(surface: *SurfaceState, format: u32, text: []const u8) void
 }
 
 fn emitClipboardWrite(surface: *SurfaceState, format: u32, text: []const u8) void {
-    if (surface.destroying.load(.acquire)) return;
+    if (surface.destroying.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return;
+    }
     const owned = allocator.dupeZ(u8, text) catch return;
     defer allocator.free(owned);
     if (surface.options.input_callbacks.on_clipboard_write) |callback| {
+        beginDispatch(surface);
+        defer endDispatch(surface);
         callback(
             surface.options.user_data,
             surfaceHandle(surface),
@@ -1157,11 +1279,28 @@ fn mouseKind(message: UINT) u32 {
     };
 }
 
-fn emitMouseMessage(surface: *SurfaceState, message: UINT, wparam: WPARAM, lparam: LPARAM) void {
-    if (surface.destroying.load(.acquire)) return;
-    const x = signedWord(@as(usize, @bitCast(lparam)));
-    const y = signedWord(@as(usize, @bitCast(lparam)) >> 16);
+fn emitMouseMessage(
+    surface: *SurfaceState,
+    hwnd: HWND,
+    message: UINT,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) void {
+    if (surface.destroying.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return;
+    }
     const kind = mouseKind(message);
+    var x = signedWord(@as(usize, @bitCast(lparam)));
+    var y = signedWord(@as(usize, @bitCast(lparam)) >> 16);
+    if (kind == mouse_wheel) {
+        var point = POINT{ .x = x, .y = y };
+        if (ScreenToClient(hwnd, &point) != 0) {
+            x = point.x;
+            y = point.y;
+        }
+    }
     const event = MouseEvent{
         .kind = kind,
         .button = mouseButton(message, wparam),
@@ -1203,7 +1342,11 @@ fn utf16ToUtf8(alloc: Allocator, units: []const u16) ![]u8 {
 }
 
 fn emitUtf16Text(surface: *SurfaceState, units: []const u16) void {
-    if (surface.destroying.load(.acquire)) return;
+    if (surface.destroying.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return;
+    }
     const utf8 = utf16ToUtf8(allocator, units) catch return;
     defer allocator.free(utf8);
     emitText(surface, utf8);
@@ -1216,7 +1359,11 @@ fn emitCodepointText(surface: *SurfaceState, codepoint: u21) void {
 }
 
 fn handleUtf16Unit(surface: *SurfaceState, unit: u16) void {
-    if (surface.destroying.load(.acquire)) return;
+    if (surface.destroying.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return;
+    }
     if (unit >= 0xD800 and unit <= 0xDBFF) {
         surface.pending_high_surrogate = unit;
         return;
@@ -1234,7 +1381,11 @@ fn handleUtf16Unit(surface: *SurfaceState, unit: u16) void {
 }
 
 fn emitImeComposition(surface: *SurfaceState, index: u32, committed: bool) void {
-    if (surface.destroying.load(.acquire)) return;
+    if (surface.destroying.load(.acquire) or
+        surface.host.shutting_down.load(.acquire))
+    {
+        return;
+    }
     const hwnd = surface.hwnd orelse return;
     const context = ImmGetContext(hwnd) orelse return;
     defer _ = ImmReleaseContext(hwnd, context);
@@ -1254,7 +1405,30 @@ fn emitImeComposition(surface: *SurfaceState, index: u32, committed: bool) void 
     emitImeUpdate(surface, utf8, committed);
 }
 
-fn keyEventFromMessage(surface: *SurfaceState, message: UINT, wparam: WPARAM, lparam: LPARAM) KeyEvent {
+fn isDeadKeyDown(surface: *SurfaceState, wparam: WPARAM, lparam: LPARAM) bool {
+    var keyboard_state: [256]u8 = undefined;
+    if (GetKeyboardState(&keyboard_state) == 0) return false;
+    const scan_code: u32 = @intCast((@as(usize, @bitCast(lparam)) >> 16) & 0xff);
+    var chars: [8]u16 = undefined;
+    const layout = surface.keyboard_layout orelse GetKeyboardLayout(0);
+    return ToUnicodeEx(
+        @intCast(wparam & 0xffff),
+        scan_code,
+        &keyboard_state,
+        &chars,
+        chars.len,
+        TOUNICODE_NO_STATE_CHANGE,
+        layout,
+    ) < 0;
+}
+
+fn keyEventFromMessage(
+    surface: *SurfaceState,
+    message: UINT,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    dead_key: bool,
+) KeyEvent {
     const repeat_count: u32 = @intCast(@as(usize, @bitCast(lparam)) & 0xffff);
     const scan_code: u32 = @intCast((@as(usize, @bitCast(lparam)) >> 16) & 0xff);
     const previous_down = ((@as(usize, @bitCast(lparam)) >> 30) & 1) != 0;
@@ -1271,7 +1445,7 @@ fn keyEventFromMessage(surface: *SurfaceState, message: UINT, wparam: WPARAM, lp
         .composing = if (surface.ime_composing or
             surface.dead_key_active or
             surface.pending_high_surrogate != null) 1 else 0,
-        .dead_key = if (message == WM_DEADCHAR or message == WM_SYSDEADCHAR) 1 else 0,
+        .dead_key = if (dead_key) 1 else 0,
         .reserved = .{0} ** 6,
         .keyboard_layout_name = if (surface.options.input.keyboard_layout) |value|
             value.ptr
@@ -1295,6 +1469,9 @@ fn surfaceWindowProc(
     }
 
     const surface = getSurface(hwnd);
+    if (surface) |value| beginDispatch(value);
+    defer if (surface) |value| endDispatch(value);
+    if (message == WM_UNICHAR and wparam == UNICODE_NOCHAR) return 1;
     switch (message) {
         WM_SETFOCUS => {
             if (surface) |value| notifyFocus(value, true);
@@ -1306,7 +1483,11 @@ fn surfaceWindowProc(
                 if (value.ime_composing) {
                     value.ime_composing = false;
                     if (value.options.input_callbacks.on_ime_end) |callback| {
-                        if (!value.destroying.load(.acquire)) {
+                        if (!value.destroying.load(.acquire) and
+                            !value.host.shutting_down.load(.acquire))
+                        {
+                            beginDispatch(value);
+                            defer endDispatch(value);
                             callback(value.options.user_data, surfaceHandle(value));
                         }
                     }
@@ -1317,7 +1498,16 @@ fn surfaceWindowProc(
         WM_KEYDOWN, WM_SYSKEYDOWN, WM_KEYUP, WM_SYSKEYUP => {
             if (surface) |value| {
                 if (value.focused or GetFocus() == hwnd) {
-                    const event = keyEventFromMessage(value, message, wparam, lparam);
+                    const dead_key = (message == WM_KEYDOWN or message == WM_SYSKEYDOWN) and
+                        isDeadKeyDown(value, wparam, lparam);
+                    if (dead_key) value.dead_key_active = true;
+                    const event = keyEventFromMessage(
+                        value,
+                        message,
+                        wparam,
+                        lparam,
+                        dead_key,
+                    );
                     emitKey(value, event);
                 }
             }
@@ -1339,8 +1529,6 @@ fn surfaceWindowProc(
             if (surface) |value| {
                 if (value.focused or GetFocus() == hwnd) {
                     value.dead_key_active = true;
-                    const event = keyEventFromMessage(value, message, wparam, lparam);
-                    emitKey(value, event);
                 }
             }
             return 0;
@@ -1348,10 +1536,13 @@ fn surfaceWindowProc(
         WM_IME_STARTCOMPOSITION => {
             if (surface) |value| {
                 if (!value.destroying.load(.acquire) and
+                    !value.host.shutting_down.load(.acquire) and
                     (value.focused or GetFocus() == hwnd))
                 {
                     value.ime_composing = true;
                     if (value.options.input_callbacks.on_ime_start) |callback| {
+                        beginDispatch(value);
+                        defer endDispatch(value);
                         callback(value.options.user_data, surfaceHandle(value));
                     }
                 }
@@ -1376,10 +1567,13 @@ fn surfaceWindowProc(
         WM_IME_ENDCOMPOSITION => {
             if (surface) |value| {
                 if (!value.destroying.load(.acquire) and
+                    !value.host.shutting_down.load(.acquire) and
                     (value.focused or GetFocus() == hwnd))
                 {
                     value.ime_composing = false;
                     if (value.options.input_callbacks.on_ime_end) |callback| {
+                        beginDispatch(value);
+                        defer endDispatch(value);
                         callback(value.options.user_data, surfaceHandle(value));
                     }
                 }
@@ -1403,7 +1597,9 @@ fn surfaceWindowProc(
             if (surface) |value| {
                 if (message == WM_LBUTTONDOWN or message == WM_LBUTTONDBLCLK) {
                     _ = SetFocus(hwnd);
+                    value.click_count = if (message == WM_LBUTTONDBLCLK) 2 else 1;
                     if (value.options.input.selection_enabled != 0) {
+                        _ = SetCapture(hwnd);
                         const x = signedWord(@as(usize, @bitCast(lparam)));
                         const y = signedWord(@as(usize, @bitCast(lparam)) >> 16);
                         value.selection_active = true;
@@ -1415,10 +1611,10 @@ fn surfaceWindowProc(
                         emitSelection(value);
                     }
                     if (value.link_hovered) emitLink(value, true, true);
-                    value.click_count = if (message == WM_LBUTTONDBLCLK) 2 else 1;
                 } else if (message == WM_LBUTTONUP) {
                     value.selection_dragging = false;
                     if (value.selection_active) emitSelection(value);
+                    if (value.options.input.selection_enabled != 0) _ = ReleaseCapture();
                 } else if (message == WM_MOUSEMOVE and value.selection_dragging) {
                     const x = signedWord(@as(usize, @bitCast(lparam)));
                     const y = signedWord(@as(usize, @bitCast(lparam)) >> 16);
@@ -1431,7 +1627,16 @@ fn surfaceWindowProc(
                         emitLink(value, false, false);
                     }
                 }
-                emitMouseMessage(value, message, wparam, lparam);
+                emitMouseMessage(value, hwnd, message, wparam, lparam);
+                if (message == WM_MOUSEMOVE and value.options.input.links_enabled != 0) {
+                    var tracking = TrackMouseEventArgs{
+                        .cbSize = @sizeOf(TrackMouseEventArgs),
+                        .dwFlags = TME_LEAVE,
+                        .hwndTrack = hwnd,
+                        .dwHoverTime = 0,
+                    };
+                    _ = TrackMouseEvent(&tracking);
+                }
                 if (message == WM_MOUSEMOVE and
                     value.options.input.links_enabled != 0 and
                     value.link_url != null and
@@ -1445,8 +1650,9 @@ fn surfaceWindowProc(
         },
         WM_CAPTURECHANGED => {
             if (surface) |value| {
+                const was_dragging = value.selection_dragging;
                 value.selection_dragging = false;
-                if (value.selection_active) emitSelection(value);
+                if (was_dragging and value.selection_active) emitSelection(value);
             }
             return 0;
         },
@@ -1540,7 +1746,9 @@ fn finishUnregisteredSurfaceCreation(
     cleanupUnregisteredSurface(surface, hwnd);
     state.creation_depth -= 1;
     const deinitialize_requested = state.deinitialize_requested;
-    if (deinitialize_requested and state.creation_depth == 0) {
+    if (deinitialize_requested and state.creation_depth == 0 and
+        state.active_dispatches == 0)
+    {
         deinitializeHost(state, 1);
         releaseHostAdmission(host_admission);
         allocator.destroy(state);
@@ -1579,8 +1787,10 @@ fn finishDeferredHostDeinitialize(
     return true;
 }
 
-pub export fn winghostty_surface_options_init(options: *SurfaceOptions) void {
-    options.* = .{
+fn defaultSurfaceOptions() SurfaceOptions {
+    return .{
+        .size = @sizeOf(SurfaceOptions),
+        .version = 2,
         .command = null,
         .cwd = null,
         .environment = null,
@@ -1626,6 +1836,26 @@ pub export fn winghostty_surface_options_init(options: *SurfaceOptions) void {
     };
 }
 
+pub export fn winghostty_surface_options_init(options: *LegacySurfaceOptions) void {
+    const full = defaultSurfaceOptions();
+    options.* = .{
+        .command = full.command,
+        .cwd = full.cwd,
+        .environment = full.environment,
+        .bounds = full.bounds,
+        .visible = full.visible,
+        .focus = full.focus,
+        .theme = full.theme,
+        .font_scale = full.font_scale,
+        .callbacks = full.callbacks,
+        .user_data = full.user_data,
+    };
+}
+
+pub export fn winghostty_surface_options_v2_init(options: *SurfaceOptions) void {
+    options.* = defaultSurfaceOptions();
+}
+
 pub export fn winghostty_host_initialize(out_host: ?*?*Host) Result {
     const output = out_host orelse return result_invalid_argument;
     output.* = null;
@@ -1659,7 +1889,10 @@ pub export fn winghostty_host_deinitialize(host: ?*Host) Result {
     }
 
     state.shutting_down.store(true, .release);
-    if (state.creation_depth != 0 or state.destroy_surface_depth != 0) {
+    if (state.creation_depth != 0 or
+        state.destroy_surface_depth != 0 or
+        state.active_dispatches != 0)
+    {
         state.deinitialize_requested = true;
         releaseHostAdmission(&admission);
         return result_ok;
@@ -1670,22 +1903,28 @@ pub export fn winghostty_host_deinitialize(host: ?*Host) Result {
     return result_ok;
 }
 
-pub export fn winghostty_host_create_surface(
-    host: ?*Host,
-    parent: ?HWND,
-    options: ?*const SurfaceOptions,
-    out_surface: ?*?*Surface,
+fn legacyToV2(source: *const LegacySurfaceOptions) SurfaceOptions {
+    var result = defaultSurfaceOptions();
+    result.command = source.command;
+    result.cwd = source.cwd;
+    result.environment = source.environment;
+    result.bounds = source.bounds;
+    result.visible = source.visible;
+    result.focus = source.focus;
+    result.theme = source.theme;
+    result.font_scale = source.font_scale;
+    result.callbacks = source.callbacks;
+    result.user_data = source.user_data;
+    return result;
+}
+
+fn createSurface(
+    state: *HostState,
+    parent_hwnd: HWND,
+    source: *const SurfaceOptions,
+    output: *?*Surface,
+    host_admission: *HostAdmission,
 ) Result {
-    const output = out_surface orelse return result_invalid_argument;
-    output.* = null;
-    const parent_hwnd = parent orelse return result_invalid_argument;
-    const source = options orelse return result_invalid_argument;
-    var host_admission = admitHost(host) orelse
-        return unavailableHostResult(host);
-    defer releaseHostAdmission(&host_admission);
-    const state = host_admission.state;
-    const thread_result = checkHost(state);
-    if (thread_result != result_ok) return thread_result;
     if (source.font_scale <= 0 or !std.math.isFinite(source.font_scale)) {
         return result_invalid_argument;
     }
@@ -1829,6 +2068,42 @@ pub export fn winghostty_host_create_surface(
 
     output.* = surfaceHandle(surface);
     return result_ok;
+}
+
+pub export fn winghostty_host_create_surface(
+    host: ?*Host,
+    parent: ?HWND,
+    options: ?*const LegacySurfaceOptions,
+    out_surface: ?*?*Surface,
+) Result {
+    const output = out_surface orelse return result_invalid_argument;
+    output.* = null;
+    const state = hostState(host) orelse return result_invalid_argument;
+    const parent_hwnd = parent orelse return result_invalid_argument;
+    const source = options orelse return result_invalid_argument;
+    const thread_result = checkHost(state);
+    if (thread_result != result_ok) return thread_result;
+    var v2 = legacyToV2(source);
+    return createSurface(state, parent_hwnd, &v2, output);
+}
+
+pub export fn winghostty_host_create_surface_v2(
+    host: ?*Host,
+    parent: ?HWND,
+    options: ?*const SurfaceOptions,
+    out_surface: ?*?*Surface,
+) Result {
+    const output = out_surface orelse return result_invalid_argument;
+    output.* = null;
+    const state = hostState(host) orelse return result_invalid_argument;
+    const parent_hwnd = parent orelse return result_invalid_argument;
+    const source = options orelse return result_invalid_argument;
+    const thread_result = checkHost(state);
+    if (thread_result != result_ok) return thread_result;
+    if (source.version != 2 or source.size < @sizeOf(SurfaceOptions)) {
+        return result_invalid_argument;
+    }
+    return createSurface(state, parent_hwnd, source, output);
 }
 
 pub export fn winghostty_surface_destroy(surface: ?*Surface) Result {
@@ -2643,27 +2918,10 @@ test "SurfaceOptions copies caller-owned strings" {
     var command = [_:0]u8{ 'c', 'm', 'd', '.', 'e', 'x', 'e' };
     var cwd = [_:0]u8{ 'C', ':', '\\' };
     var environment = [_:0]u8{ 'A', '=', 'B' };
-    const options = SurfaceOptions{
-        .command = &command,
-        .cwd = &cwd,
-        .environment = &environment,
-        .bounds = .{ .x = 0, .y = 0, .width = 1, .height = 1 },
-        .visible = 0,
-        .focus = 0,
-        .theme = theme_system,
-        .font_scale = 1,
-        .callbacks = .{
-            .on_exit = null,
-            .on_title = null,
-            .on_cwd = null,
-            .on_bell = null,
-            .on_notification = null,
-            .on_redraw = null,
-            .on_focus = null,
-            .on_fatal_error = null,
-        },
-        .user_data = null,
-    };
+    var options = defaultSurfaceOptions();
+    options.command = &command;
+    options.cwd = &cwd;
+    options.environment = &environment;
     var owned = try OwnedOptions.init(&options);
     defer owned.deinit();
     command[0] = 'X';

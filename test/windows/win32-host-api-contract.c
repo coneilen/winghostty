@@ -29,7 +29,7 @@ WINGHOSTTY_LAYOUT_ASSERT(
     "fatal callback offset changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
-    sizeof(winghostty_surface_options) == 240,
+    sizeof(winghostty_surface_options) == 128,
     "surface options ABI changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
@@ -49,15 +49,19 @@ WINGHOSTTY_LAYOUT_ASSERT(
     "input callback ABI changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
-    offsetof(winghostty_surface_options, input_callbacks) == 128,
-    "input callback offset changed"
-);
-WINGHOSTTY_LAYOUT_ASSERT(
     sizeof(winghostty_input_options) == 24,
     "input options ABI changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
-    offsetof(winghostty_surface_options, input) == 216,
+    sizeof(winghostty_surface_options_v2) == 248,
+    "surface options v2 ABI changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    offsetof(winghostty_surface_options_v2, input_callbacks) == 136,
+    "input options offset changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    offsetof(winghostty_surface_options_v2, input) == 224,
     "input options offset changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(sizeof(winghostty_key_event) == 48, "key event ABI changed");
@@ -162,11 +166,28 @@ void winghostty_win32_host_compile_contract(void) {
     options.callbacks.on_redraw = on_redraw;
     options.callbacks.on_focus = on_focus;
     options.callbacks.on_fatal_error = on_fatal_error;
-    options.input_callbacks.on_key = on_key;
-    options.input_callbacks.on_text = on_text;
+    winghostty_surface_options_v2 options_v2;
+    winghostty_surface_options_v2_init(&options_v2);
+    options_v2.command = options.command;
+    options_v2.cwd = options.cwd;
+    options_v2.environment = options.environment;
+    options_v2.bounds = options.bounds;
+    options_v2.visible = options.visible;
+    options_v2.focus = options.focus;
+    options_v2.theme = options.theme;
+    options_v2.font_scale = options.font_scale;
+    options_v2.callbacks = options.callbacks;
+    options_v2.user_data = options.user_data;
+    options_v2.input_callbacks.on_key = on_key;
+    options_v2.input_callbacks.on_text = on_text;
 
     (void)winghostty_host_initialize(&host);
-    (void)winghostty_host_create_surface(host, (HWND)0, &options, &surface);
+    (void)winghostty_host_create_surface_v2(
+        host,
+        (HWND)0,
+        &options_v2,
+        &surface
+    );
     (void)winghostty_surface_set_bounds(surface, &bounds);
     (void)winghostty_surface_set_visible(surface, 1);
     (void)winghostty_surface_set_focus(surface, 1);

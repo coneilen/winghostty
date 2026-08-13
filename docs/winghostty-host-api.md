@@ -13,8 +13,13 @@ independent of GraphCode product types.
 - ABI-facing result and theme values are fixed-width `int32_t` typedefs with
   constants; the external contract checks C/C++ layouts with and without
   `-fshort-enums`.
-- `winghostty_surface_options` is copied during creation, including strings
-  and callback configuration.
+- `winghostty_surface_options` is the legacy 128-byte creation ABI. It is
+  copied during creation, including strings and callback configuration; the
+  legacy entry point never reads beyond that structure.
+- `winghostty_surface_options_v2` is the input-enabled ABI. Its `size` and
+  `version` fields must be initialized with
+  `winghostty_surface_options_v2_init`, and it is passed to
+  `winghostty_host_create_surface_v2`.
 - Host lifecycle and surface mutation calls are UI-thread-affine to the thread
   that initialized the host. Renderer calls are affine to the first thread
   that claims the host's render context.
@@ -50,6 +55,10 @@ independent of GraphCode product types.
 - If teardown is waiting for a persistent context owned by another render
   thread, that thread may call `winghostty_surface_clear_current` to release
   it and allow synchronous destruction to complete.
+- Destroy disables callbacks before destroying the child window and drains no
+  caller messages. Callback dispatches are pinned until they unwind, and host
+  deinitialization requested from a callback or window procedure is deferred
+  until callback and window-procedure dispatches unwind.
 - If the caller destroys the parent, child windows are invalidated but their
   surface handles remain safe until explicit surface or host teardown.
 - Initial focus delivery is guarded against callbacks that destroy the surface
