@@ -261,7 +261,9 @@ replacement objects after allocator address reuse. It also has a parent
 `WM_PARENTNOTIFY` handler that calls host deinitialization during child
 destruction and verifies deferred teardown completes without a deadlock. A
 1024-cycle numeric-handle run measures process-heap busy blocks/bytes to catch
-registry and retired-token growth beyond USER/GDI accounting.
+registry and retired-token growth beyond USER/GDI accounting. Persistent
+context coverage switches render-thread ownership from surface A to B, clears
+B, destroys A on the UI thread, and switches B again.
 
 ```powershell
 .\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\test\windows\run-win32-host-renderer.ps1

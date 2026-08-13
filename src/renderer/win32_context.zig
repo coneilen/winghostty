@@ -143,6 +143,24 @@ pub const Context = struct {
     destroying: bool = false,
     persistent_current: bool = false,
 
+    const PersistentTransfer = struct {
+        context: *Context,
+
+        fn cancel(self: *PersistentTransfer) void {
+            self.context.operation_mutex.unlock();
+        }
+
+        fn complete(self: *PersistentTransfer) void {
+            self.context.persistent_current = false;
+            std.debug.assert(self.context.active_operations > 0);
+            self.context.active_operations -= 1;
+            if (self.context.active_operations == 0) {
+                self.context.operation_done.broadcast();
+            }
+            self.context.operation_mutex.unlock();
+        }
+    };
+
     pub fn init(hwnd: HWND) Error!Context {
         const hdc = GetDC(hwnd) orelse return error.GetDCFailed;
         errdefer _ = ReleaseDC(hwnd, hdc);
@@ -176,6 +194,7 @@ pub const Context = struct {
             std.debug.assert(self.active_operations > 0);
             self.active_operations -= 1;
             if (self.active_operations == 0) self.operation_done.broadcast();
+            if (persistent_context == self) persistent_context = null;
         }
 
         self.destroying = true;
@@ -215,22 +234,39 @@ pub const Context = struct {
     pub fn makeCurrent(self: *Context) Error!void {
         try self.claimRenderThread();
         const current = currentBinding();
+
+        var previous_transfer: ?PersistentTransfer = null;
+        if (persistent_context) |previous| {
+            if (previous != self) {
+                previous_transfer = previous.beginPersistentTransfer();
+            }
+        }
+
         if (self.persistent_current) {
             if (!current.matches(self) and
                 wglMakeCurrent(self.hdc, self.hglrc) == 0)
             {
+                if (previous_transfer) |*transfer| transfer.cancel();
                 return error.MakeCurrentFailed;
             }
+            persistent_context = self;
+            if (previous_transfer) |*transfer| transfer.complete();
             return;
         }
-        self.beginOperation() catch |err| return err;
+        self.beginOperation() catch |err| {
+            if (previous_transfer) |*transfer| transfer.cancel();
+            return err;
+        };
         if (!current.matches(self)) {
             if (wglMakeCurrent(self.hdc, self.hglrc) == 0) {
                 self.endOperation();
+                if (previous_transfer) |*transfer| transfer.cancel();
                 return error.MakeCurrentFailed;
             }
         }
         self.persistent_current = true;
+        persistent_context = self;
+        if (previous_transfer) |*transfer| transfer.complete();
     }
 
     pub fn clearCurrent(self: *Context) void {
@@ -247,6 +283,7 @@ pub const Context = struct {
             self.active_operations -= 1;
             if (self.active_operations == 0) self.operation_done.broadcast();
         }
+        if (persistent_context == self) persistent_context = null;
     }
 
     pub fn present(self: *Context) Error!void {
@@ -339,6 +376,15 @@ pub const Context = struct {
         self.active_operations += 1;
     }
 
+    fn beginPersistentTransfer(self: *Context) ?PersistentTransfer {
+        self.operation_mutex.lock();
+        if (!self.persistent_current) {
+            self.operation_mutex.unlock();
+            return null;
+        }
+        return .{ .context = self };
+    }
+
     fn endOperation(self: *Context) void {
         self.operation_mutex.lock();
         std.debug.assert(self.active_operations > 0);
@@ -386,3 +432,7 @@ pub const Context = struct {
         };
     }
 };
+
+// WGL current bindings are thread-local, so this tracks the last successful
+// API-owned persistent binding that must be transferred before a switch.
+threadlocal var persistent_context: ?*Context = null;

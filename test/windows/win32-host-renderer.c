@@ -33,6 +33,22 @@ typedef struct render_call {
     int current_after_clear;
 } render_call;
 
+typedef struct persistent_switch_call {
+    winghostty_surface *first;
+    winghostty_surface *second;
+    winghostty_result first_make_current_result;
+    winghostty_result second_make_current_result;
+    winghostty_result second_clear_current_result;
+    winghostty_result second_make_current_again_result;
+    winghostty_result second_clear_current_again_result;
+    volatile LONG ready_after_clear;
+    volatile LONG continue_after_destroy;
+    int current_after_second_make;
+    int current_after_second_clear;
+    int current_after_second_make_again;
+    int current_after_second_clear_again;
+} persistent_switch_call;
+
 static int current_matches(winghostty_surface *surface);
 static int current_is_clear(void);
 static int check(int condition, const char *message);
@@ -122,6 +138,33 @@ static DWORD WINAPI render_thread(void *parameter) {
     winghostty_rect bounds = {0, 0, 11, 11};
     call->ui_call_result =
         winghostty_surface_set_bounds(call->surface, &bounds);
+    return 0;
+}
+
+static DWORD WINAPI persistent_switch_thread(void *parameter) {
+    persistent_switch_call *call = (persistent_switch_call *)parameter;
+    call->first_make_current_result =
+        winghostty_surface_make_current(call->first);
+    call->second_make_current_result =
+        winghostty_surface_make_current(call->second);
+    call->current_after_second_make = current_matches(call->second);
+    call->second_clear_current_result =
+        winghostty_surface_clear_current(call->second);
+    call->current_after_second_clear = current_is_clear();
+    InterlockedExchange(&call->ready_after_clear, 1);
+    while (InterlockedCompareExchange(
+               &call->continue_after_destroy,
+               0,
+               0
+           ) == 0) {
+        Sleep(1);
+    }
+    call->second_make_current_again_result =
+        winghostty_surface_make_current(call->second);
+    call->current_after_second_make_again = current_matches(call->second);
+    call->second_clear_current_again_result =
+        winghostty_surface_clear_current(call->second);
+    call->current_after_second_clear_again = current_is_clear();
     return 0;
 }
 
@@ -633,6 +676,114 @@ static int run_persistent_teardown_contract(HWND parent) {
     return 0;
 }
 
+static int run_persistent_switch_teardown_contract(HWND parent) {
+    winghostty_host *host = NULL;
+    winghostty_surface *first = NULL;
+    winghostty_surface *second = NULL;
+    winghostty_surface_options options;
+    persistent_switch_call call = {0};
+    winghostty_surface_options_init(&options);
+    options.visible = 0;
+    options.bounds.width = 80;
+    options.bounds.height = 40;
+
+    if (winghostty_host_initialize(&host) != WINGHOSTTY_OK ||
+        winghostty_host_create_surface(
+            host,
+            parent,
+            &options,
+            &first
+        ) != WINGHOSTTY_OK ||
+        winghostty_host_create_surface(
+            host,
+            parent,
+            &options,
+            &second
+        ) != WINGHOSTTY_OK ||
+        first == NULL ||
+        second == NULL) {
+        if (host != NULL) winghostty_host_deinitialize(host);
+        return fail("persistent-switch setup failed");
+    }
+
+    call.first = first;
+    call.second = second;
+    HANDLE thread = CreateThread(
+        NULL,
+        0,
+        persistent_switch_thread,
+        &call,
+        0,
+        NULL
+    );
+    if (thread == NULL) {
+        winghostty_surface_destroy(second);
+        winghostty_surface_destroy(first);
+        winghostty_host_deinitialize(host);
+        return fail("persistent-switch worker creation failed");
+    }
+
+    for (int i = 0; i < 5000 && call.ready_after_clear == 0; ++i) {
+        Sleep(1);
+    }
+    if (check(
+            call.ready_after_clear != 0,
+            "persistent-switch worker did not clear second context"
+        )) {
+        InterlockedExchange(&call.continue_after_destroy, 1);
+        WaitForSingleObject(thread, 10000);
+        CloseHandle(thread);
+        winghostty_surface_destroy(second);
+        winghostty_surface_destroy(first);
+        winghostty_host_deinitialize(host);
+        return 1;
+    }
+
+    HWND first_hwnd = winghostty_surface_get_hwnd(first);
+    if (check(
+            winghostty_surface_destroy(first) == WINGHOSTTY_OK,
+            "persistent first-surface teardown waited after switch"
+        ) ||
+        check(!IsWindow(first_hwnd), "persistent first window survived teardown")) {
+        InterlockedExchange(&call.continue_after_destroy, 1);
+        WaitForSingleObject(thread, 10000);
+        CloseHandle(thread);
+        winghostty_surface_destroy(second);
+        winghostty_host_deinitialize(host);
+        return 1;
+    }
+
+    InterlockedExchange(&call.continue_after_destroy, 1);
+    const int worker_finished =
+        WaitForSingleObject(thread, 10000) == WAIT_OBJECT_0;
+    CloseHandle(thread);
+    if (check(worker_finished, "persistent-switch worker did not finish") ||
+        check(
+            call.first_make_current_result == WINGHOSTTY_OK &&
+                call.second_make_current_result == WINGHOSTTY_OK &&
+                call.second_clear_current_result == WINGHOSTTY_OK &&
+                call.second_make_current_again_result == WINGHOSTTY_OK &&
+                call.second_clear_current_again_result == WINGHOSTTY_OK,
+            "persistent-switch context operations failed"
+        ) ||
+        check(
+            call.current_after_second_make &&
+                call.current_after_second_clear &&
+                call.current_after_second_make_again &&
+                call.current_after_second_clear_again,
+            "persistent-switch WGL binding was not restored")) {
+        winghostty_surface_destroy(second);
+        winghostty_host_deinitialize(host);
+        return 1;
+    }
+
+    if (winghostty_surface_destroy(second) != WINGHOSTTY_OK ||
+        winghostty_host_deinitialize(host) != WINGHOSTTY_OK) {
+        return fail("persistent-switch final teardown failed");
+    }
+    return 0;
+}
+
 static int run_handle_reuse_contract(HWND parent) {
     winghostty_host *old_host = NULL;
     winghostty_surface *old_surface = NULL;
@@ -916,6 +1067,10 @@ int main(void) {
         return 1;
     }
     if (run_persistent_teardown_contract(state.parent) != 0) {
+        DestroyWindow(state.parent);
+        return 1;
+    }
+    if (run_persistent_switch_teardown_contract(state.parent) != 0) {
         DestroyWindow(state.parent);
         return 1;
     }

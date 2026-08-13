@@ -26,6 +26,10 @@ independent of GraphCode product types.
 - Scoped render and presentation save and restore the prior WGL binding, so a
   persistent context on one surface remains current across another surface's
   temporary operation.
+- A `makeCurrent` on the render thread transfers tracked persistent ownership
+  from the previously bound surface only after the new WGL binding succeeds;
+  clearing the replacement then leaves the old surface safe to destroy on the
+  UI thread.
 - Destroy is synchronous. It disables callbacks before destroying the child
   window, drains no caller messages, and frees copied options before
   returning; no callbacks occur after completion.
