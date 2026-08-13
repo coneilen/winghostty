@@ -6,6 +6,7 @@
 //! snapshots and UTF-16 selection offsets.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const com = @import("apprt/win32_uia/com.zig");
 
 extern "user32" fn IsWindow(hwnd: com.HWND) callconv(.winapi) com.BOOL;
@@ -110,224 +111,20 @@ fn decodeCodepoint(text: []const u8, byte_index: usize) DecodedCodepoint {
     };
 }
 
-fn isCombiningCodepoint(codepoint: u21) bool {
-    return (codepoint >= 0x0300 and codepoint <= 0x036f) or
-        (codepoint >= 0x0483 and codepoint <= 0x0489) or
-        (codepoint >= 0x0591 and codepoint <= 0x05bd) or
-        codepoint == 0x05bf or
-        (codepoint >= 0x05c1 and codepoint <= 0x05c2) or
-        (codepoint >= 0x05c4 and codepoint <= 0x05c5) or
-        codepoint == 0x05c7 or
-        (codepoint >= 0x0610 and codepoint <= 0x061a) or
-        (codepoint >= 0x064b and codepoint <= 0x065f) or
-        codepoint == 0x0670 or
-        (codepoint >= 0x06d6 and codepoint <= 0x06dc) or
-        (codepoint >= 0x06df and codepoint <= 0x06e4) or
-        (codepoint >= 0x06e7 and codepoint <= 0x06e8) or
-        (codepoint >= 0x06ea and codepoint <= 0x06ed) or
-        codepoint == 0x0711 or
-        (codepoint >= 0x0730 and codepoint <= 0x074a) or
-        (codepoint >= 0x07a6 and codepoint <= 0x07b0) or
-        (codepoint >= 0x07eb and codepoint <= 0x07f3) or
-        codepoint == 0x07fd or
-        (codepoint >= 0x0816 and codepoint <= 0x0819) or
-        (codepoint >= 0x081b and codepoint <= 0x0823) or
-        (codepoint >= 0x0825 and codepoint <= 0x0827) or
-        (codepoint >= 0x0829 and codepoint <= 0x082d) or
-        (codepoint >= 0x0859 and codepoint <= 0x085b) or
-        (codepoint >= 0x08d3 and codepoint <= 0x08ff) or
-        (codepoint >= 0x0900 and codepoint <= 0x0903) or
-        (codepoint >= 0x093a and codepoint <= 0x093c) or
-        (codepoint >= 0x093e and codepoint <= 0x094f) or
-        (codepoint >= 0x0951 and codepoint <= 0x0957) or
-        (codepoint >= 0x0962 and codepoint <= 0x0963) or
-        (codepoint >= 0x0981 and codepoint <= 0x0984) or
-        (codepoint >= 0x09bc and codepoint <= 0x09cd) or
-        (codepoint >= 0x0a01 and codepoint <= 0x0a03) or
-        (codepoint >= 0x0a3c and codepoint <= 0x0a4d) or
-        (codepoint >= 0x0a70 and codepoint <= 0x0a71) or
-        (codepoint >= 0x0a81 and codepoint <= 0x0a83) or
-        (codepoint >= 0x0abc and codepoint <= 0x0acd) or
-        (codepoint >= 0x0b01 and codepoint <= 0x0b03) or
-        (codepoint >= 0x0b3c and codepoint <= 0x0b4d) or
-        (codepoint >= 0x0b55 and codepoint <= 0x0b57) or
-        (codepoint >= 0x0b82 and codepoint <= 0x0b83) or
-        (codepoint >= 0x0bbe and codepoint <= 0x0bcd) or
-        (codepoint >= 0x0c00 and codepoint <= 0x0c04) or
-        (codepoint >= 0x0c3e and codepoint <= 0x0c56) or
-        (codepoint >= 0x0cbf and codepoint <= 0x0ccd) or
-        (codepoint >= 0x0d00 and codepoint <= 0x0d03) or
-        (codepoint >= 0x0d3b and codepoint <= 0x0d4d) or
-        (codepoint >= 0x0d57 and codepoint <= 0x0d57) or
-        (codepoint >= 0x0e31 and codepoint <= 0x0e4d) or
-        (codepoint >= 0x0eb1 and codepoint <= 0x0ebd) or
-        (codepoint >= 0x0f18 and codepoint <= 0x0f19) or
-        (codepoint >= 0x0f35 and codepoint <= 0x0f39) or
-        (codepoint >= 0x0f71 and codepoint <= 0x0f87) or
-        (codepoint >= 0x0f8d and codepoint <= 0x0fbc) or
-        (codepoint >= 0x0fc6 and codepoint <= 0x0fc6) or
-        (codepoint >= 0x102d and codepoint <= 0x103e) or
-        (codepoint >= 0x1058 and codepoint <= 0x1059) or
-        (codepoint >= 0x105e and codepoint <= 0x1064) or
-        (codepoint >= 0x1067 and codepoint <= 0x106d) or
-        (codepoint >= 0x1071 and codepoint <= 0x1074) or
-        (codepoint >= 0x1082 and codepoint <= 0x108d) or
-        (codepoint >= 0x108f and codepoint <= 0x109d) or
-        (codepoint >= 0x135d and codepoint <= 0x135f) or
-        (codepoint >= 0x1712 and codepoint <= 0x1714) or
-        (codepoint >= 0x1732 and codepoint <= 0x1734) or
-        (codepoint >= 0x1752 and codepoint <= 0x1753) or
-        (codepoint >= 0x1772 and codepoint <= 0x1773) or
-        (codepoint >= 0x17b4 and codepoint <= 0x17d3) or
-        (codepoint >= 0x180b and codepoint <= 0x180f) or
-        (codepoint >= 0x1885 and codepoint <= 0x1886) or
-        (codepoint >= 0x18a9 and codepoint <= 0x18a9) or
-        (codepoint >= 0x1920 and codepoint <= 0x193b) or
-        (codepoint >= 0x1a17 and codepoint <= 0x1a1b) or
-        (codepoint >= 0x1a55 and codepoint <= 0x1a7f) or
-        (codepoint >= 0x1ab0 and codepoint <= 0x1aff) or
-        (codepoint >= 0x1b00 and codepoint <= 0x1b04) or
-        (codepoint >= 0x1b34 and codepoint <= 0x1b44) or
-        (codepoint >= 0x1b6b and codepoint <= 0x1b73) or
-        (codepoint >= 0x1b80 and codepoint <= 0x1b82) or
-        (codepoint >= 0x1ba1 and codepoint <= 0x1bad) or
-        (codepoint >= 0x1be6 and codepoint <= 0x1bf3) or
-        (codepoint >= 0x1c24 and codepoint <= 0x1c37) or
-        (codepoint >= 0x1cd0 and codepoint <= 0x1cf9) or
-        (codepoint >= 0x1dc0 and codepoint <= 0x1dff) or
-        (codepoint >= 0x20d0 and codepoint <= 0x20ff) or
-        (codepoint >= 0x2cef and codepoint <= 0x2cf1) or
-        (codepoint >= 0x2de0 and codepoint <= 0x2dff) or
-        (codepoint >= 0x302a and codepoint <= 0x302f) or
-        (codepoint >= 0x3099 and codepoint <= 0x309a) or
-        (codepoint >= 0xa66f and codepoint <= 0xa67f) or
-        (codepoint >= 0xa69e and codepoint <= 0xa69f) or
-        (codepoint >= 0xa6f0 and codepoint <= 0xa6f1) or
-        (codepoint >= 0xa802 and codepoint <= 0xa802) or
-        (codepoint >= 0xa806 and codepoint <= 0xa806) or
-        (codepoint >= 0xa80b and codepoint <= 0xa80b) or
-        (codepoint >= 0xa825 and codepoint <= 0xa82c) or
-        (codepoint >= 0xa8c4 and codepoint <= 0xa8c5) or
-        (codepoint >= 0xa8e0 and codepoint <= 0xa8f1) or
-        (codepoint >= 0xa926 and codepoint <= 0xa92f) or
-        (codepoint >= 0xa947 and codepoint <= 0xa953) or
-        (codepoint >= 0xa980 and codepoint <= 0xa983) or
-        (codepoint >= 0xa9b3 and codepoint <= 0xa9c0) or
-        (codepoint >= 0xaa29 and codepoint <= 0xaa36) or
-        (codepoint >= 0xaa43 and codepoint <= 0xaa43) or
-        (codepoint >= 0xaa4c and codepoint <= 0xaa4d) or
-        (codepoint >= 0xaa7b and codepoint <= 0xaa7d) or
-        (codepoint >= 0xaab0 and codepoint <= 0xaab0) or
-        (codepoint >= 0xaab2 and codepoint <= 0xaab4) or
-        (codepoint >= 0xaab7 and codepoint <= 0xaab8) or
-        (codepoint >= 0xaabe and codepoint <= 0xaabf) or
-        (codepoint >= 0xaac1 and codepoint <= 0xaac1) or
-        (codepoint >= 0xaaec and codepoint <= 0xaaed) or
-        (codepoint >= 0xaaf5 and codepoint <= 0xaaf6) or
-        (codepoint >= 0xabe3 and codepoint <= 0xabe4) or
-        (codepoint >= 0xabe6 and codepoint <= 0xabe7) or
-        (codepoint >= 0xabe9 and codepoint <= 0xabeb) or
-        (codepoint >= 0xd7b0 and codepoint <= 0xd7ff) or
-        (codepoint >= 0xfb1e and codepoint <= 0xfb1e) or
-        (codepoint >= 0xfe00 and codepoint <= 0xfe0f) or
-        (codepoint >= 0xfe20 and codepoint <= 0xfe2f) or
-        (codepoint >= 0xff9e and codepoint <= 0xff9f) or
-        (codepoint >= 0x101fd and codepoint <= 0x102e0) or
-        (codepoint >= 0x10376 and codepoint <= 0x1037a) or
-        (codepoint >= 0x10a01 and codepoint <= 0x10a0f) or
-        (codepoint >= 0x10a38 and codepoint <= 0x10a3f) or
-        (codepoint >= 0x10ae5 and codepoint <= 0x10ae6) or
-        (codepoint >= 0x11000 and codepoint <= 0x11002) or
-        (codepoint >= 0x11038 and codepoint <= 0x11046) or
-        (codepoint >= 0x11070 and codepoint <= 0x11082) or
-        (codepoint >= 0x110b0 and codepoint <= 0x110ba) or
-        (codepoint >= 0x11100 and codepoint <= 0x11102) or
-        (codepoint >= 0x11127 and codepoint <= 0x1113f) or
-        (codepoint >= 0x11173 and codepoint <= 0x11173) or
-        (codepoint >= 0x11180 and codepoint <= 0x11182) or
-        (codepoint >= 0x111b0 and codepoint <= 0x111c0) or
-        (codepoint >= 0x111c9 and codepoint <= 0x111cc) or
-        (codepoint >= 0x1122f and codepoint <= 0x11231) or
-        (codepoint >= 0x11234 and codepoint <= 0x11237) or
-        (codepoint >= 0x1123e and codepoint <= 0x1123e) or
-        (codepoint >= 0x112df and codepoint <= 0x112ea) or
-        (codepoint >= 0x11300 and codepoint <= 0x11304) or
-        (codepoint >= 0x1133b and codepoint <= 0x1134f) or
-        (codepoint >= 0x11366 and codepoint <= 0x1136c) or
-        (codepoint >= 0x11370 and codepoint <= 0x11374) or
-        (codepoint >= 0x11435 and codepoint <= 0x11446) or
-        (codepoint >= 0x1145e and codepoint <= 0x1145e) or
-        (codepoint >= 0x114b0 and codepoint <= 0x114c3) or
-        (codepoint >= 0x114c6 and codepoint <= 0x114c6) or
-        (codepoint >= 0x115af and codepoint <= 0x115b5) or
-        (codepoint >= 0x115b8 and codepoint <= 0x115bf) or
-        (codepoint >= 0x11630 and codepoint <= 0x11640) or
-        (codepoint >= 0x116ab and codepoint <= 0x116b7) or
-        (codepoint >= 0x1171d and codepoint <= 0x1172b) or
-        (codepoint >= 0x11730 and codepoint <= 0x1173b) or
-        (codepoint >= 0x1182f and codepoint <= 0x1183a) or
-        (codepoint >= 0x1193b and codepoint <= 0x11943) or
-        (codepoint >= 0x119d1 and codepoint <= 0x119e0) or
-        (codepoint >= 0x119e4 and codepoint <= 0x119e4) or
-        (codepoint >= 0x11a01 and codepoint <= 0x11a0a) or
-        (codepoint >= 0x11a33 and codepoint <= 0x11a39) or
-        (codepoint >= 0x11a3b and codepoint <= 0x11a3e) or
-        (codepoint >= 0x11a47 and codepoint <= 0x11a47) or
-        (codepoint >= 0x11a51 and codepoint <= 0x11a5b) or
-        (codepoint >= 0x11a8a and codepoint <= 0x11a99) or
-        (codepoint >= 0x11c30 and codepoint <= 0x11c3f) or
-        (codepoint >= 0x11c92 and codepoint <= 0x11ca7) or
-        (codepoint >= 0x11d31 and codepoint <= 0x11d45) or
-        (codepoint >= 0x11d90 and codepoint <= 0x11d91) or
-        (codepoint >= 0x11ef3 and codepoint <= 0x11ef6) or
-        (codepoint >= 0x13430 and codepoint <= 0x1343f) or
-        (codepoint >= 0x16af0 and codepoint <= 0x16af4) or
-        (codepoint >= 0x16b30 and codepoint <= 0x16b3f) or
-        (codepoint >= 0x16f4f and codepoint <= 0x16f4f) or
-        (codepoint >= 0x16f8f and codepoint <= 0x16f9f) or
-        (codepoint >= 0x16fe4 and codepoint <= 0x16fe4) or
-        (codepoint >= 0x1bc9d and codepoint <= 0x1bc9e) or
-        (codepoint >= 0x1cf00 and codepoint <= 0x1cf2d) or
-        (codepoint >= 0x1cf30 and codepoint <= 0x1cf46) or
-        (codepoint >= 0x1d167 and codepoint <= 0x1d169) or
-        (codepoint >= 0x1d17b and codepoint <= 0x1d182) or
-        (codepoint >= 0x1d185 and codepoint <= 0x1d18b) or
-        (codepoint >= 0x1d1aa and codepoint <= 0x1d1ad) or
-        (codepoint >= 0x1d242 and codepoint <= 0x1d244) or
-        (codepoint >= 0x1da00 and codepoint <= 0x1da36) or
-        (codepoint >= 0x1da3b and codepoint <= 0x1da6c) or
-        (codepoint >= 0x1da75 and codepoint <= 0x1da75) or
-        (codepoint >= 0x1da84 and codepoint <= 0x1da84) or
-        (codepoint >= 0x1da9b and codepoint <= 0x1daa0) or
-        (codepoint >= 0x1daa2 and codepoint <= 0x1dab0) or
-        (codepoint >= 0x1e000 and codepoint <= 0x1e02a) or
-        (codepoint >= 0x1e130 and codepoint <= 0x1e136) or
-        (codepoint >= 0x1e2ec and codepoint <= 0x1e2ef) or
-        (codepoint >= 0x1e8d0 and codepoint <= 0x1e8d6) or
-        (codepoint >= 0x1e944 and codepoint <= 0x1e94a) or
-        (codepoint >= 0x1f3fb and codepoint <= 0x1f3ff) or
-        (codepoint >= 0xe0100 and codepoint <= 0xe01ef);
-}
-
-fn isWideCodepoint(codepoint: u21) bool {
-    return (codepoint >= 0x1100 and codepoint <= 0x115f) or
-        codepoint == 0x2329 or
-        codepoint == 0x232a or
-        (codepoint >= 0x2e80 and codepoint <= 0x303e) or
-        (codepoint >= 0x3040 and codepoint <= 0xa4cf) or
-        (codepoint >= 0xac00 and codepoint <= 0xd7a3) or
-        (codepoint >= 0xf900 and codepoint <= 0xfaff) or
-        (codepoint >= 0xfe10 and codepoint <= 0xfe19) or
-        (codepoint >= 0xfe30 and codepoint <= 0xfe6f) or
-        (codepoint >= 0xff00 and codepoint <= 0xff60) or
-        (codepoint >= 0xffe0 and codepoint <= 0xffe6) or
-        (codepoint >= 0x1f300 and codepoint <= 0x1faff) or
-        (codepoint >= 0x20000 and codepoint <= 0x3fffd);
+fn testDisplayCellWidth(codepoint: u21) usize {
+    if (codepoint < 0x20 or codepoint == 0x7f or
+        codepoint == 0x0301 or codepoint == 0x200d or codepoint == 0xfe0f) return 0;
+    if ((codepoint >= 0x2e80 and codepoint <= 0xa4cf) or
+        codepoint == 0x1b000 or
+        (codepoint >= 0x1f300 and codepoint <= 0x1faff)) return 2;
+    return 1;
 }
 
 fn displayCellWidth(codepoint: u21) usize {
-    if (codepoint < 0x20 or codepoint == 0x7f or isCombiningCodepoint(codepoint)) return 0;
-    return if (isWideCodepoint(codepoint)) 2 else 1;
+    if (comptime builtin.is_test) return testDisplayCellWidth(codepoint);
+    const uucode = @import("uucode");
+    if (codepoint > uucode.config.max_code_point) return 1;
+    return @intCast(uucode.get(.width, @intCast(codepoint)));
 }
 
 fn displayCellWidthRange(text: []const u8, start: usize, end: usize) usize {
@@ -351,7 +148,8 @@ fn lineColumnAtByte(snapshot: *const Snapshot, byte_index: usize) usize {
     );
     if (clamped < snapshot.text.len) {
         const current = decodeCodepoint(snapshot.text, clamped);
-        if (displayCellWidth(current.value) == 0 and column > 0) {
+        const is_control = current.value < 0x20 or current.value == 0x7f;
+        if (!is_control and displayCellWidth(current.value) == 0 and column > 0) {
             var previous = line_start;
             var previous_width: usize = 0;
             while (previous < clamped) {
@@ -472,6 +270,11 @@ pub const SurfaceProvider = struct {
     refcount: std.atomic.Value(u32),
     alloc: std.mem.Allocator,
     hwnd: com.HWND,
+    state_lock: std.Thread.RwLock,
+    callback_lock: std.Thread.Mutex,
+    lifetime_lock: std.Thread.Mutex,
+    active_calls: usize,
+    destroying: bool,
     name: []u8,
     snapshot: Snapshot,
     role: Role,
@@ -556,6 +359,11 @@ pub const SurfaceProvider = struct {
             .refcount = std.atomic.Value(u32).init(1),
             .alloc = alloc,
             .hwnd = hwnd,
+            .state_lock = .{},
+            .callback_lock = .{},
+            .lifetime_lock = .{},
+            .active_calls = 0,
+            .destroying = false,
             .name = name,
             .snapshot = snapshot,
             .role = config.role,
@@ -570,10 +378,45 @@ pub const SurfaceProvider = struct {
         return self;
     }
 
+    const CallGuard = struct {
+        provider: *SurfaceProvider,
+
+        fn deinit(self: *CallGuard) void {
+            self.provider.lifetime_lock.lock();
+            self.provider.active_calls -= 1;
+            self.provider.lifetime_lock.unlock();
+        }
+    };
+
+    fn beginCall(self: *SurfaceProvider) ?CallGuard {
+        self.lifetime_lock.lock();
+        defer self.lifetime_lock.unlock();
+        if (self.destroying or self.detached.load(.acquire)) return null;
+        self.active_calls += 1;
+        return .{ .provider = self };
+    }
+
+    fn snapshotCopy(self: *SurfaceProvider, alloc: std.mem.Allocator) !Snapshot {
+        self.state_lock.lockShared();
+        defer self.state_lock.unlockShared();
+        return snapshotFromUtf8(
+            alloc,
+            self.snapshot.text,
+            self.snapshot.visible,
+            self.snapshot.selection,
+            self.snapshot.caret,
+            self.snapshot.metrics,
+        );
+    }
+
     pub fn detach(self: *SurfaceProvider) void {
+        self.detached.store(true, .release);
+        self.callback_lock.lock();
+        self.state_lock.lock();
         self.on_selection = null;
         self.callback_ctx = null;
-        self.detached.store(true, .release);
+        self.state_lock.unlock();
+        self.callback_lock.unlock();
     }
 
     pub fn disconnect(self: *SurfaceProvider) com.HRESULT {
@@ -589,10 +432,18 @@ pub const SurfaceProvider = struct {
     }
 
     pub fn updateName(self: *SurfaceProvider, name: []const u8) !void {
-        if (!self.available()) return error.ElementNotAvailable;
+        var call = self.beginCall() orelse return error.ElementNotAvailable;
+        defer call.deinit();
         const owned = try self.alloc.dupe(u8, name);
+        self.state_lock.lock();
+        if (self.detached.load(.acquire)) {
+            self.state_lock.unlock();
+            self.alloc.free(owned);
+            return error.ElementNotAvailable;
+        }
         self.alloc.free(self.name);
         self.name = owned;
+        self.state_lock.unlock();
         raiseNameChanged(self);
     }
 
@@ -603,68 +454,117 @@ pub const SurfaceProvider = struct {
         next_selection: Range,
         caret: usize,
     ) !void {
-        if (!self.available()) return error.ElementNotAvailable;
+        var call = self.beginCall() orelse return error.ElementNotAvailable;
+        defer call.deinit();
+        self.state_lock.lockShared();
+        const metrics = self.snapshot.metrics;
+        self.state_lock.unlockShared();
         const next = try snapshotFromUtf8(
             self.alloc,
             text,
             visible,
             next_selection,
             caret,
-            self.snapshot.metrics,
+            metrics,
         );
+        self.state_lock.lock();
+        if (self.detached.load(.acquire)) {
+            self.state_lock.unlock();
+            var owned = next;
+            owned.deinit(self.alloc);
+            return error.ElementNotAvailable;
+        }
         self.snapshot.deinit(self.alloc);
         self.snapshot = next;
+        self.state_lock.unlock();
         raiseAutomationEvent(self, 20015);
         raiseAutomationEvent(self, 20014);
     }
 
     pub fn updateSelection(self: *SurfaceProvider, next_selection: Range, caret: usize) void {
-        if (!self.available()) return;
+        var call = self.beginCall() orelse return;
+        defer call.deinit();
+        self.state_lock.lock();
+        if (self.detached.load(.acquire)) {
+            self.state_lock.unlock();
+            return;
+        }
         const next = next_selection.normalized(self.snapshot.utf16_len);
         self.snapshot.selection = next;
         self.snapshot.caret = @min(caret, self.snapshot.utf16_len);
+        self.state_lock.unlock();
         raiseAutomationEvent(self, 20014);
     }
 
     pub fn updateFocus(self: *SurfaceProvider, focused: bool) void {
-        if (!self.available()) return;
+        var call = self.beginCall() orelse return;
+        defer call.deinit();
+        if (self.detached.load(.acquire)) return;
         self.focused.store(focused, .release);
         raiseAutomationEvent(self, 20005);
     }
 
     pub fn updateVisibility(self: *SurfaceProvider, visible: bool) void {
-        if (!self.available()) return;
+        var call = self.beginCall() orelse return;
+        defer call.deinit();
+        if (self.detached.load(.acquire)) return;
         self.visible.store(visible, .release);
     }
 
     pub fn updateRole(self: *SurfaceProvider, role: Role) void {
-        if (!self.available()) return;
+        var call = self.beginCall() orelse return;
+        defer call.deinit();
+        self.state_lock.lock();
+        if (self.detached.load(.acquire)) {
+            self.state_lock.unlock();
+            return;
+        }
         const previous = self.role;
-        if (previous == role) return;
+        if (previous == role) {
+            self.state_lock.unlock();
+            return;
+        }
         self.role = role;
+        self.state_lock.unlock();
         raiseRoleChanged(self, previous, role);
     }
 
     pub fn updateMetrics(self: *SurfaceProvider, metrics: Metrics) void {
-        if (!self.available()) return;
+        var call = self.beginCall() orelse return;
+        defer call.deinit();
+        self.state_lock.lock();
+        if (self.detached.load(.acquire)) {
+            self.state_lock.unlock();
+            return;
+        }
         self.snapshot.metrics = metrics;
+        self.state_lock.unlock();
         raiseAutomationEvent(self, 20015);
     }
 
-    pub fn textUtf8(self: *const SurfaceProvider) []const u8 {
-        return self.snapshot.text;
+    pub fn textUtf8(self: *SurfaceProvider, alloc: std.mem.Allocator) ![]u8 {
+        var call = self.beginCall() orelse return error.ElementNotAvailable;
+        defer call.deinit();
+        self.state_lock.lockShared();
+        defer self.state_lock.unlockShared();
+        return alloc.dupe(u8, self.snapshot.text);
     }
 
-    pub fn selectionRange(self: *const SurfaceProvider) Range {
+    pub fn selectionRange(self: *SurfaceProvider) Range {
+        self.state_lock.lockShared();
+        defer self.state_lock.unlockShared();
         return self.snapshot.selection;
     }
 
     pub fn copyRangeUtf8(
-        self: *const SurfaceProvider,
+        self: *SurfaceProvider,
         range: Range,
         alloc: std.mem.Allocator,
     ) ![]u8 {
-        if (!self.available()) return error.ElementNotAvailable;
+        var call = self.beginCall() orelse return error.ElementNotAvailable;
+        defer call.deinit();
+        self.state_lock.lockShared();
+        defer self.state_lock.unlockShared();
         const bytes = self.snapshot.utf16RangeToBytes(range);
         return alloc.dupe(u8, self.snapshot.text[bytes.start..bytes.end]);
     }
@@ -674,17 +574,22 @@ pub const SurfaceProvider = struct {
     }
 
     fn refreshScreenOrigin(self: *SurfaceProvider) void {
-        if (self.screen_origin_query) |origin_query| {
-            if (origin_query(self.hwnd)) |origin| {
+        const origin_query = self.screen_origin_query;
+        if (origin_query) |origin_fn| {
+            if (origin_fn(self.hwnd)) |origin| {
+                self.state_lock.lock();
                 self.snapshot.metrics.origin_x = @floatFromInt(origin.x);
                 self.snapshot.metrics.origin_y = @floatFromInt(origin.y);
+                self.state_lock.unlock();
             }
             return;
         }
         var origin: ScreenOrigin = .{ .x = 0, .y = 0 };
         if (ClientToScreen(self.hwnd, &origin) != 0) {
+            self.state_lock.lock();
             self.snapshot.metrics.origin_x = @floatFromInt(origin.x);
             self.snapshot.metrics.origin_y = @floatFromInt(origin.y);
+            self.state_lock.unlock();
         }
     }
 
@@ -706,6 +611,8 @@ pub const SurfaceProvider = struct {
         iid: *const com.GUID,
         out: *?*anyopaque,
     ) com.HRESULT {
+        var call = self.beginCall() orelse return com.UIA_E_ELEMENTNOTAVAILABLE;
+        defer call.deinit();
         out.* = null;
         if (iidEqual(iid, &com.IID_IUnknown) or
             iidEqual(iid, &com.IID_IRawElementProviderSimple))
@@ -727,8 +634,18 @@ pub const SurfaceProvider = struct {
     fn release(self: *SurfaceProvider) u32 {
         const previous = self.refcount.fetchSub(1, .acq_rel);
         if (previous == 1) {
+            self.lifetime_lock.lock();
+            self.destroying = true;
+            while (self.active_calls != 0) {
+                self.lifetime_lock.unlock();
+                std.Thread.yield() catch {};
+                self.lifetime_lock.lock();
+            }
+            self.lifetime_lock.unlock();
+            self.state_lock.lock();
             self.snapshot.deinit(self.alloc);
             self.alloc.free(self.name);
+            self.state_lock.unlock();
             self.alloc.destroy(self);
             return 0;
         }
@@ -762,13 +679,34 @@ pub const SurfaceProvider = struct {
     }
 
     fn setSelectedRange(self: *SurfaceProvider, range: Range) com.HRESULT {
+        var call = self.beginCall() orelse return com.UIA_E_ELEMENTNOTAVAILABLE;
+        defer call.deinit();
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        self.state_lock.lock();
+        if (self.detached.load(.acquire)) {
+            self.state_lock.unlock();
+            return com.UIA_E_ELEMENTNOTAVAILABLE;
+        }
         const next = range.normalized(self.snapshot.utf16_len);
         self.snapshot.selection = next;
         self.snapshot.caret = next.end;
-        if (self.on_selection) |callback| {
-            if (self.callback_ctx) |ctx| callback(ctx, next.start, next.end);
+        const callback = self.on_selection;
+        const callback_ctx = self.callback_ctx;
+        self.state_lock.unlock();
+        self.callback_lock.lock();
+        self.state_lock.lockShared();
+        const still_attached = !self.detached.load(.acquire);
+        const current_callback = self.on_selection;
+        const current_ctx = self.callback_ctx;
+        self.state_lock.unlockShared();
+        if (still_attached and callback != null and
+            current_callback == callback and current_ctx == callback_ctx)
+        {
+            if (callback) |selection_callback| {
+                if (callback_ctx) |ctx| selection_callback(ctx, next.start, next.end);
+            }
         }
+        self.callback_lock.unlock();
         raiseAutomationEvent(self, 20014);
         return com.S_OK;
     }
@@ -797,9 +735,10 @@ pub const SurfaceProvider = struct {
         out: *i32,
     ) callconv(.winapi) com.HRESULT {
         const self = fromBase(value);
-        out.* = com.ProviderOptions_ServerSideProvider;
-        if (self.available()) return com.S_OK;
-        return com.UIA_E_ELEMENTNOTAVAILABLE;
+        var call = self.beginCall() orelse return com.UIA_E_ELEMENTNOTAVAILABLE;
+        defer call.deinit();
+        out.* = com.ProviderOptions_ServerSideProvider | com.ProviderOptions_UseComThreading;
+        return if (self.available()) com.S_OK else com.UIA_E_ELEMENTNOTAVAILABLE;
     }
 
     fn GetPatternProvider(
@@ -808,7 +747,11 @@ pub const SurfaceProvider = struct {
         out: *?*com.IUnknown,
     ) callconv(.winapi) com.HRESULT {
         const self = fromBase(value);
+        var call = self.beginCall() orelse return com.UIA_E_ELEMENTNOTAVAILABLE;
+        defer call.deinit();
         out.* = null;
+        self.state_lock.lockShared();
+        defer self.state_lock.unlockShared();
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         if (pattern == 10002 and self.role == .edit) {
             out.* = @ptrCast(&self.value_iface);
@@ -829,8 +772,11 @@ pub const SurfaceProvider = struct {
         out: *com.VARIANT,
     ) callconv(.winapi) com.HRESULT {
         const self = fromBase(value);
+        var call = self.beginCall() orelse return com.UIA_E_ELEMENTNOTAVAILABLE;
+        defer call.deinit();
         out.* = com.VARIANT.empty();
-        if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        self.state_lock.lockShared();
+        defer self.state_lock.unlockShared();
         switch (property) {
             30003 => out.* = com.VARIANT.fromI4(
                 controlType(self.role),
@@ -872,6 +818,11 @@ pub const SurfaceProvider = struct {
         out: *?*com.IRawElementProviderSimple,
     ) callconv(.winapi) com.HRESULT {
         const self = fromBase(value);
+        var call = self.beginCall() orelse {
+            out.* = null;
+            return com.UIA_E_ELEMENTNOTAVAILABLE;
+        };
+        defer call.deinit();
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         return com.UiaHostProviderFromHwnd(self.hwnd, out);
@@ -894,7 +845,9 @@ pub const SurfaceProvider = struct {
         value: *com.IValueProvider,
         _: [*:0]const u16,
     ) callconv(.winapi) com.HRESULT {
-        _ = value;
+        const self = fromValue(value);
+        var call = self.beginCall() orelse return com.UIA_E_ELEMENTNOTAVAILABLE;
+        defer call.deinit();
         return com.UIA_E_INVALIDOPERATION;
     }
     fn ValueGetValue(
@@ -902,7 +855,11 @@ pub const SurfaceProvider = struct {
         out: *?[*:0]u16,
     ) callconv(.winapi) com.HRESULT {
         const self = fromValue(value);
+        var call = self.beginCall() orelse return com.UIA_E_ELEMENTNOTAVAILABLE;
+        defer call.deinit();
         out.* = null;
+        self.state_lock.lockShared();
+        defer self.state_lock.unlockShared();
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         const bytes = self.snapshot.utf16RangeToBytes(.{
             .start = 0,
@@ -918,6 +875,10 @@ pub const SurfaceProvider = struct {
         out: *com.BOOL,
     ) callconv(.winapi) com.HRESULT {
         const self = fromValue(value);
+        var call = self.beginCall() orelse return com.UIA_E_ELEMENTNOTAVAILABLE;
+        defer call.deinit();
+        self.state_lock.lockShared();
+        defer self.state_lock.unlockShared();
         out.* = if (self.role == .edit) 0 else 1;
         return if (self.available()) com.S_OK else com.UIA_E_ELEMENTNOTAVAILABLE;
     }
@@ -976,69 +937,83 @@ pub const SurfaceProvider = struct {
         self: *SurfaceProvider,
         out: *?*com.SAFEARRAY,
     ) com.HRESULT {
-        if (!self.available()) {
+        var call = self.beginCall() orelse {
             out.* = null;
             return com.UIA_E_ELEMENTNOTAVAILABLE;
-        }
+        };
+        defer call.deinit();
+        self.state_lock.lockShared();
         const range = self.selectedRange();
+        self.state_lock.unlockShared();
         return self.makeSafeArrayRange(&.{range}, out);
     }
     fn textGetVisibleRanges(
         self: *SurfaceProvider,
         out: *?*com.SAFEARRAY,
     ) com.HRESULT {
-        if (!self.available()) {
+        var call = self.beginCall() orelse {
             out.* = null;
             return com.UIA_E_ELEMENTNOTAVAILABLE;
-        }
-        return self.makeSafeArrayRange(&.{self.snapshot.visible}, out);
+        };
+        defer call.deinit();
+        self.state_lock.lockShared();
+        const visible = self.snapshot.visible;
+        self.state_lock.unlockShared();
+        return self.makeSafeArrayRange(&.{visible}, out);
     }
     fn textRangeFromPoint(
         self: *SurfaceProvider,
         point: com.UiaPoint,
         out: *?*com.ITextRangeProvider,
     ) com.HRESULT {
+        var call = self.beginCall() orelse {
+            out.* = null;
+            return com.UIA_E_ELEMENTNOTAVAILABLE;
+        };
+        defer call.deinit();
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         if (!std.math.isFinite(point.x) or !std.math.isFinite(point.y)) return com.S_OK;
         self.refreshScreenOrigin();
-        const cell_height = @max(self.snapshot.metrics.cell_height, 1);
-        const cell_width = @max(self.snapshot.metrics.cell_width, 1);
-        const last_row = lineIndexAtByte(&self.snapshot, self.snapshot.text.len);
+        var snapshot = self.snapshotCopy(self.alloc) catch return com.E_OUTOFMEMORY;
+        defer snapshot.deinit(self.alloc);
+        const cell_height = @max(snapshot.metrics.cell_height, 1);
+        const cell_width = @max(snapshot.metrics.cell_width, 1);
+        const last_row = lineIndexAtByte(&snapshot, snapshot.text.len);
         const row = cellCoordinate(
             point.y,
-            self.snapshot.metrics.origin_y,
+            snapshot.metrics.origin_y,
             cell_height,
             last_row,
         );
         const column = cellCoordinate(
             point.x,
-            self.snapshot.metrics.origin_x,
+            snapshot.metrics.origin_x,
             cell_width,
-            lineDisplayCellWidth(&self.snapshot, row),
+            lineDisplayCellWidth(&snapshot, row),
         );
         var current_row: usize = 0;
         var current_column: usize = 0;
         var utf16_start: usize = 0;
         var index: usize = 0;
-        while (index < self.snapshot.text.len) {
-            const byte = self.snapshot.text[index];
+        while (index < snapshot.text.len) {
+            const byte = snapshot.text[index];
             if (byte == '\n') {
                 if (current_row >= row) break;
                 current_row += 1;
                 current_column = 0;
-                utf16_start = self.snapshot.utf16_for_byte[index + 1];
+                utf16_start = snapshot.utf16_for_byte[index + 1];
                 index += 1;
                 continue;
             }
-            const decoded = decodeCodepoint(self.snapshot.text, index);
+            const decoded = decodeCodepoint(snapshot.text, index);
             const display_width = displayCellWidth(decoded.value);
             if (current_row == row and current_column >= column and display_width != 0) break;
             current_column += display_width;
             index += decoded.byte_len;
         }
-        const offset = if (index <= self.snapshot.text.len)
-            self.snapshot.utf16_for_byte[index]
+        const offset = if (index <= snapshot.text.len)
+            snapshot.utf16_for_byte[index]
         else
             utf16_start;
         const range = self.makeRange(.{ .start = offset, .end = offset }) orelse
@@ -1050,9 +1025,17 @@ pub const SurfaceProvider = struct {
         self: *SurfaceProvider,
         out: *?*com.ITextRangeProvider,
     ) com.HRESULT {
+        var call = self.beginCall() orelse {
+            out.* = null;
+            return com.UIA_E_ELEMENTNOTAVAILABLE;
+        };
+        defer call.deinit();
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        const range = self.makeRange(.{ .start = 0, .end = self.snapshot.utf16_len }) orelse
+        self.state_lock.lockShared();
+        const end = self.snapshot.utf16_len;
+        self.state_lock.unlockShared();
+        const range = self.makeRange(.{ .start = 0, .end = end }) orelse
             return com.E_OUTOFMEMORY;
         out.* = &range.base;
         return com.S_OK;
@@ -1061,6 +1044,8 @@ pub const SurfaceProvider = struct {
         self: *SurfaceProvider,
         out: *i32,
     ) com.HRESULT {
+        var call = self.beginCall() orelse return com.UIA_E_ELEMENTNOTAVAILABLE;
+        defer call.deinit();
         out.* = com.SupportedTextSelection_Single;
         return if (self.available()) com.S_OK else com.UIA_E_ELEMENTNOTAVAILABLE;
     }
@@ -1071,8 +1056,14 @@ pub const SurfaceProvider = struct {
         return fromText(value).textGetVisibleRanges(out);
     }
     fn TextRangeFromChild(value: *com.ITextProvider, _: ?*com.IRawElementProviderSimple, out: *?*com.ITextRangeProvider) callconv(.winapi) com.HRESULT {
+        const self = fromText(value);
+        var call = self.beginCall() orelse {
+            out.* = null;
+            return com.UIA_E_ELEMENTNOTAVAILABLE;
+        };
+        defer call.deinit();
         out.* = null;
-        return if (fromText(value).available()) com.S_OK else com.UIA_E_ELEMENTNOTAVAILABLE;
+        return if (self.available()) com.S_OK else com.UIA_E_ELEMENTNOTAVAILABLE;
     }
     fn TextRangeFromPoint(value: *com.ITextProvider, point: com.UiaPoint, out: *?*com.ITextRangeProvider) callconv(.winapi) com.HRESULT {
         return fromText(value).textRangeFromPoint(point, out);
@@ -1090,9 +1081,15 @@ pub const SurfaceProvider = struct {
         return fromText2(value).textGetVisibleRanges(out);
     }
     fn Text2RangeFromChild(value: *com.ITextProvider2, child: ?*com.IRawElementProviderSimple, out: *?*com.ITextRangeProvider) callconv(.winapi) com.HRESULT {
+        const self = fromText2(value);
+        var call = self.beginCall() orelse {
+            out.* = null;
+            return com.UIA_E_ELEMENTNOTAVAILABLE;
+        };
+        defer call.deinit();
         out.* = null;
         _ = child;
-        return if (fromText2(value).available()) com.S_OK else com.UIA_E_ELEMENTNOTAVAILABLE;
+        return if (self.available()) com.S_OK else com.UIA_E_ELEMENTNOTAVAILABLE;
     }
     fn Text2RangeFromPoint(value: *com.ITextProvider2, point: com.UiaPoint, out: *?*com.ITextRangeProvider) callconv(.winapi) com.HRESULT {
         return fromText2(value).textRangeFromPoint(point, out);
@@ -1104,16 +1101,29 @@ pub const SurfaceProvider = struct {
         return fromText2(value).textGetSupported(out);
     }
     fn Text2RangeFromAnnotation(value: *com.ITextProvider2, _: ?*com.IRawElementProviderSimple, out: *?*com.ITextRangeProvider) callconv(.winapi) com.HRESULT {
+        const self = fromText2(value);
+        var call = self.beginCall() orelse {
+            out.* = null;
+            return com.UIA_E_ELEMENTNOTAVAILABLE;
+        };
+        defer call.deinit();
         out.* = null;
-        return if (fromText2(value).available()) com.S_OK else com.UIA_E_ELEMENTNOTAVAILABLE;
+        return if (self.available()) com.S_OK else com.UIA_E_ELEMENTNOTAVAILABLE;
     }
     fn Text2GetCaretRange(value: *com.ITextProvider2, active: *com.BOOL, out: *?*com.ITextRangeProvider) callconv(.winapi) com.HRESULT {
         const self = fromText2(value);
+        var call = self.beginCall() orelse {
+            out.* = null;
+            return com.UIA_E_ELEMENTNOTAVAILABLE;
+        };
+        defer call.deinit();
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        self.state_lock.lockShared();
         active.* = if (self.focused.load(.acquire)) 1 else 0;
-        const range = self.makeRange(.{ .start = self.snapshot.caret, .end = self.snapshot.caret }) orelse
-            return com.E_OUTOFMEMORY;
+        const caret = self.snapshot.caret;
+        self.state_lock.unlockShared();
+        const range = self.makeRange(.{ .start = caret, .end = caret }) orelse return com.E_OUTOFMEMORY;
         out.* = &range.base;
         return com.S_OK;
     }
@@ -1125,6 +1135,7 @@ const SurfaceTextRangeProvider = struct {
     alloc: std.mem.Allocator,
     parent: *SurfaceProvider,
     snapshot: Snapshot,
+    range_lock: std.Thread.Mutex,
     range: Range,
 
     const vtbl: com.ITextRangeProviderVtbl = .{
@@ -1160,20 +1171,14 @@ const SurfaceTextRangeProvider = struct {
         errdefer alloc.destroy(self);
         _ = SurfaceProvider.AddRef(&parent.base);
         errdefer _ = SurfaceProvider.Release(&parent.base);
-        const copy = try snapshotFromUtf8(
-            alloc,
-            parent.snapshot.text,
-            parent.snapshot.visible,
-            parent.snapshot.selection,
-            parent.snapshot.caret,
-            parent.snapshot.metrics,
-        );
+        const copy = try parent.snapshotCopy(alloc);
         self.* = .{
             .base = .{ .vtbl = &vtbl },
             .refcount = std.atomic.Value(u32).init(1),
             .alloc = alloc,
             .parent = parent,
             .snapshot = copy,
+            .range_lock = .{},
             .range = range.normalized(copy.utf16_len),
         };
         return self;
@@ -1205,15 +1210,25 @@ const SurfaceTextRangeProvider = struct {
         return com.E_NOINTERFACE;
     }
     fn clone(self: *SurfaceTextRangeProvider) ?*SurfaceTextRangeProvider {
-        return SurfaceTextRangeProvider.create(self.alloc, self.parent, self.range) catch null;
+        self.range_lock.lock();
+        const current = self.range;
+        self.range_lock.unlock();
+        return SurfaceTextRangeProvider.create(self.alloc, self.parent, current) catch null;
+    }
+    fn rangeCopy(self: *SurfaceTextRangeProvider) Range {
+        self.range_lock.lock();
+        defer self.range_lock.unlock();
+        return self.range;
     }
     fn byteRange(self: *const SurfaceTextRangeProvider) Range {
         return self.snapshot.utf16RangeToBytes(self.range);
     }
 
-    fn refreshGeometry(self: *SurfaceTextRangeProvider) void {
+    fn geometryMetrics(self: *SurfaceTextRangeProvider) Metrics {
         self.parent.refreshScreenOrigin();
-        self.snapshot.metrics = self.parent.snapshot.metrics;
+        self.parent.state_lock.lockShared();
+        defer self.parent.state_lock.unlockShared();
+        return self.parent.snapshot.metrics;
     }
 
     fn lineBounds(self: *const SurfaceTextRangeProvider) Range {
@@ -1274,9 +1289,11 @@ const SurfaceTextRangeProvider = struct {
         };
         const other_range = fromBase(rhs);
         if (!self.available() or !other_range.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        const lhs = self.rangeCopy();
+        const rhs_range = other_range.rangeCopy();
         out.* = if (std.mem.eql(u8, self.snapshot.text, other_range.snapshot.text) and
-            self.range.start == other_range.range.start and
-            self.range.end == other_range.range.end) 1 else 0;
+            lhs.start == rhs_range.start and
+            lhs.end == rhs_range.end) 1 else 0;
         return com.S_OK;
     }
     fn CompareEndpoints(
@@ -1290,14 +1307,18 @@ const SurfaceTextRangeProvider = struct {
         const rhs = other orelse return com.E_INVALIDARG;
         const other_range = fromBase(rhs);
         if (!self.available() or !other_range.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        const lhs_value = if (endpoint == com.TextPatternRangeEndpoint_Start) self.range.start else self.range.end;
-        const rhs_value = if (other_endpoint == com.TextPatternRangeEndpoint_Start) other_range.range.start else other_range.range.end;
+        const lhs_range = self.rangeCopy();
+        const rhs_range = other_range.rangeCopy();
+        const lhs_value = if (endpoint == com.TextPatternRangeEndpoint_Start) lhs_range.start else lhs_range.end;
+        const rhs_value = if (other_endpoint == com.TextPatternRangeEndpoint_Start) rhs_range.start else rhs_range.end;
         out.* = if (lhs_value < rhs_value) -1 else if (lhs_value > rhs_value) 1 else 0;
         return com.S_OK;
     }
     fn ExpandToEnclosingUnit(value: *com.ITextRangeProvider, unit: i32) callconv(.winapi) com.HRESULT {
         const self = fromBase(value);
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        self.range_lock.lock();
+        defer self.range_lock.unlock();
         switch (unit) {
             com.TextUnit_Document => self.range = .{ .start = 0, .end = self.snapshot.utf16_len },
             com.TextUnit_Line, com.TextUnit_Paragraph => self.range = self.lineBounds(),
@@ -1319,6 +1340,8 @@ const SurfaceTextRangeProvider = struct {
         const self = fromBase(value);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        self.range_lock.lock();
+        defer self.range_lock.unlock();
         const needle_ptr = needle orelse return com.E_INVALIDARG;
         var length: usize = 0;
         while (needle_ptr[length] != 0) : (length += 1) {}
@@ -1356,7 +1379,9 @@ const SurfaceTextRangeProvider = struct {
         const self = fromBase(value);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        self.refreshGeometry();
+        self.range_lock.lock();
+        defer self.range_lock.unlock();
+        const metrics = self.geometryMetrics();
         if (self.range.start == self.range.end) {
             out.* = com.SafeArrayCreateVector(com.VT_R8, 0, 0);
             return if (out.* == null) com.E_OUTOFMEMORY else com.S_OK;
@@ -1370,16 +1395,20 @@ const SurfaceTextRangeProvider = struct {
         out.* = com.SafeArrayCreateVector(com.VT_R8, 0, @intCast(line_count * 4));
         if (out.* == null) return com.E_OUTOFMEMORY;
         var line_start = bytes.start;
-        const first_column = lineColumnAtByte(&self.snapshot, bytes.start);
         var line_index: usize = 0;
         while (line_index < line_count) : (line_index += 1) {
             var line_end = line_start;
             while (line_end < bytes.end and self.snapshot.text[line_end] != '\n') line_end += 1;
-            const line_width = displayCellWidthRange(self.snapshot.text, line_start, line_end);
+            const start_column = if (line_index == 0)
+                lineColumnAtByte(&self.snapshot, bytes.start)
+            else
+                0;
+            const end_column = lineColumnAtByte(&self.snapshot, line_end);
+            const line_width = end_column -| start_column;
             const rectangle = boundingRectangle(
-                self.snapshot.metrics,
+                metrics,
                 document_row + line_index,
-                if (line_index == 0) first_column else 0,
+                start_column,
                 line_width,
             );
             const values = [_]f64{
@@ -1416,6 +1445,8 @@ const SurfaceTextRangeProvider = struct {
         const self = fromBase(value);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        self.range_lock.lock();
+        defer self.range_lock.unlock();
         const bstr = self.textForRange(max_length) orelse return com.E_OUTOFMEMORY;
         out.* = bstr;
         return com.S_OK;
@@ -1423,6 +1454,8 @@ const SurfaceTextRangeProvider = struct {
     fn Move(value: *com.ITextRangeProvider, unit: i32, count: i32, moved: *i32) callconv(.winapi) com.HRESULT {
         const self = fromBase(value);
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        self.range_lock.lock();
+        defer self.range_lock.unlock();
         moved.* = 0;
         if (unit == com.TextUnit_Document) {
             if (count != 0) self.range = if (count > 0)
@@ -1464,6 +1497,8 @@ const SurfaceTextRangeProvider = struct {
     ) callconv(.winapi) com.HRESULT {
         const self = fromBase(value);
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        self.range_lock.lock();
+        defer self.range_lock.unlock();
         moved.* = 0;
         if (unit == com.TextUnit_Document) {
             if (count == 0) return com.S_OK;
@@ -1492,16 +1527,19 @@ const SurfaceTextRangeProvider = struct {
         const rhs = other orelse return com.E_INVALIDARG;
         const other_range = fromBase(rhs);
         if (!self.available() or !other_range.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        const other_copy = other_range.rangeCopy();
+        self.range_lock.lock();
+        defer self.range_lock.unlock();
         const target = if (other_endpoint == com.TextPatternRangeEndpoint_Start)
-            other_range.range.start
+            other_copy.start
         else
-            other_range.range.end;
+            other_copy.end;
         self.moveEndpoint(endpoint, target);
         return com.S_OK;
     }
     fn Select(value: *com.ITextRangeProvider) callconv(.winapi) com.HRESULT {
         const self = fromBase(value);
-        return self.parent.setSelectedRange(self.range);
+        return self.parent.setSelectedRange(self.rangeCopy());
     }
     fn AddToSelection(value: *com.ITextRangeProvider) callconv(.winapi) com.HRESULT {
         return Select(value);
@@ -1533,13 +1571,16 @@ fn raiseAutomationEvent(self: *SurfaceProvider, event_id: i32) void {
 fn raiseNameChanged(self: *SurfaceProvider) void {
     if (!self.available() or IsWindow(self.hwnd) == 0 or
         com.UiaClientsAreListening() == 0) return;
-    const bstr = self.propertyBstr(self.name) orelse return;
-    defer com.SysFreeString(bstr);
+    self.state_lock.lockShared();
+    const bstr = self.propertyBstr(self.name);
+    self.state_lock.unlockShared();
+    const value = bstr orelse return;
+    defer com.SysFreeString(value);
     _ = com.UiaRaiseAutomationPropertyChangedEvent(
         &self.base,
         30005,
         com.VARIANT.empty(),
-        com.VARIANT.fromBstr(bstr),
+        com.VARIANT.fromBstr(value),
     );
 }
 
@@ -1618,8 +1659,12 @@ test "provider owns independent names and text snapshots" {
     });
     defer _ = SurfaceProvider.Release(&second.base);
 
-    try std.testing.expectEqualStrings("one", first.textUtf8());
-    try std.testing.expectEqualStrings("two", second.textUtf8());
+    const first_text = try first.textUtf8(std.testing.allocator);
+    defer std.testing.allocator.free(first_text);
+    const second_text = try second.textUtf8(std.testing.allocator);
+    defer std.testing.allocator.free(second_text);
+    try std.testing.expectEqualStrings("one", first_text);
+    try std.testing.expectEqualStrings("two", second_text);
     first.detach();
     try std.testing.expect(!first.available());
     try std.testing.expect(second.available());
@@ -2004,6 +2049,57 @@ test "bounding rectangles use display-cell columns for Unicode text" {
     try std.testing.expectEqual(@as(f64, 110), wide_left);
     try std.testing.expectEqual(@as(f64, 30), wide_width);
     _ = com.SafeArrayDestroy(wide_rectangles);
+
+    var combining_start = try SurfaceTextRangeProvider.create(
+        std.testing.allocator,
+        provider,
+        .{ .start = 1, .end = 3 },
+    );
+    defer _ = SurfaceTextRangeProvider.Release(&combining_start.base);
+    var combining_start_rectangles: ?*com.SAFEARRAY = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        SurfaceTextRangeProvider.GetBoundingRectangles(&combining_start.base, &combining_start_rectangles),
+    );
+    var combining_start_width: f64 = 0;
+    var combining_start_width_index: i32 = 2;
+    try std.testing.expectEqual(
+        com.S_OK,
+        com.SafeArrayGetElement(
+            combining_start_rectangles.?,
+            &combining_start_width_index,
+            &combining_start_width,
+        ),
+    );
+    try std.testing.expectEqual(@as(f64, 20), combining_start_width);
+    _ = com.SafeArrayDestroy(combining_start_rectangles);
+}
+
+test "display-cell geometry covers wide Unicode outside the BMP" {
+    var provider = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(1), .{
+        .text = "\u{1b000}x",
+        .metrics = .{ .cell_width = 10, .cell_height = 20 },
+    });
+    defer _ = SurfaceProvider.Release(&provider.base);
+    var range = try SurfaceTextRangeProvider.create(
+        std.testing.allocator,
+        provider,
+        .{ .start = 0, .end = 3 },
+    );
+    defer _ = SurfaceTextRangeProvider.Release(&range.base);
+    var rectangles: ?*com.SAFEARRAY = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        SurfaceTextRangeProvider.GetBoundingRectangles(&range.base, &rectangles),
+    );
+    var width: f64 = 0;
+    var index: i32 = 2;
+    try std.testing.expectEqual(
+        com.S_OK,
+        com.SafeArrayGetElement(rectangles.?, &index, &width),
+    );
+    try std.testing.expectEqual(@as(f64, 30), width);
+    _ = com.SafeArrayDestroy(rectangles);
 }
 
 test "RangeFromPoint uses display-cell positions for combining and wide text" {
@@ -2030,6 +2126,115 @@ test "RangeFromPoint uses display-cell positions for combining and wide text" {
     const wide_value = SurfaceTextRangeProvider.fromBase(range.?);
     try std.testing.expectEqual(Range{ .start = 3, .end = 3 }, wide_value.range);
     _ = SurfaceTextRangeProvider.Release(range.?);
+}
+
+const ProviderStress = struct {
+    provider: *SurfaceProvider,
+    stop: *std.atomic.Value(bool),
+};
+
+const CallbackStress = struct {
+    callbacks: std.atomic.Value(usize),
+    detached: std.atomic.Value(bool),
+    after_detach: std.atomic.Value(usize),
+};
+
+fn stressSelectionCallback(ctx: *anyopaque, _: usize, _: usize) void {
+    const state: *CallbackStress = @ptrCast(@alignCast(ctx));
+    _ = state.callbacks.fetchAdd(1, .monotonic);
+    if (state.detached.load(.acquire)) {
+        _ = state.after_detach.fetchAdd(1, .monotonic);
+    }
+}
+
+fn stressQueryProvider(stress: *ProviderStress) void {
+    for (0..2000) |_| {
+        if (stress.stop.load(.acquire)) break;
+        var value = com.VARIANT.empty();
+        const property_hr = SurfaceProvider.GetPropertyValue(
+            &stress.provider.base,
+            30005,
+            &value,
+        );
+        if (property_hr == com.S_OK) _ = com.VariantClear(&value);
+
+        var range: ?*com.ITextRangeProvider = null;
+        _ = SurfaceProvider.TextGetDocumentRange(&stress.provider.text_iface, &range);
+        if (range) |item| _ = SurfaceTextRangeProvider.Release(item);
+        std.Thread.yield() catch {};
+    }
+}
+
+fn stressUpdateProvider(stress: *ProviderStress) void {
+    for (0..1000) |index| {
+        if (stress.stop.load(.acquire)) break;
+        stress.provider.updateText(
+            if (index % 2 == 0) "e\u{0301}界x" else "replacement",
+            .{ .start = 0, .end = 1 },
+            .{ .start = 0, .end = 0 },
+            0,
+        ) catch break;
+        stress.provider.updateName(if (index % 2 == 0) "one" else "two") catch break;
+        stress.provider.updateSelection(.{ .start = 0, .end = 0 }, 0);
+        std.Thread.yield() catch {};
+    }
+}
+
+fn stressDetachProvider(stress: *ProviderStress) void {
+    for (0..32) |_| std.Thread.yield() catch {};
+    stress.provider.detach();
+    stress.stop.store(true, .release);
+}
+
+test "provider synchronizes concurrent queries updates and detach" {
+    var provider = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(1), .{
+        .text = "initial",
+        .name = "initial",
+        .screen_origin_query = testScreenOriginQuery,
+    });
+    defer _ = SurfaceProvider.Release(&provider.base);
+    var stop = std.atomic.Value(bool).init(false);
+    var stress = ProviderStress{
+        .provider = provider,
+        .stop = &stop,
+    };
+    const query_thread = try std.Thread.spawn(.{}, stressQueryProvider, .{&stress});
+    const update_thread = try std.Thread.spawn(.{}, stressUpdateProvider, .{&stress});
+    const detach_thread = try std.Thread.spawn(.{}, stressDetachProvider, .{&stress});
+    query_thread.join();
+    update_thread.join();
+    detach_thread.join();
+    try std.testing.expect(!provider.available());
+}
+
+test "selection callbacks are detached without post-teardown calls" {
+    var callback_state = CallbackStress{
+        .callbacks = std.atomic.Value(usize).init(0),
+        .detached = std.atomic.Value(bool).init(false),
+        .after_detach = std.atomic.Value(usize).init(0),
+    };
+    var provider = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(1), .{
+        .text = "initial",
+        .callback_ctx = &callback_state,
+        .on_selection = stressSelectionCallback,
+    });
+    defer _ = SurfaceProvider.Release(&provider.base);
+
+    try std.testing.expectEqual(com.S_OK, provider.setSelectedRange(.{ .start = 0, .end = 0 }));
+    const update_thread = try std.Thread.spawn(.{}, struct {
+        fn run(value: *SurfaceProvider) void {
+            for (0..2000) |index| {
+                _ = value.setSelectedRange(.{ .start = index % 4, .end = index % 4 });
+            }
+        }
+    }.run, .{provider});
+    for (0..32) |_| std.Thread.yield() catch {};
+    provider.detach();
+    callback_state.detached.store(true, .release);
+    update_thread.join();
+
+    try std.testing.expect(callback_state.callbacks.load(.acquire) > 0);
+    try std.testing.expectEqual(@as(usize, 0), callback_state.after_detach.load(.acquire));
 }
 
 test "caret ranges expose empty bounding rectangles" {

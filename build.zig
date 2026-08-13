@@ -47,13 +47,21 @@ pub fn build(b: *std.Build) !void {
         "Build the embeddable Win32 host API.",
     ) orelse false;
     if (emit_win32_host) {
+        const host_module = b.createModule(.{
+            .root_source_file = b.path("src/win32_host.zig"),
+            .target = config.target,
+            .optimize = config.optimize,
+        });
+        if (b.lazyDependency("uucode", .{
+            .target = config.target,
+            .optimize = config.optimize,
+            .build_config_path = b.path("src/build/uucode_config.zig"),
+        })) |dep| {
+            host_module.addImport("uucode", dep.module("uucode"));
+        }
         const host_lib = b.addLibrary(.{
             .name = "winghostty-win32-host",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/win32_host.zig"),
-                .target = config.target,
-                .optimize = config.optimize,
-            }),
+            .root_module = host_module,
             .linkage = .static,
         });
         host_lib.linkLibC();

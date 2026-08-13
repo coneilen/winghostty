@@ -90,10 +90,13 @@ ranges, caret, selection, and update notifications. UIA state is detached
 before a surface is destroyed, so retained providers return
 `UIA_E_ELEMENTNOTAVAILABLE` and never call back into the embedding application
 after teardown.
+Retained UIA providers synchronize concurrent queries, updates, selection
+callbacks, and teardown; provider options advertise COM-threaded access.
 Each child tracks its screen-space origin for `RangeFromPoint` and bounding
 rectangles and refreshes it after moves, DPI changes, and bounds updates.
 Text geometry uses Unicode display-cell columns (including combining and
-wide characters), not UTF-8 byte offsets.
+wide characters), not UTF-8 byte offsets; production widths come from
+Ghostty's generated `uucode` data.
 Changing the role raises `ControlType` and `LocalizedControlType` property
 changes.
 
