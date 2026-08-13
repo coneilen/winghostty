@@ -213,10 +213,6 @@ void winghostty_win32_host_compile_contract(void) {
     options.callbacks.on_redraw = on_redraw;
     options.callbacks.on_focus = on_focus;
     options.callbacks.on_fatal_error = on_fatal_error;
-    options.callbacks.on_dpi_changed = on_dpi_changed;
-    options.callbacks.on_metrics_changed = on_metrics_changed;
-    options.callbacks.on_accessibility_selection = on_accessibility_selection;
-    winghostty_surface_options_v2 options_v2;
     winghostty_surface_options_v2_init(&options_v2);
     options_v2.command = options.command;
     options_v2.cwd = options.cwd;
