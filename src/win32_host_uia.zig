@@ -64,9 +64,15 @@ pub const Config = struct {
     on_selection: ?SelectionCallback = null,
 };
 
-fn boundingRectangle(metrics: Metrics, line_index: usize, line_width: usize) com.UiaRect {
+fn boundingRectangle(
+    metrics: Metrics,
+    line_index: usize,
+    line_column: usize,
+    line_width: usize,
+) com.UiaRect {
     return .{
-        .left = metrics.origin_x,
+        .left = metrics.origin_x +
+            metrics.cell_width * @as(f64, @floatFromInt(line_column)),
         .top = metrics.origin_y +
             metrics.cell_height * @as(f64, @floatFromInt(line_index)),
         .width = metrics.cell_width *
@@ -81,6 +87,12 @@ fn lineIndexAtByte(snapshot: *const Snapshot, byte_index: usize) usize {
         if (byte == '\n') row += 1;
     }
     return row;
+}
+
+fn lineStartAtByte(snapshot: *const Snapshot, byte_index: usize) usize {
+    var start = @min(byte_index, snapshot.text.len);
+    while (start > 0 and snapshot.text[start - 1] != '\n') start -= 1;
+    return start;
 }
 
 const Snapshot = struct {
@@ -1053,6 +1065,7 @@ const SurfaceTextRangeProvider = struct {
         out.* = com.SafeArrayCreateVector(com.VT_R8, 0, @intCast(line_count * 4));
         if (out.* == null) return com.E_OUTOFMEMORY;
         var line_start = bytes.start;
+        const first_column = bytes.start - lineStartAtByte(&self.snapshot, bytes.start);
         var line_index: usize = 0;
         while (line_index < line_count) : (line_index += 1) {
             var line_end = line_start;
@@ -1064,6 +1077,7 @@ const SurfaceTextRangeProvider = struct {
             const rectangle = boundingRectangle(
                 self.snapshot.metrics,
                 document_row + line_index,
+                if (line_index == 0) first_column else 0,
                 line_width,
             );
             const values = [_]f64{
@@ -1361,8 +1375,8 @@ test "range geometry tracks independent screen-space origins" {
     try std.testing.expectEqual(Range{ .start = 0, .end = 0 }, second_value.range);
     _ = SurfaceTextRangeProvider.Release(second_range.?);
 
-    const first_rect = boundingRectangle(first.snapshot.metrics, 0, 2);
-    const second_rect = boundingRectangle(second.snapshot.metrics, 0, 2);
+    const first_rect = boundingRectangle(first.snapshot.metrics, 0, 0, 2);
+    const second_rect = boundingRectangle(second.snapshot.metrics, 0, 0, 2);
     try std.testing.expectEqual(@as(f64, 100), first_rect.left);
     try std.testing.expectEqual(@as(f64, 500), second_rect.left);
     try std.testing.expectEqual(@as(f64, 200), first_rect.top);
@@ -1483,6 +1497,112 @@ test "bounding rectangles use document rows and empty degenerate ranges" {
         com.SafeArrayGetUBound(empty.?, 0, &upper),
     );
     _ = com.SafeArrayDestroy(empty);
+}
+
+test "bounding rectangles use the selected column and exact line widths" {
+    var provider = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(1), .{
+        .text = "abcdef\nuvwxyz",
+        .metrics = .{
+            .cell_width = 10,
+            .cell_height = 20,
+            .origin_x = 50,
+            .origin_y = 100,
+        },
+    });
+    defer _ = SurfaceProvider.Release(&provider.base);
+
+    var mid_line = try SurfaceTextRangeProvider.create(
+        std.testing.allocator,
+        provider,
+        .{ .start = 2, .end = 4 },
+    );
+    defer _ = SurfaceTextRangeProvider.Release(&mid_line.base);
+    var mid_line_rectangles: ?*com.SAFEARRAY = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        SurfaceTextRangeProvider.GetBoundingRectangles(&mid_line.base, &mid_line_rectangles),
+    );
+    var mid_line_left: f64 = 0;
+    var mid_line_width: f64 = 0;
+    var left_index: i32 = 0;
+    var width_index: i32 = 2;
+    try std.testing.expectEqual(
+        com.S_OK,
+        com.SafeArrayGetElement(mid_line_rectangles.?, &left_index, &mid_line_left),
+    );
+    try std.testing.expectEqual(
+        com.S_OK,
+        com.SafeArrayGetElement(mid_line_rectangles.?, &width_index, &mid_line_width),
+    );
+    try std.testing.expectEqual(@as(f64, 70), mid_line_left);
+    try std.testing.expectEqual(@as(f64, 20), mid_line_width);
+    _ = com.SafeArrayDestroy(mid_line_rectangles);
+
+    var multi_line = try SurfaceTextRangeProvider.create(
+        std.testing.allocator,
+        provider,
+        .{ .start = 2, .end = 10 },
+    );
+    defer _ = SurfaceTextRangeProvider.Release(&multi_line.base);
+    var multi_line_rectangles: ?*com.SAFEARRAY = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        SurfaceTextRangeProvider.GetBoundingRectangles(&multi_line.base, &multi_line_rectangles),
+    );
+    var first_left: f64 = 0;
+    var first_width: f64 = 0;
+    var second_left: f64 = 0;
+    var second_width: f64 = 0;
+    var first_left_index: i32 = 0;
+    var first_width_index: i32 = 2;
+    var second_left_index: i32 = 4;
+    var second_width_index: i32 = 6;
+    try std.testing.expectEqual(
+        com.S_OK,
+        com.SafeArrayGetElement(multi_line_rectangles.?, &first_left_index, &first_left),
+    );
+    try std.testing.expectEqual(
+        com.S_OK,
+        com.SafeArrayGetElement(multi_line_rectangles.?, &first_width_index, &first_width),
+    );
+    try std.testing.expectEqual(
+        com.S_OK,
+        com.SafeArrayGetElement(multi_line_rectangles.?, &second_left_index, &second_left),
+    );
+    try std.testing.expectEqual(
+        com.S_OK,
+        com.SafeArrayGetElement(multi_line_rectangles.?, &second_width_index, &second_width),
+    );
+    try std.testing.expectEqual(@as(f64, 70), first_left);
+    try std.testing.expectEqual(@as(f64, 40), first_width);
+    try std.testing.expectEqual(@as(f64, 50), second_left);
+    try std.testing.expectEqual(@as(f64, 30), second_width);
+    _ = com.SafeArrayDestroy(multi_line_rectangles);
+}
+
+test "caret ranges expose empty bounding rectangles" {
+    var provider = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(1), .{
+        .text = "abcdef",
+        .caret = 3,
+    });
+    defer _ = SurfaceProvider.Release(&provider.base);
+
+    var active: com.BOOL = 0;
+    var caret_range: ?*com.ITextRangeProvider = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        SurfaceProvider.Text2GetCaretRange(&provider.text2_iface, &active, &caret_range),
+    );
+    const value = SurfaceTextRangeProvider.fromBase(caret_range.?);
+    try std.testing.expectEqual(Range{ .start = 3, .end = 3 }, value.range);
+    var rectangles: ?*com.SAFEARRAY = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        SurfaceTextRangeProvider.GetBoundingRectangles(&value.base, &rectangles),
+    );
+    try std.testing.expectEqual(@as(u32, 1), com.SafeArrayGetDim(rectangles.?));
+    _ = com.SafeArrayDestroy(rectangles);
+    _ = SurfaceTextRangeProvider.Release(caret_range.?);
 }
 
 test "range creation cleans up allocation failure after provider allocation" {
