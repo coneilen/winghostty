@@ -32,7 +32,9 @@ try {
     )
     Invoke-DevWindows @(
         "zig", "cc", "-target", "x86_64-windows-msvc",
-        $object, $library, "-luser32", "-lkernel32", "-limm32",
+        $object, $library, "-luser32", "-lgdi32", "-lopengl32", "-lkernel32",
+        "-limm32",
+        "-loleaut32", "-lole32", "-luiautomationcore",
         "-o", $executable
     )
     & $executable

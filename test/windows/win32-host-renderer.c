@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <objbase.h>
 #include <windows.h>
 
 typedef struct test_state {
@@ -1048,6 +1049,9 @@ static int run_teardown_admission_contract(HWND parent, int destroy_surface) {
 }
 
 int main(void) {
+    if (FAILED(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED))) {
+        return fail("COM initialization failed");
+    }
     test_state state = {
         .ui_thread = GetCurrentThreadId(),
     };
@@ -1143,6 +1147,7 @@ int main(void) {
     }
 
     DestroyWindow(state.parent);
+    CoUninitialize();
     printf("Win32 host renderer contract passed: child HWND/HDC/HGLRC, affinity, presentation, stable handles, teardown, 100 cycles.\n");
     return 0;
 }

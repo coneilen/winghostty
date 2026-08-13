@@ -1,4 +1,6 @@
 #include "../../include/winghostty/win32_host.h"
+
+#include <objbase.h>
 #include <string.h>
 
 #define WM_HOST_API_TRIGGER (WM_APP + 1)
@@ -54,7 +56,11 @@ static LRESULT CALLBACK parent_window_proc(
             break;
         case WM_HOST_API_TRIGGER:
             if (context && context->surface) {
-                InvalidateRect(winghostty_surface_get_hwnd(context->surface), NULL, FALSE);
+                HWND child = winghostty_surface_get_hwnd(context->surface);
+                if (child) {
+                    InvalidateRect(child, NULL, FALSE);
+                    UpdateWindow(child);
+                }
             }
             return 0;
         case WM_HOST_API_DONE:
@@ -154,6 +160,7 @@ static int fail(void) {
 }
 
 int main(void) {
+    if (FAILED(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED))) return fail();
     const wchar_t class_name[] = L"WinghosttyHostApiSmoke";
     WNDCLASSW parent_class = {
         .style = 0,
@@ -301,10 +308,12 @@ int main(void) {
         return fail();
     }
     winghostty_cell_metrics callback_metrics = {8, 16, 8, 16, 13};
-    if (winghostty_surface_set_cell_metrics(
+    const winghostty_result metrics_result =
+        winghostty_surface_set_cell_metrics(
             metrics_deinit_surface,
             &callback_metrics
-        ) != WINGHOSTTY_OK ||
+        );
+    if (metrics_result != WINGHOSTTY_OK ||
         !context.reentrant_called ||
         context.reentrant_result != WINGHOSTTY_OK) {
         DestroyWindow(context.parent);
@@ -562,6 +571,7 @@ int main(void) {
         return fail();
     }
 
+    CoUninitialize();
     UnregisterClassW(class_name, parent_class.hInstance);
     return 0;
 }

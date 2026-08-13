@@ -8174,7 +8174,7 @@ Assert-WorkflowContract `
     -Description 'Win32 host API owns explicit initialize/create/destroy lifecycle exports'
 Assert-WorkflowContract `
     -Path (Join-Path $repoRoot 'src\win32_host.zig') `
-    -Pattern '(?s)state\.creation_depth \+= 1;\s+surface\.creation_in_progress = true;\s+const hwnd = CreateWindowExW.*?if \(state\.shutting_down\)' `
+    -Pattern '(?s)state\.creation_depth \+= 1;\s+surface\.creation_in_progress = true;\s+const hwnd = CreateWindowExW.*?if \(state\.shutting_down(?:\.load\(\.acquire\))?\)' `
     -Description 'Win32 host API guards child creation before synchronous parent reentrancy'
 Assert-WorkflowContract `
     -Path (Join-Path $repoRoot 'test\windows\win32-host-api-smoke.c') `
