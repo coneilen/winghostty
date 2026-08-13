@@ -266,16 +266,6 @@ fn surfaceHandle(surface: *SurfaceState) *Surface {
     return @ptrCast(surface);
 }
 
-fn hostState(host: ?*Host) ?*HostState {
-    const handle = host orelse return null;
-    return @ptrCast(@alignCast(handle));
-}
-
-fn surfaceState(surface: ?*Surface) ?*SurfaceState {
-    const handle = surface orelse return null;
-    return @ptrCast(@alignCast(handle));
-}
-
 const HostAdmission = struct {
     state: *HostState,
     released: bool = false,
@@ -287,6 +277,40 @@ const SurfaceAdmission = struct {
     clear: bool = false,
     released: bool = false,
 };
+
+fn unavailableHostResult(handle: ?*Host) Result {
+    const pointer = handle orelse return result_invalid_argument;
+    admission_registry_mutex.lock();
+    defer admission_registry_mutex.unlock();
+    const state = host_registry.get(@intFromPtr(pointer)) orelse
+        return result_invalid_argument;
+    state.admission.mutex.lock();
+    const accepting = state.admission.accepting;
+    state.admission.mutex.unlock();
+    return if (accepting) result_invalid_argument else result_shutting_down;
+}
+
+fn unavailableSurfaceResult(handle: ?*Surface) Result {
+    const pointer = handle orelse return result_invalid_argument;
+    admission_registry_mutex.lock();
+    defer admission_registry_mutex.unlock();
+    const surface = surface_registry.get(@intFromPtr(pointer)) orelse
+        return result_invalid_argument;
+    surface.admission.mutex.lock();
+    const accepting = surface.admission.accepting;
+    const clearable = surface.admission.clearable;
+    surface.admission.mutex.unlock();
+
+    const host = surface.host;
+    const host_shutting_down = host.shutting_down.load(.acquire);
+    if (!accepting or !clearable or host_shutting_down) {
+        return if (host_shutting_down)
+            result_shutting_down
+        else
+            result_surface_invalidated;
+    }
+    return result_invalid_argument;
+}
 
 fn registerHost(state: *HostState) !void {
     admission_registry_mutex.lock();
@@ -573,7 +597,8 @@ fn endRendererOperation(surface: *SurfaceState) void {
 fn rendererHdc(surface: *SurfaceState) HDC {
     surface.renderer_mutex.lock();
     defer surface.renderer_mutex.unlock();
-    if (surface.invalidated.load(.acquire) or
+    if (surface.host.shutting_down.load(.acquire) or
+        surface.invalidated.load(.acquire) or
         surface.destroying.load(.acquire) or
         surface.renderer_destroying)
     {
@@ -585,7 +610,8 @@ fn rendererHdc(surface: *SurfaceState) HDC {
 fn rendererHglrc(surface: *SurfaceState) HGLRC {
     surface.renderer_mutex.lock();
     defer surface.renderer_mutex.unlock();
-    if (surface.invalidated.load(.acquire) or
+    if (surface.host.shutting_down.load(.acquire) or
+        surface.invalidated.load(.acquire) or
         surface.destroying.load(.acquire) or
         surface.renderer_destroying)
     {
@@ -748,13 +774,15 @@ fn finishUnregisteredSurfaceCreation(
     surface: *SurfaceState,
     hwnd: ?HWND,
     result: Result,
+    host_admission: *HostAdmission,
 ) Result {
     surface.creation_in_progress = false;
     cleanupUnregisteredSurface(surface, hwnd);
     state.creation_depth -= 1;
     const deinitialize_requested = state.deinitialize_requested;
     if (deinitialize_requested and state.creation_depth == 0) {
-        deinitializeHost(state, 0);
+        deinitializeHost(state, 1);
+        releaseHostAdmission(host_admission);
         allocator.destroy(state);
     }
     return if (deinitialize_requested) result_shutting_down else result;
@@ -816,7 +844,8 @@ pub export fn winghostty_host_initialize(out_host: ?*?*Host) Result {
 }
 
 pub export fn winghostty_host_deinitialize(host: ?*Host) Result {
-    var admission = admitHost(host) orelse return result_invalid_argument;
+    var admission = admitHost(host) orelse
+        return unavailableHostResult(host);
     const state = admission.state;
     const result = checkHost(state);
     if (result != result_ok) {
@@ -844,9 +873,12 @@ pub export fn winghostty_host_create_surface(
 ) Result {
     const output = out_surface orelse return result_invalid_argument;
     output.* = null;
-    const state = hostState(host) orelse return result_invalid_argument;
     const parent_hwnd = parent orelse return result_invalid_argument;
     const source = options orelse return result_invalid_argument;
+    var host_admission = admitHost(host) orelse
+        return unavailableHostResult(host);
+    defer releaseHostAdmission(&host_admission);
+    const state = host_admission.state;
     const thread_result = checkHost(state);
     if (thread_result != result_ok) return thread_result;
     if (source.font_scale <= 0 or !std.math.isFinite(source.font_scale)) {
@@ -898,6 +930,7 @@ pub export fn winghostty_host_create_surface(
             surface,
             null,
             result_win32_error,
+            &host_admission,
         );
     };
     surface.hwnd = hwnd;
@@ -908,6 +941,7 @@ pub export fn winghostty_host_create_surface(
             surface,
             hwnd,
             result_shutting_down,
+            &host_admission,
         );
     }
 
@@ -917,6 +951,7 @@ pub export fn winghostty_host_create_surface(
             surface,
             hwnd,
             result_out_of_memory,
+            &host_admission,
         );
     };
     renderer.* = win32_context.Context.init(hwnd) catch |err| {
@@ -934,6 +969,7 @@ pub export fn winghostty_host_create_surface(
                 error.CreateContextFailed => result_context_error,
                 else => result_renderer_error,
             },
+            &host_admission,
         );
     };
     surface.renderer = renderer;
@@ -944,6 +980,7 @@ pub export fn winghostty_host_create_surface(
             surface,
             hwnd,
             result_out_of_memory,
+            &host_admission,
         );
     };
 
@@ -967,7 +1004,8 @@ pub export fn winghostty_host_create_surface(
         allocator.destroy(surface);
         const deinitialize_requested = state.deinitialize_requested;
         if (deinitialize_requested and state.creation_depth == 0) {
-            deinitializeHost(state, 0);
+            deinitializeHost(state, 1);
+            releaseHostAdmission(&host_admission);
             allocator.destroy(state);
         }
         return if (was_invalidated and !was_shutting_down)
@@ -981,7 +1019,8 @@ pub export fn winghostty_host_create_surface(
 }
 
 pub export fn winghostty_surface_destroy(surface: ?*Surface) Result {
-    var admission = admitSurface(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
     const state = admission.surface;
     const result = checkHost(state.host);
     if (result != result_ok) {
@@ -1008,17 +1047,27 @@ pub export fn winghostty_surface_set_bounds(
     surface: ?*Surface,
     bounds: ?*const Rect,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
     const next = bounds orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    const state = admission.surface;
     const result = checkSurface(state);
-    if (result != result_ok) return result;
+    if (result != result_ok) {
+        releaseSurfaceAdmission(&admission);
+        return result;
+    }
     if (next.width > std.math.maxInt(i32) or next.height > std.math.maxInt(i32)) {
+        releaseSurfaceAdmission(&admission);
         return result_invalid_argument;
     }
     state.options_mutex.lock();
     state.options.bounds = next.*;
     state.options_mutex.unlock();
-    const hwnd = state.hwnd orelse return result_shutting_down;
+    const hwnd = state.hwnd orelse {
+        releaseSurfaceAdmission(&admission);
+        return result_shutting_down;
+    };
+    releaseSurfaceAdmission(&admission);
     if (SetWindowPos(
         hwnd,
         null,
@@ -1035,12 +1084,24 @@ pub export fn winghostty_surface_set_visible(
     surface: ?*Surface,
     visible: u8,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    const state = admission.surface;
     const result = checkSurface(state);
-    if (result != result_ok) return result;
-    state.options.visible = if (visible == 0) 0 else 1;
-    const hwnd = state.hwnd orelse return result_shutting_down;
-    _ = ShowWindow(hwnd, if (state.options.visible != 0) SW_SHOW else SW_HIDE);
+    if (result != result_ok) {
+        releaseSurfaceAdmission(&admission);
+        return result;
+    }
+    const next_visible: u8 = if (visible == 0) 0 else 1;
+    state.options_mutex.lock();
+    state.options.visible = next_visible;
+    state.options_mutex.unlock();
+    const hwnd = state.hwnd orelse {
+        releaseSurfaceAdmission(&admission);
+        return result_shutting_down;
+    };
+    releaseSurfaceAdmission(&admission);
+    _ = ShowWindow(hwnd, if (next_visible != 0) SW_SHOW else SW_HIDE);
     return result_ok;
 }
 
@@ -1048,11 +1109,23 @@ pub export fn winghostty_surface_set_focus(
     surface: ?*Surface,
     focused: u8,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    const state = admission.surface;
     const result = checkSurface(state);
-    if (result != result_ok) return result;
-    state.options.focus = if (focused == 0) 0 else 1;
-    const hwnd = state.hwnd orelse return result_shutting_down;
+    if (result != result_ok) {
+        releaseSurfaceAdmission(&admission);
+        return result;
+    }
+    const next_focused: u8 = if (focused == 0) 0 else 1;
+    state.options_mutex.lock();
+    state.options.focus = next_focused;
+    state.options_mutex.unlock();
+    const hwnd = state.hwnd orelse {
+        releaseSurfaceAdmission(&admission);
+        return result_shutting_down;
+    };
+    releaseSurfaceAdmission(&admission);
     if (focused != 0) {
         _ = SetFocus(hwnd);
     } else if (GetFocus()) |current| {
@@ -1065,14 +1138,24 @@ pub export fn winghostty_surface_set_theme(
     surface: ?*Surface,
     theme: Theme,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    const state = admission.surface;
     const result = checkSurface(state);
-    if (result != result_ok) return result;
-    if (theme < 0 or theme > 2) return result_invalid_argument;
+    if (result != result_ok) {
+        releaseSurfaceAdmission(&admission);
+        return result;
+    }
+    if (theme < 0 or theme > 2) {
+        releaseSurfaceAdmission(&admission);
+        return result_invalid_argument;
+    }
     state.options_mutex.lock();
     state.options.theme = theme;
     state.options_mutex.unlock();
-    if (state.hwnd) |hwnd| _ = InvalidateRect(hwnd, null, 0);
+    const hwnd = state.hwnd;
+    releaseSurfaceAdmission(&admission);
+    if (hwnd) |value| _ = InvalidateRect(value, null, 0);
     return result_ok;
 }
 
@@ -1080,21 +1163,30 @@ pub export fn winghostty_surface_set_font_scale(
     surface: ?*Surface,
     font_scale: f32,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    const state = admission.surface;
     const result = checkSurface(state);
-    if (result != result_ok) return result;
+    if (result != result_ok) {
+        releaseSurfaceAdmission(&admission);
+        return result;
+    }
     if (font_scale <= 0 or !std.math.isFinite(font_scale)) {
+        releaseSurfaceAdmission(&admission);
         return result_invalid_argument;
     }
     state.options_mutex.lock();
     state.options.font_scale = font_scale;
     state.options_mutex.unlock();
-    if (state.hwnd) |hwnd| _ = InvalidateRect(hwnd, null, 0);
+    const hwnd = state.hwnd;
+    releaseSurfaceAdmission(&admission);
+    if (hwnd) |value| _ = InvalidateRect(value, null, 0);
     return result_ok;
 }
 
 pub export fn winghostty_surface_make_current(surface: ?*Surface) Result {
-    var admission = admitSurface(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
     defer releaseSurfaceAdmission(&admission);
     const state = admission.surface;
     const result = checkRenderSurface(state);
@@ -1112,7 +1204,8 @@ pub export fn winghostty_surface_make_current(surface: ?*Surface) Result {
 }
 
 pub export fn winghostty_surface_clear_current(surface: ?*Surface) Result {
-    var admission = admitClearSurface(surface) orelse return result_invalid_argument;
+    var admission = admitClearSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
     defer releaseSurfaceAdmission(&admission);
     const state = admission.surface;
     state.host.render_thread_mutex.lock();
@@ -1129,7 +1222,8 @@ pub export fn winghostty_surface_clear_current(surface: ?*Surface) Result {
 }
 
 pub export fn winghostty_surface_render(surface: ?*Surface) Result {
-    var admission = admitSurface(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
     defer releaseSurfaceAdmission(&admission);
     const state = admission.surface;
     if (state.invalidated.load(.acquire) or
@@ -1163,7 +1257,8 @@ pub export fn winghostty_surface_render(surface: ?*Surface) Result {
 }
 
 pub export fn winghostty_surface_present(surface: ?*Surface) Result {
-    var admission = admitSurface(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
     defer releaseSurfaceAdmission(&admission);
     const state = admission.surface;
     if (state.invalidated.load(.acquire) or
@@ -1190,12 +1285,19 @@ pub export fn winghostty_surface_notify_exit(
     surface: ?*Surface,
     status: i32,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    const state = admission.surface;
     const result = checkSurface(state);
-    if (result != result_ok) return result;
-    if (state.options.callbacks.on_exit) |callback| {
-        callback(state.options.user_data, surfaceHandle(state), status);
+    if (result != result_ok) {
+        releaseSurfaceAdmission(&admission);
+        return result;
     }
+    const callback = state.options.callbacks.on_exit;
+    const user_data = state.options.user_data;
+    const handle = surfaceHandle(state);
+    releaseSurfaceAdmission(&admission);
+    if (callback) |value| value(user_data, handle, status);
     return result_ok;
 }
 
@@ -1203,13 +1305,20 @@ pub export fn winghostty_surface_notify_title(
     surface: ?*Surface,
     title: ?[*:0]const u8,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
     const value = title orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    const state = admission.surface;
     const result = checkSurface(state);
-    if (result != result_ok) return result;
-    if (state.options.callbacks.on_title) |callback| {
-        callback(state.options.user_data, surfaceHandle(state), value);
+    if (result != result_ok) {
+        releaseSurfaceAdmission(&admission);
+        return result;
     }
+    const callback = state.options.callbacks.on_title;
+    const user_data = state.options.user_data;
+    const handle = surfaceHandle(state);
+    releaseSurfaceAdmission(&admission);
+    if (callback) |callback_value| callback_value(user_data, handle, value);
     return result_ok;
 }
 
@@ -1217,23 +1326,37 @@ pub export fn winghostty_surface_notify_cwd(
     surface: ?*Surface,
     cwd: ?[*:0]const u8,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
     const value = cwd orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    const state = admission.surface;
     const result = checkSurface(state);
-    if (result != result_ok) return result;
-    if (state.options.callbacks.on_cwd) |callback| {
-        callback(state.options.user_data, surfaceHandle(state), value);
+    if (result != result_ok) {
+        releaseSurfaceAdmission(&admission);
+        return result;
     }
+    const callback = state.options.callbacks.on_cwd;
+    const user_data = state.options.user_data;
+    const handle = surfaceHandle(state);
+    releaseSurfaceAdmission(&admission);
+    if (callback) |callback_value| callback_value(user_data, handle, value);
     return result_ok;
 }
 
 pub export fn winghostty_surface_notify_bell(surface: ?*Surface) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    const state = admission.surface;
     const result = checkSurface(state);
-    if (result != result_ok) return result;
-    if (state.options.callbacks.on_bell) |callback| {
-        callback(state.options.user_data, surfaceHandle(state));
+    if (result != result_ok) {
+        releaseSurfaceAdmission(&admission);
+        return result;
     }
+    const callback = state.options.callbacks.on_bell;
+    const user_data = state.options.user_data;
+    const handle = surfaceHandle(state);
+    releaseSurfaceAdmission(&admission);
+    if (callback) |value| value(user_data, handle);
     return result_ok;
 }
 
@@ -1241,21 +1364,37 @@ pub export fn winghostty_surface_notify_notification(
     surface: ?*Surface,
     notification: ?[*:0]const u8,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
     const value = notification orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    const state = admission.surface;
     const result = checkSurface(state);
-    if (result != result_ok) return result;
-    if (state.options.callbacks.on_notification) |callback| {
-        callback(state.options.user_data, surfaceHandle(state), value);
+    if (result != result_ok) {
+        releaseSurfaceAdmission(&admission);
+        return result;
     }
+    const callback = state.options.callbacks.on_notification;
+    const user_data = state.options.user_data;
+    const handle = surfaceHandle(state);
+    releaseSurfaceAdmission(&admission);
+    if (callback) |callback_value| callback_value(user_data, handle, value);
     return result_ok;
 }
 
 pub export fn winghostty_surface_notify_redraw(surface: ?*Surface) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    const state = admission.surface;
     const result = checkSurface(state);
-    if (result != result_ok) return result;
-    notifyRedraw(state);
+    if (result != result_ok) {
+        releaseSurfaceAdmission(&admission);
+        return result;
+    }
+    const callback = state.options.callbacks.on_redraw;
+    const user_data = state.options.user_data;
+    const handle = surfaceHandle(state);
+    releaseSurfaceAdmission(&admission);
+    if (callback) |value| value(user_data, handle);
     return result_ok;
 }
 
@@ -1263,10 +1402,19 @@ pub export fn winghostty_surface_notify_focus(
     surface: ?*Surface,
     focused: u8,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    const state = admission.surface;
     const result = checkSurface(state);
-    if (result != result_ok) return result;
-    notifyFocus(state, focused != 0);
+    if (result != result_ok) {
+        releaseSurfaceAdmission(&admission);
+        return result;
+    }
+    const callback = state.options.callbacks.on_focus;
+    const user_data = state.options.user_data;
+    const handle = surfaceHandle(state);
+    releaseSurfaceAdmission(&admission);
+    if (callback) |value| value(user_data, handle, if (focused == 0) 0 else 1);
     return result_ok;
 }
 
@@ -1275,13 +1423,20 @@ pub export fn winghostty_surface_notify_fatal_error(
     result_code: Result,
     message: ?[*:0]const u8,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
     const value = message orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    const state = admission.surface;
     const result = checkSurface(state);
-    if (result != result_ok) return result;
-    if (state.options.callbacks.on_fatal_error) |callback| {
-        callback(state.options.user_data, surfaceHandle(state), result_code, value);
+    if (result != result_ok) {
+        releaseSurfaceAdmission(&admission);
+        return result;
     }
+    const callback = state.options.callbacks.on_fatal_error;
+    const user_data = state.options.user_data;
+    const handle = surfaceHandle(state);
+    releaseSurfaceAdmission(&admission);
+    if (callback) |callback_value| callback_value(user_data, handle, result_code, value);
     return result_ok;
 }
 
@@ -1312,12 +1467,18 @@ pub export fn winghostty_surface_get_hglrc(surface: ?*const Surface) HGLRC {
 }
 
 pub export fn winghostty_host_get_ui_thread_id(host: ?*const Host) DWORD {
-    const state = hostState(@constCast(host)) orelse return 0;
+    var admission = admitHost(@constCast(host)) orelse return 0;
+    defer releaseHostAdmission(&admission);
+    const state = admission.state;
+    if (state.shutting_down.load(.acquire)) return 0;
     return state.thread_id;
 }
 
 pub export fn winghostty_host_get_render_thread_id(host: ?*const Host) DWORD {
-    const state = hostState(@constCast(host)) orelse return 0;
+    var admission = admitHost(@constCast(host)) orelse return 0;
+    defer releaseHostAdmission(&admission);
+    const state = admission.state;
+    if (state.shutting_down.load(.acquire)) return 0;
     state.render_thread_mutex.lock();
     defer state.render_thread_mutex.unlock();
     return state.render_thread_id;
@@ -1329,6 +1490,12 @@ pub export fn winghostty_surface_get_last_error(
     var admission = admitSurface(@constCast(surface)) orelse return 0;
     defer releaseSurfaceAdmission(&admission);
     const state = admission.surface;
+    if (state.host.shutting_down.load(.acquire) or
+        state.invalidated.load(.acquire) or
+        state.destroying.load(.acquire))
+    {
+        return 0;
+    }
     return loadRendererError(state);
 }
 
@@ -1338,6 +1505,12 @@ pub export fn winghostty_surface_get_present_count(
     var admission = admitSurface(@constCast(surface)) orelse return 0;
     defer releaseSurfaceAdmission(&admission);
     const state = admission.surface;
+    if (state.host.shutting_down.load(.acquire) or
+        state.invalidated.load(.acquire) or
+        state.destroying.load(.acquire))
+    {
+        return 0;
+    }
     return state.present_count.load(.acquire);
 }
 
@@ -1345,7 +1518,10 @@ pub export fn winghostty_host_drain(
     host: ?*Host,
     out_drained: ?*u32,
 ) Result {
-    const state = hostState(host) orelse return result_invalid_argument;
+    var admission = admitHost(host) orelse
+        return unavailableHostResult(host);
+    defer releaseHostAdmission(&admission);
+    const state = admission.state;
     const result = checkHost(state);
     if (result != result_ok) return result;
     if (out_drained) |count| count.* = 0;

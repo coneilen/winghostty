@@ -32,9 +32,13 @@ typedef struct render_call {
 
 static int current_matches(winghostty_surface *surface);
 static int current_is_clear(void);
+static int check(int condition, const char *message);
 
 typedef struct teardown_stress {
+    winghostty_host *host;
     winghostty_surface *surface;
+    HWND parent;
+    winghostty_surface_options options;
     volatile LONG stop;
     volatile LONG entered;
     volatile LONG failures;
@@ -110,12 +114,160 @@ static int renderer_result_allowed(winghostty_result result) {
         result == WINGHOSTTY_PRESENT_ERROR;
 }
 
+static int public_result_allowed(winghostty_result result) {
+    return result >= WINGHOSTTY_OK && result <= WINGHOSTTY_PRESENT_ERROR;
+}
+
+static int invalid_state_result(winghostty_result result) {
+    return result == WINGHOSTTY_INVALID_ARGUMENT ||
+        result == WINGHOSTTY_SHUTTING_DOWN ||
+        result == WINGHOSTTY_SURFACE_INVALIDATED;
+}
+
+static int check_stale_surface(winghostty_surface *surface) {
+    winghostty_rect bounds = {0, 0, 80, 40};
+    char title[] = "stale";
+    char cwd[] = "C:\\";
+    char notification[] = "stale";
+    char fatal[] = "stale";
+    return check(
+        invalid_state_result(winghostty_surface_destroy(surface)) &&
+            invalid_state_result(winghostty_surface_set_bounds(surface, &bounds)) &&
+            invalid_state_result(winghostty_surface_set_visible(surface, 0)) &&
+            invalid_state_result(winghostty_surface_set_focus(surface, 0)) &&
+            invalid_state_result(winghostty_surface_set_theme(
+                surface,
+                WINGHOSTTY_THEME_SYSTEM
+            )) &&
+            invalid_state_result(winghostty_surface_set_font_scale(surface, 1.0f)) &&
+            invalid_state_result(winghostty_surface_make_current(surface)) &&
+            invalid_state_result(winghostty_surface_clear_current(surface)) &&
+            invalid_state_result(winghostty_surface_render(surface)) &&
+            invalid_state_result(winghostty_surface_present(surface)) &&
+            invalid_state_result(winghostty_surface_notify_exit(surface, 0)) &&
+            invalid_state_result(winghostty_surface_notify_title(surface, title)) &&
+            invalid_state_result(winghostty_surface_notify_cwd(surface, cwd)) &&
+            invalid_state_result(winghostty_surface_notify_bell(surface)) &&
+            invalid_state_result(winghostty_surface_notify_notification(
+                surface,
+                notification
+            )) &&
+            invalid_state_result(winghostty_surface_notify_redraw(surface)) &&
+            invalid_state_result(winghostty_surface_notify_focus(surface, 0)) &&
+            invalid_state_result(winghostty_surface_notify_fatal_error(
+                surface,
+                WINGHOSTTY_RENDERER_ERROR,
+                fatal
+            )),
+        "stale surface handle was not rejected"
+    );
+}
+
+static int check_stale_host(
+    winghostty_host *host,
+    HWND parent
+) {
+    winghostty_surface_options options;
+    winghostty_surface *surface = NULL;
+    winghostty_surface_options_init(&options);
+    return check(
+        winghostty_host_deinitialize(host) == WINGHOSTTY_INVALID_ARGUMENT &&
+            winghostty_host_create_surface(
+                host,
+                parent,
+                &options,
+                &surface
+            ) == WINGHOSTTY_INVALID_ARGUMENT &&
+            surface == NULL &&
+            winghostty_host_drain(host, NULL) == WINGHOSTTY_INVALID_ARGUMENT &&
+            winghostty_host_get_ui_thread_id(host) == 0 &&
+            winghostty_host_get_render_thread_id(host) == 0,
+        "stale host handle was not rejected"
+    );
+}
+
 static DWORD WINAPI teardown_stress_thread(void *parameter) {
     teardown_stress *stress = (teardown_stress *)parameter;
+    winghostty_rect bounds = {0, 0, 81, 41};
+    char title[] = "stress";
+    char cwd[] = "C:\\";
+    char notification[] = "stress";
+    char fatal[] = "stress";
     while (InterlockedCompareExchange(&stress->stop, 0, 0) == 0) {
         InterlockedIncrement(&stress->entered);
-        winghostty_result result =
-            winghostty_surface_make_current(stress->surface);
+        winghostty_surface *created = NULL;
+        winghostty_result result = winghostty_host_create_surface(
+            stress->host,
+            stress->parent,
+            &stress->options,
+            &created
+        );
+        if (!public_result_allowed(result) || created != NULL) {
+            InterlockedIncrement(&stress->failures);
+        }
+        result = winghostty_surface_set_bounds(stress->surface, &bounds);
+        if (!public_result_allowed(result)) {
+            InterlockedIncrement(&stress->failures);
+        }
+        result = winghostty_surface_set_visible(stress->surface, 0);
+        if (!public_result_allowed(result)) {
+            InterlockedIncrement(&stress->failures);
+        }
+        result = winghostty_surface_set_focus(stress->surface, 0);
+        if (!public_result_allowed(result)) {
+            InterlockedIncrement(&stress->failures);
+        }
+        result = winghostty_surface_set_theme(
+            stress->surface,
+            WINGHOSTTY_THEME_DARK
+        );
+        if (!public_result_allowed(result)) {
+            InterlockedIncrement(&stress->failures);
+        }
+        result = winghostty_surface_set_font_scale(stress->surface, 1.0f);
+        if (!public_result_allowed(result)) {
+            InterlockedIncrement(&stress->failures);
+        }
+        result = winghostty_surface_notify_exit(stress->surface, 0);
+        if (!public_result_allowed(result)) {
+            InterlockedIncrement(&stress->failures);
+        }
+        result = winghostty_surface_notify_title(stress->surface, title);
+        if (!public_result_allowed(result)) {
+            InterlockedIncrement(&stress->failures);
+        }
+        result = winghostty_surface_notify_cwd(stress->surface, cwd);
+        if (!public_result_allowed(result)) {
+            InterlockedIncrement(&stress->failures);
+        }
+        result = winghostty_surface_notify_bell(stress->surface);
+        if (!public_result_allowed(result)) {
+            InterlockedIncrement(&stress->failures);
+        }
+        result = winghostty_surface_notify_notification(
+            stress->surface,
+            notification
+        );
+        if (!public_result_allowed(result)) {
+            InterlockedIncrement(&stress->failures);
+        }
+        result = winghostty_surface_notify_redraw(stress->surface);
+        if (!public_result_allowed(result)) {
+            InterlockedIncrement(&stress->failures);
+        }
+        result = winghostty_surface_notify_focus(stress->surface, 0);
+        if (!public_result_allowed(result)) {
+            InterlockedIncrement(&stress->failures);
+        }
+        result = winghostty_surface_notify_fatal_error(
+            stress->surface,
+            WINGHOSTTY_RENDERER_ERROR,
+            fatal
+        );
+        if (!public_result_allowed(result)) {
+            InterlockedIncrement(&stress->failures);
+        }
+        result = winghostty_surface_make_current(stress->surface);
         if (!renderer_result_allowed(result)) {
             InterlockedIncrement(&stress->failures);
         }
@@ -129,6 +281,21 @@ static DWORD WINAPI teardown_stress_thread(void *parameter) {
         }
         result = winghostty_surface_clear_current(stress->surface);
         if (!renderer_result_allowed(result)) {
+            InterlockedIncrement(&stress->failures);
+        }
+        (void)winghostty_surface_get_hwnd(stress->surface);
+        (void)winghostty_surface_get_hdc(stress->surface);
+        (void)winghostty_surface_get_hglrc(stress->surface);
+        (void)winghostty_surface_get_last_error(stress->surface);
+        (void)winghostty_surface_get_present_count(stress->surface);
+        (void)winghostty_host_get_ui_thread_id(stress->host);
+        (void)winghostty_host_get_render_thread_id(stress->host);
+        result = winghostty_host_drain(stress->host, NULL);
+        if (!public_result_allowed(result)) {
+            InterlockedIncrement(&stress->failures);
+        }
+        result = winghostty_host_deinitialize(stress->host);
+        if (!public_result_allowed(result)) {
             InterlockedIncrement(&stress->failures);
         }
         Sleep(1);
@@ -445,7 +612,10 @@ static int run_teardown_admission_contract(HWND parent, int destroy_surface) {
         return fail("teardown-race surface creation failed");
     }
 
+    stress.host = host;
     stress.surface = surface;
+    stress.parent = parent;
+    stress.options = options;
     HANDLE thread = CreateThread(NULL, 0, teardown_stress_thread, &stress, 0, NULL);
     if (thread == NULL) {
         winghostty_surface_destroy(surface);
@@ -497,14 +667,17 @@ static int run_teardown_admission_contract(HWND parent, int destroy_surface) {
     }
 
     if (destroy_surface) {
+        if (check_stale_surface(surface) != 0) return 1;
         if (check(
                 winghostty_host_deinitialize(host) == WINGHOSTTY_OK,
                 "surface-race host teardown failed"
             )) {
             return 1;
         }
+    } else if (check_stale_surface(surface) != 0) {
+        return 1;
     }
-    return 0;
+    return check_stale_host(host, parent);
 }
 
 int main(void) {
