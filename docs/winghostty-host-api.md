@@ -29,6 +29,10 @@ independent of GraphCode product types.
 - Destroy is synchronous. It disables callbacks before destroying the child
   window, drains no caller messages, and frees copied options before
   returning; no callbacks occur after completion.
+- If `winghostty_host_deinitialize` is called reentrantly by the parent
+  `WM_PARENTNOTIFY` handler while `winghostty_surface_destroy` is delivering
+  child-window destruction, deinitialization is deferred until that destroy
+  unwinds; the outer admission then completes host teardown.
 - Every public API entry point that consumes a host or surface handle takes a
   registry-backed lifetime admission before touching its state. Teardown
   closes new admissions and waits for admitted calls and active operations

@@ -12,6 +12,9 @@ typedef struct test_state {
     LONG redraw_count;
     LONG focus_count;
     LONG callback_mismatch;
+    int deinit_on_child_destroy;
+    LONG parent_destroy_notifications;
+    winghostty_result parent_deinit_result;
 } test_state;
 
 typedef struct render_call {
@@ -50,8 +53,20 @@ static LRESULT CALLBACK parent_window_proc(
     WPARAM wparam,
     LPARAM lparam
 ) {
-    (void)wparam;
     (void)lparam;
+    test_state *state = (test_state *)(LONG_PTR)GetWindowLongPtrW(
+        hwnd,
+        GWLP_USERDATA
+    );
+    if (message == WM_PARENTNOTIFY &&
+        LOWORD(wparam) == WM_DESTROY &&
+        state != NULL) {
+        InterlockedIncrement(&state->parent_destroy_notifications);
+        if (state->deinit_on_child_destroy && state->host != NULL) {
+            state->parent_deinit_result =
+                winghostty_host_deinitialize(state->host);
+        }
+    }
     if (message == WM_NCDESTROY) {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
     }
@@ -650,6 +665,61 @@ static int run_handle_reuse_contract(HWND parent) {
     return 0;
 }
 
+static int run_reentrant_parent_deinitialize_contract(test_state *state) {
+    winghostty_host *host = NULL;
+    winghostty_surface *surface = NULL;
+    winghostty_surface_options options;
+    winghostty_surface_options_init(&options);
+    options.visible = 0;
+    options.bounds.width = 80;
+    options.bounds.height = 40;
+
+    if (winghostty_host_initialize(&host) != WINGHOSTTY_OK ||
+        winghostty_host_create_surface(
+            host,
+            state->parent,
+            &options,
+            &surface
+        ) != WINGHOSTTY_OK ||
+        surface == NULL) {
+        if (host != NULL) winghostty_host_deinitialize(host);
+        return fail("reentrant teardown setup failed");
+    }
+
+    state->host = host;
+    state->surface = surface;
+    state->deinit_on_child_destroy = 1;
+    state->parent_destroy_notifications = 0;
+    state->parent_deinit_result = WINGHOSTTY_INVALID_ARGUMENT;
+    HWND child = winghostty_surface_get_hwnd(surface);
+
+    if (check(
+            winghostty_surface_destroy(surface) == WINGHOSTTY_OK,
+            "parent-proc reentrant surface destroy failed"
+        ) ||
+        check(
+            state->parent_destroy_notifications > 0,
+            "parent proc did not observe child destruction"
+        ) ||
+        check(
+            state->parent_deinit_result == WINGHOSTTY_OK,
+            "parent-proc host deinitialize did not complete"
+        ) ||
+        check(!IsWindow(child), "reentrant child window survived teardown") ||
+        check_stale_surface(surface) != 0 ||
+        check_stale_host(host, state->parent) != 0) {
+        state->deinit_on_child_destroy = 0;
+        state->host = NULL;
+        state->surface = NULL;
+        return 1;
+    }
+
+    state->deinit_on_child_destroy = 0;
+    state->host = NULL;
+    state->surface = NULL;
+    return 0;
+}
+
 static int run_teardown_admission_contract(HWND parent, int destroy_surface) {
     winghostty_host *host = NULL;
     winghostty_surface *surface = NULL;
@@ -744,6 +814,11 @@ int main(void) {
     };
     state.parent = create_parent();
     if (!state.parent) return fail("parent window creation failed");
+    SetWindowLongPtrW(
+        state.parent,
+        GWLP_USERDATA,
+        (LONG_PTR)&state
+    );
     ShowWindow(state.parent, SW_SHOW);
     UpdateWindow(state.parent);
 
@@ -757,6 +832,10 @@ int main(void) {
         return 1;
     }
     if (run_handle_reuse_contract(state.parent) != 0) {
+        DestroyWindow(state.parent);
+        return 1;
+    }
+    if (run_reentrant_parent_deinitialize_contract(&state) != 0) {
         DestroyWindow(state.parent);
         return 1;
     }

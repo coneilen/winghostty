@@ -264,6 +264,7 @@ const HostState = struct {
     shutting_down: std.atomic.Value(bool) = .init(false),
     deinitialize_requested: bool = false,
     creation_depth: usize = 0,
+    destroy_surface_depth: usize = 0,
     render_thread_mutex: std.Thread.Mutex = .{},
     render_thread_id: DWORD = 0,
 };
@@ -856,6 +857,21 @@ fn deinitializeHost(
     unregisterHost(state);
 }
 
+fn finishDeferredHostDeinitialize(
+    state: *HostState,
+    remaining_host_admissions: usize,
+) bool {
+    if (!state.deinitialize_requested or
+        state.creation_depth != 0 or
+        state.destroy_surface_depth != 0)
+    {
+        return false;
+    }
+    state.deinitialize_requested = false;
+    deinitializeHost(state, remaining_host_admissions);
+    return true;
+}
+
 pub export fn winghostty_surface_options_init(options: *SurfaceOptions) void {
     options.* = .{
         .command = null,
@@ -919,7 +935,7 @@ pub export fn winghostty_host_deinitialize(host: ?*Host) Result {
     }
 
     state.shutting_down.store(true, .release);
-    if (state.creation_depth != 0) {
+    if (state.creation_depth != 0 or state.destroy_surface_depth != 0) {
         state.deinitialize_requested = true;
         releaseHostAdmission(&admission);
         return result_ok;
@@ -1114,9 +1130,14 @@ pub export fn winghostty_surface_destroy(surface: ?*Surface) Result {
         releaseSurfaceAdmission(&admission);
         return result_ok;
     }
+    const host = state.host;
+    host.destroy_surface_depth += 1;
     closeSurfaceAdmission(state);
     destroySurfaceNow(state, 1);
+    host.destroy_surface_depth -= 1;
+    const host_deinitialized = finishDeferredHostDeinitialize(host, 1);
     releaseSurfaceAdmission(&admission);
+    if (host_deinitialized) allocator.destroy(host);
     allocator.destroy(state);
     return result_ok;
 }

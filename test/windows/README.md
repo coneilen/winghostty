@@ -257,7 +257,9 @@ teardown, renderer-entry races against surface/host destruction, and 100
 create/destroy cycles with USER/GDI handle counts. The teardown stress also
 enters the public host, mutation, notification, renderer, and getter APIs
 while destruction is in progress, and verifies stale handles cannot affect
-replacement objects after allocator address reuse.
+replacement objects after allocator address reuse. It also has a parent
+`WM_PARENTNOTIFY` handler that calls host deinitialization during child
+destruction and verifies deferred teardown completes without a deadlock.
 
 ```powershell
 .\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\test\windows\run-win32-host-renderer.ps1
