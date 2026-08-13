@@ -23,6 +23,9 @@ typedef int32_t winghostty_result;
 #define WINGHOSTTY_RENDERER_ERROR ((winghostty_result)7)
 #define WINGHOSTTY_CONTEXT_ERROR ((winghostty_result)8)
 #define WINGHOSTTY_PRESENT_ERROR ((winghostty_result)9)
+#define WINGHOSTTY_PASTE_REQUIRES_CONFIRMATION ((winghostty_result)10)
+#define WINGHOSTTY_INVALID_UTF8 ((winghostty_result)11)
+#define WINGHOSTTY_CLIPBOARD_UNAVAILABLE ((winghostty_result)12)
 
 typedef int32_t winghostty_theme;
 
@@ -73,6 +76,142 @@ typedef struct winghostty_callbacks {
     );
 } winghostty_callbacks;
 
+typedef enum winghostty_key_action {
+    WINGHOSTTY_KEY_RELEASE = 0,
+    WINGHOSTTY_KEY_PRESS = 1,
+    WINGHOSTTY_KEY_REPEAT = 2
+} winghostty_key_action;
+
+typedef enum winghostty_mouse_kind {
+    WINGHOSTTY_MOUSE_MOVE = 0,
+    WINGHOSTTY_MOUSE_BUTTON_DOWN = 1,
+    WINGHOSTTY_MOUSE_BUTTON_UP = 2,
+    WINGHOSTTY_MOUSE_WHEEL = 3,
+    WINGHOSTTY_MOUSE_LEAVE = 4
+} winghostty_mouse_kind;
+
+typedef enum winghostty_clipboard_format {
+    WINGHOSTTY_CLIPBOARD_TEXT = 0,
+    WINGHOSTTY_CLIPBOARD_HTML = 1
+} winghostty_clipboard_format;
+
+typedef enum winghostty_paste_severity {
+    WINGHOSTTY_PASTE_SAFE = 0,
+    WINGHOSTTY_PASTE_CONTAINS_NEWLINE = 1,
+    WINGHOSTTY_PASTE_SHELL_METACHAR = 2,
+    WINGHOSTTY_PASTE_CONTROL_CHARS = 3,
+    WINGHOSTTY_PASTE_MIXED_CONTENT = 4
+} winghostty_paste_severity;
+
+typedef struct winghostty_key_event {
+    uint32_t action;
+    uint32_t virtual_key;
+    uint32_t scan_code;
+    uint32_t repeat_count;
+    uint32_t flags;
+    uint32_t modifiers;
+    uintptr_t keyboard_layout;
+    uint8_t composing;
+    uint8_t dead_key;
+    uint8_t reserved[6];
+    const char *keyboard_layout_name;
+} winghostty_key_event;
+
+typedef struct winghostty_mouse_event {
+    uint32_t kind;
+    uint32_t button;
+    uint32_t modifiers;
+    int32_t x;
+    int32_t y;
+    int32_t cell_x;
+    int32_t cell_y;
+    int32_t wheel_delta;
+    uint32_t click_count;
+} winghostty_mouse_event;
+
+typedef struct winghostty_selection_event {
+    uint8_t active;
+    uint8_t dragging;
+    uint8_t rectangular;
+    uint8_t reserved;
+    int32_t anchor_x;
+    int32_t anchor_y;
+    int32_t current_x;
+    int32_t current_y;
+} winghostty_selection_event;
+
+typedef struct winghostty_input_callbacks {
+    void (*on_key)(
+        void *user_data,
+        winghostty_surface *surface,
+        const winghostty_key_event *event
+    );
+    void (*on_text)(
+        void *user_data,
+        winghostty_surface *surface,
+        const char *text,
+        uint32_t length
+    );
+    void (*on_ime_start)(void *user_data, winghostty_surface *surface);
+    void (*on_ime_update)(
+        void *user_data,
+        winghostty_surface *surface,
+        const char *text,
+        uint32_t length,
+        uint8_t committed
+    );
+    void (*on_ime_end)(void *user_data, winghostty_surface *surface);
+    void (*on_mouse)(
+        void *user_data,
+        winghostty_surface *surface,
+        const winghostty_mouse_event *event
+    );
+    void (*on_selection)(
+        void *user_data,
+        winghostty_surface *surface,
+        const winghostty_selection_event *event
+    );
+    void (*on_link)(
+        void *user_data,
+        winghostty_surface *surface,
+        const char *url,
+        uint8_t hovered,
+        uint8_t clicked
+    );
+    void (*on_paste)(
+        void *user_data,
+        winghostty_surface *surface,
+        const char *text,
+        uint32_t length,
+        uint8_t bracketed
+    );
+    void (*on_clipboard_read)(
+        void *user_data,
+        winghostty_surface *surface,
+        uint32_t format,
+        const char *text,
+        uint32_t length
+    );
+    void (*on_clipboard_write)(
+        void *user_data,
+        winghostty_surface *surface,
+        uint32_t format,
+        const char *text,
+        uint32_t length
+    );
+} winghostty_input_callbacks;
+
+typedef struct winghostty_input_options {
+    uint32_t cell_width;
+    uint32_t cell_height;
+    uint8_t selection_enabled;
+    uint8_t links_enabled;
+    uint8_t paste_protection;
+    uint8_t bracketed_paste;
+    uint8_t reserved[4];
+    const char *keyboard_layout;
+} winghostty_input_options;
+
 typedef struct winghostty_surface_options {
     const char *command;
     const char *cwd;
@@ -84,6 +223,8 @@ typedef struct winghostty_surface_options {
     float font_scale;
     winghostty_callbacks callbacks;
     void *user_data;
+    winghostty_input_callbacks input_callbacks;
+    winghostty_input_options input;
 } winghostty_surface_options;
 
 void winghostty_surface_options_init(winghostty_surface_options *options);
@@ -118,6 +259,65 @@ winghostty_result winghostty_surface_set_theme(
 winghostty_result winghostty_surface_set_font_scale(
     winghostty_surface *surface,
     float font_scale
+);
+winghostty_result winghostty_surface_set_keyboard_layout(
+    winghostty_surface *surface,
+    uintptr_t keyboard_layout
+);
+winghostty_result winghostty_surface_ime_update(
+    winghostty_surface *surface,
+    const char *text,
+    uint32_t length,
+    uint8_t committed
+);
+
+winghostty_result winghostty_surface_paste_text(
+    winghostty_surface *surface,
+    const char *text,
+    uint32_t length,
+    uint8_t allow_unsafe
+);
+uint32_t winghostty_paste_validate(
+    const char *text,
+    uint32_t length
+);
+
+winghostty_result winghostty_surface_read_clipboard(
+    winghostty_surface *surface,
+    uint32_t format
+);
+winghostty_result winghostty_surface_write_clipboard(
+    winghostty_surface *surface,
+    uint32_t format,
+    const char *text,
+    uint32_t length
+);
+winghostty_result winghostty_surface_clipboard_read(
+    winghostty_surface *surface,
+    uint32_t format
+);
+winghostty_result winghostty_surface_clipboard_write(
+    winghostty_surface *surface,
+    uint32_t format,
+    const char *text,
+    uint32_t length
+);
+
+winghostty_result winghostty_surface_set_link(
+    winghostty_surface *surface,
+    const char *url
+);
+winghostty_result winghostty_surface_clear_link(winghostty_surface *surface);
+winghostty_result winghostty_surface_set_selection_text(
+    winghostty_surface *surface,
+    const char *text,
+    uint32_t length
+);
+winghostty_result winghostty_surface_clear_selection(
+    winghostty_surface *surface
+);
+winghostty_result winghostty_surface_copy_selection(
+    winghostty_surface *surface
 );
 
 /*

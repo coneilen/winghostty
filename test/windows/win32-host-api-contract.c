@@ -29,7 +29,7 @@ WINGHOSTTY_LAYOUT_ASSERT(
     "fatal callback offset changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
-    sizeof(winghostty_surface_options) == 128,
+    sizeof(winghostty_surface_options) == 240,
     "surface options ABI changed"
 );
 WINGHOSTTY_LAYOUT_ASSERT(
@@ -44,6 +44,25 @@ WINGHOSTTY_LAYOUT_ASSERT(
     offsetof(winghostty_surface_options, user_data) == 120,
     "surface user data offset changed"
 );
+WINGHOSTTY_LAYOUT_ASSERT(
+    sizeof(winghostty_input_callbacks) == 88,
+    "input callback ABI changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    offsetof(winghostty_surface_options, input_callbacks) == 128,
+    "input callback offset changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    sizeof(winghostty_input_options) == 24,
+    "input options ABI changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    offsetof(winghostty_surface_options, input) == 216,
+    "input options offset changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(sizeof(winghostty_key_event) == 48, "key event ABI changed");
+WINGHOSTTY_LAYOUT_ASSERT(sizeof(winghostty_mouse_event) == 36, "mouse event ABI changed");
+WINGHOSTTY_LAYOUT_ASSERT(sizeof(winghostty_selection_event) == 20, "selection event ABI changed");
 
 static void on_exit(void *user_data, winghostty_surface *surface, int32_t status) {
     (void)user_data;
@@ -101,6 +120,28 @@ static void on_fatal_error(
     (void)message;
 }
 
+static void on_key(
+    void *user_data,
+    winghostty_surface *surface,
+    const winghostty_key_event *event
+) {
+    (void)user_data;
+    (void)surface;
+    (void)event;
+}
+
+static void on_text(
+    void *user_data,
+    winghostty_surface *surface,
+    const char *text,
+    uint32_t length
+) {
+    (void)user_data;
+    (void)surface;
+    (void)text;
+    (void)length;
+}
+
 void winghostty_win32_host_compile_contract(void) {
     winghostty_host *host = 0;
     winghostty_surface *surface = 0;
@@ -121,6 +162,8 @@ void winghostty_win32_host_compile_contract(void) {
     options.callbacks.on_redraw = on_redraw;
     options.callbacks.on_focus = on_focus;
     options.callbacks.on_fatal_error = on_fatal_error;
+    options.input_callbacks.on_key = on_key;
+    options.input_callbacks.on_text = on_text;
 
     (void)winghostty_host_initialize(&host);
     (void)winghostty_host_create_surface(host, (HWND)0, &options, &surface);
@@ -129,6 +172,22 @@ void winghostty_win32_host_compile_contract(void) {
     (void)winghostty_surface_set_focus(surface, 1);
     (void)winghostty_surface_set_theme(surface, WINGHOSTTY_THEME_DARK);
     (void)winghostty_surface_set_font_scale(surface, 1.0f);
+    (void)winghostty_surface_set_keyboard_layout(surface, 0);
+    (void)winghostty_surface_ime_update(surface, "preedit", 7, 0);
+    (void)winghostty_surface_paste_text(surface, "echo", 4, 1);
+    (void)winghostty_paste_validate("echo", 4);
+    (void)winghostty_surface_read_clipboard(surface, WINGHOSTTY_CLIPBOARD_TEXT);
+    (void)winghostty_surface_write_clipboard(
+        surface,
+        WINGHOSTTY_CLIPBOARD_TEXT,
+        "text",
+        4
+    );
+    (void)winghostty_surface_set_link(surface, "https://example.com");
+    (void)winghostty_surface_clear_link(surface);
+    (void)winghostty_surface_set_selection_text(surface, "text", 4);
+    (void)winghostty_surface_clear_selection(surface);
+    (void)winghostty_surface_copy_selection(surface);
     (void)winghostty_surface_notify_exit(surface, 0);
     (void)winghostty_surface_notify_title(surface, "title");
     (void)winghostty_surface_notify_cwd(surface, "C:\\");

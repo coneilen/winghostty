@@ -60,10 +60,18 @@ independent of GraphCode product types.
 - `winghostty_host_drain` is a non-blocking adapter hook; it does not pump or
   dispatch the caller's messages.
 
-The host boundary provides child-window lifecycle, bounds, visibility, focus,
-theme, font-scale adapters, redraw/focus callback delivery, and an explicit
-WGL context/presentation adapter. Terminal input, DPI, process, IME,
-clipboard, and UIA adapters remain separate extraction boundaries.
+The host API provides child-window lifecycle, bounds, visibility, focus, theme,
+font-scale, keyboard/text/IME, mouse/selection/link, paste, clipboard, and an
+explicit WGL context/presentation adapter. Input callbacks are delivered
+synchronously from the caller's message loop thread. Keyboard events retain
+virtual-key, scan-code, repeat/dead-key state, modifier state, and the copied
+layout name; text callbacks are UTF-8 and preserve surrogate pairs.
+
+`winghostty_surface_paste_text` validates UTF-8 and uses the host's paste
+protection classifier. Unsafe text requires `allow_unsafe` and bracketed paste
+is enabled by default. Clipboard read/write supports Unicode text and
+`CF_HTML` writes. A surface's input options and strings are copied during
+creation.
 
 ## Validation
 
@@ -71,5 +79,6 @@ clipboard, and UIA adapters remain separate extraction boundaries.
 .\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\test\windows\compile-win32-host-api.ps1
 .\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\test\windows\run-win32-host-api-smoke.ps1
 .\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\test\windows\run-win32-host-renderer.ps1
+.\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\test\windows\run-win32-host-api-input.ps1
 .\scripts\dev-windows.cmd zig build -Demit-win32-host=true
 ```

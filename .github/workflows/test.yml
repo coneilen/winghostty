@@ -106,6 +106,10 @@ jobs:
         shell: pwsh
         run: ./test/windows/run-win32-host-api-smoke.ps1
 
+      - name: Win32 host API input caller-loop smoke
+        shell: pwsh
+        run: ./test/windows/run-win32-host-api-input.ps1
+
       - name: Zig version
         run: zig version
 

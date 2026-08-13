@@ -59,6 +59,7 @@ pub fn build(b: *std.Build) !void {
         host_lib.linkLibC();
         host_lib.linkSystemLibrary("kernel32");
         host_lib.linkSystemLibrary("user32");
+        host_lib.linkSystemLibrary("imm32");
         b.installArtifact(host_lib);
         const host_header = b.addInstallFile(
             b.path("include/winghostty/win32_host.h"),

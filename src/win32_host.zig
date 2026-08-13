@@ -4,6 +4,8 @@ const Allocator = std.mem.Allocator;
 const win32_types = @import("apprt/win32_types.zig");
 const win32_context = @import("renderer/win32_context.zig");
 const win32_presentation = @import("renderer/win32_presentation.zig");
+const paste_protection = @import("apprt/win32_paste_protection.zig");
+const win32_clipboard_html = @import("apprt/win32_clipboard_html.zig");
 
 comptime {
     if (builtin.target.os.tag != .windows) {
@@ -32,6 +34,7 @@ const WNDCLASSEXW = win32_types.WNDCLASSEXW;
 const CREATESTRUCTW = win32_types.CREATESTRUCTW;
 const PAINTSTRUCT = win32_types.PAINTSTRUCT;
 const RECT = win32_types.RECT;
+const POINT = win32_types.POINT;
 
 const allocator: Allocator = std.heap.c_allocator;
 
@@ -42,6 +45,33 @@ const WM_PAINT: u32 = 0x000F;
 const WM_ERASEBKGND: u32 = 0x0014;
 const WM_SETFOCUS: u32 = 0x0007;
 const WM_KILLFOCUS: u32 = 0x0008;
+const WM_KEYDOWN: u32 = 0x0100;
+const WM_KEYUP: u32 = 0x0101;
+const WM_CHAR: u32 = 0x0102;
+const WM_DEADCHAR: u32 = 0x0103;
+const WM_SYSKEYDOWN: u32 = 0x0104;
+const WM_SYSKEYUP: u32 = 0x0105;
+const WM_SYSCHAR: u32 = 0x0106;
+const WM_SYSDEADCHAR: u32 = 0x0107;
+const WM_UNICHAR: u32 = 0x0109;
+const WM_IME_STARTCOMPOSITION: u32 = 0x010D;
+const WM_IME_ENDCOMPOSITION: u32 = 0x010E;
+const WM_IME_COMPOSITION: u32 = 0x010F;
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_LBUTTONUP: u32 = 0x0202;
+const WM_LBUTTONDBLCLK: u32 = 0x0203;
+const WM_RBUTTONDOWN: u32 = 0x0204;
+const WM_RBUTTONUP: u32 = 0x0205;
+const WM_MBUTTONDOWN: u32 = 0x0207;
+const WM_MBUTTONUP: u32 = 0x0208;
+const WM_MOUSEWHEEL: u32 = 0x020A;
+const WM_XBUTTONDOWN: u32 = 0x020B;
+const WM_XBUTTONUP: u32 = 0x020C;
+const WM_MOUSEHWHEEL: u32 = 0x020E;
+const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_INPUTLANGCHANGE: u32 = 0x0051;
+const WM_CAPTURECHANGED: u32 = 0x0215;
 
 const WS_CHILD: u32 = 0x40000000;
 const WS_VISIBLE: u32 = 0x10000000;
@@ -49,6 +79,24 @@ const SW_HIDE: i32 = 0;
 const SW_SHOW: i32 = 5;
 const SWP_NOZORDER: u32 = 0x0004;
 const SWP_NOACTIVATE: u32 = 0x0010;
+const CF_TEXT: u32 = 1;
+const CF_UNICODETEXT: u32 = 13;
+const GMEM_MOVEABLE: u32 = 0x0002;
+const GCS_COMPSTR: u32 = 0x0008;
+const GCS_RESULTSTR: u32 = 0x0800;
+const WHEEL_DELTA: i32 = 120;
+const UNICODE_NOCHAR: WPARAM = 0xFFFF;
+const VK_SHIFT: i32 = 0x10;
+const VK_CONTROL: i32 = 0x11;
+const VK_MENU: i32 = 0x12;
+const MK_LBUTTON: u32 = 0x0001;
+const MK_RBUTTON: u32 = 0x0002;
+const MK_SHIFT: u32 = 0x0004;
+const MK_CONTROL: u32 = 0x0008;
+const MK_MBUTTON: u32 = 0x0010;
+const MK_XBUTTON1: u32 = 0x0020;
+const MK_XBUTTON2: u32 = 0x0040;
+const max_input_text_bytes: u32 = 16 * 1024 * 1024;
 
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral(
     "WinghosttyEmbeddableSurface",
@@ -107,6 +155,43 @@ extern "user32" fn SetWindowPos(
     flags: UINT,
 ) callconv(.winapi) BOOL;
 extern "user32" fn ShowWindow(hwnd: HWND, command: i32) callconv(.winapi) BOOL;
+extern "user32" fn GetKeyState(virtual_key: i32) callconv(.winapi) i16;
+extern "user32" fn GetKeyboardLayout(thread_id: DWORD) callconv(.winapi) ?*anyopaque;
+extern "user32" fn GetKeyboardState(state: *[256]u8) callconv(.winapi) BOOL;
+extern "user32" fn MapVirtualKeyExW(
+    code: u32,
+    map_type: u32,
+    keyboard_layout: ?*anyopaque,
+) callconv(.winapi) u32;
+extern "user32" fn ToUnicodeEx(
+    virtual_key: u32,
+    scan_code: u32,
+    keyboard_state: *const [256]u8,
+    chars: [*]u16,
+    char_count: i32,
+    flags: u32,
+    keyboard_layout: ?*anyopaque,
+) callconv(.winapi) i32;
+extern "user32" fn OpenClipboard(owner: ?HWND) callconv(.winapi) BOOL;
+extern "user32" fn CloseClipboard() callconv(.winapi) BOOL;
+extern "user32" fn EmptyClipboard() callconv(.winapi) BOOL;
+extern "user32" fn GetClipboardData(format: u32) callconv(.winapi) ?*anyopaque;
+extern "user32" fn SetClipboardData(format: u32, data: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "user32" fn RegisterClipboardFormatW(name: [*:0]const u16) callconv(.winapi) u32;
+extern "kernel32" fn GlobalAlloc(flags: u32, bytes: usize) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GlobalFree(memory: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GlobalLock(memory: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GlobalUnlock(memory: ?*anyopaque) callconv(.winapi) BOOL;
+extern "kernel32" fn GlobalSize(memory: ?*anyopaque) callconv(.winapi) usize;
+extern "kernel32" fn lstrlenW(string: [*:0]const u16) callconv(.winapi) i32;
+extern "imm32" fn ImmGetContext(hwnd: HWND) callconv(.winapi) ?*anyopaque;
+extern "imm32" fn ImmReleaseContext(hwnd: HWND, context: ?*anyopaque) callconv(.winapi) BOOL;
+extern "imm32" fn ImmGetCompositionStringW(
+    context: ?*anyopaque,
+    index: u32,
+    data: ?*anyopaque,
+    bytes: u32,
+) callconv(.winapi) i32;
 extern "kernel32" fn GetCurrentThreadId() callconv(.winapi) DWORD;
 extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
 extern "kernel32" fn GetModuleHandleW(module: ?LPCWSTR) callconv(.winapi) HINSTANCE;
@@ -124,8 +209,22 @@ const result_surface_invalidated: Result = 6;
 const result_renderer_error: Result = 7;
 const result_context_error: Result = 8;
 const result_present_error: Result = 9;
+const result_paste_requires_confirmation: Result = 10;
+const result_invalid_utf8: Result = 11;
+const result_clipboard_unavailable: Result = 12;
 
 const theme_system: Theme = 0;
+
+const key_release: u32 = 0;
+const key_press: u32 = 1;
+const key_repeat: u32 = 2;
+const mouse_move: u32 = 0;
+const mouse_button_down: u32 = 1;
+const mouse_button_up: u32 = 2;
+const mouse_wheel: u32 = 3;
+const mouse_leave: u32 = 4;
+const clipboard_text: u32 = 0;
+const clipboard_html: u32 = 1;
 
 pub const Rect = extern struct {
     x: i32,
@@ -168,6 +267,80 @@ pub const Callbacks = extern struct {
     on_fatal_error: ?FatalErrorCallback,
 };
 
+pub const KeyEvent = extern struct {
+    action: u32,
+    virtual_key: u32,
+    scan_code: u32,
+    repeat_count: u32,
+    flags: u32,
+    modifiers: u32,
+    keyboard_layout: usize,
+    composing: u8,
+    dead_key: u8,
+    reserved: [6]u8,
+    keyboard_layout_name: ?[*:0]const u8,
+};
+
+pub const MouseEvent = extern struct {
+    kind: u32,
+    button: u32,
+    modifiers: u32,
+    x: i32,
+    y: i32,
+    cell_x: i32,
+    cell_y: i32,
+    wheel_delta: i32,
+    click_count: u32,
+};
+
+pub const SelectionEvent = extern struct {
+    active: u8,
+    dragging: u8,
+    rectangular: u8,
+    reserved: u8,
+    anchor_x: i32,
+    anchor_y: i32,
+    current_x: i32,
+    current_y: i32,
+};
+
+pub const OnKeyCallback = *const fn (?*anyopaque, *Surface, *const KeyEvent) callconv(.c) void;
+pub const OnTextCallback = *const fn (?*anyopaque, *Surface, [*:0]const u8, u32) callconv(.c) void;
+pub const OnImeStartCallback = *const fn (?*anyopaque, *Surface) callconv(.c) void;
+pub const OnImeUpdateCallback = *const fn (?*anyopaque, *Surface, [*:0]const u8, u32, u8) callconv(.c) void;
+pub const OnImeEndCallback = *const fn (?*anyopaque, *Surface) callconv(.c) void;
+pub const OnMouseCallback = *const fn (?*anyopaque, *Surface, *const MouseEvent) callconv(.c) void;
+pub const OnSelectionCallback = *const fn (?*anyopaque, *Surface, *const SelectionEvent) callconv(.c) void;
+pub const OnLinkCallback = *const fn (?*anyopaque, *Surface, [*:0]const u8, u8, u8) callconv(.c) void;
+pub const OnPasteCallback = *const fn (?*anyopaque, *Surface, [*:0]const u8, u32, u8) callconv(.c) void;
+pub const OnClipboardReadCallback = *const fn (?*anyopaque, *Surface, u32, [*:0]const u8, u32) callconv(.c) void;
+pub const OnClipboardWriteCallback = *const fn (?*anyopaque, *Surface, u32, [*:0]const u8, u32) callconv(.c) void;
+
+pub const InputCallbacks = extern struct {
+    on_key: ?OnKeyCallback,
+    on_text: ?OnTextCallback,
+    on_ime_start: ?OnImeStartCallback,
+    on_ime_update: ?OnImeUpdateCallback,
+    on_ime_end: ?OnImeEndCallback,
+    on_mouse: ?OnMouseCallback,
+    on_selection: ?OnSelectionCallback,
+    on_link: ?OnLinkCallback,
+    on_paste: ?OnPasteCallback,
+    on_clipboard_read: ?OnClipboardReadCallback,
+    on_clipboard_write: ?OnClipboardWriteCallback,
+};
+
+pub const InputOptions = extern struct {
+    cell_width: u32,
+    cell_height: u32,
+    selection_enabled: u8,
+    links_enabled: u8,
+    paste_protection: u8,
+    bracketed_paste: u8,
+    reserved: [4]u8,
+    keyboard_layout: ?[*:0]const u8,
+};
+
 pub const SurfaceOptions = extern struct {
     command: ?[*:0]const u8,
     cwd: ?[*:0]const u8,
@@ -179,6 +352,8 @@ pub const SurfaceOptions = extern struct {
     font_scale: f32,
     callbacks: Callbacks,
     user_data: ?*anyopaque,
+    input_callbacks: InputCallbacks,
+    input: InputOptions,
 };
 
 const OwnedOptions = struct {
@@ -192,6 +367,8 @@ const OwnedOptions = struct {
     font_scale: f32,
     callbacks: Callbacks,
     user_data: ?*anyopaque,
+    input_callbacks: InputCallbacks,
+    input: InputOptionsOwned,
 
     fn init(options: *const SurfaceOptions) !OwnedOptions {
         var result = OwnedOptions{
@@ -202,11 +379,22 @@ const OwnedOptions = struct {
             .font_scale = options.font_scale,
             .callbacks = options.callbacks,
             .user_data = options.user_data,
+            .input_callbacks = options.input_callbacks,
+            .input = .{
+                .cell_width = options.input.cell_width,
+                .cell_height = options.input.cell_height,
+                .selection_enabled = if (options.input.selection_enabled == 0) 0 else 1,
+                .links_enabled = if (options.input.links_enabled == 0) 0 else 1,
+                .paste_protection = if (options.input.paste_protection == 0) 0 else 1,
+                .bracketed_paste = if (options.input.bracketed_paste == 0) 0 else 1,
+                .keyboard_layout = null,
+            },
         };
         errdefer result.deinit();
         result.command = try duplicate(options.command);
         result.cwd = try duplicate(options.cwd);
         result.environment = try duplicate(options.environment);
+        result.input.keyboard_layout = try duplicate(options.input.keyboard_layout);
         return result;
     }
 
@@ -217,6 +405,22 @@ const OwnedOptions = struct {
         self.command = null;
         self.cwd = null;
         self.environment = null;
+        self.input.deinit();
+    }
+};
+
+const InputOptionsOwned = struct {
+    cell_width: u32,
+    cell_height: u32,
+    selection_enabled: u8,
+    links_enabled: u8,
+    paste_protection: u8,
+    bracketed_paste: u8,
+    keyboard_layout: ?[:0]u8,
+
+    fn deinit(self: *InputOptionsOwned) void {
+        if (self.keyboard_layout) |value| allocator.free(value);
+        self.keyboard_layout = null;
     }
 };
 
@@ -248,6 +452,24 @@ const SurfaceState = struct {
     invalidated: std.atomic.Value(bool) = .init(false),
     creation_in_progress: bool = false,
     destroying: std.atomic.Value(bool) = .init(false),
+    focused: bool = false,
+    ime_composing: bool = false,
+    dead_key_active: bool = false,
+    pending_high_surrogate: ?u16 = null,
+    selection_active: bool = false,
+    selection_dragging: bool = false,
+    selection_anchor_x: i32 = 0,
+    selection_anchor_y: i32 = 0,
+    selection_current_x: i32 = 0,
+    selection_current_y: i32 = 0,
+    selection_text: ?[:0]u8 = null,
+    link_url: ?[:0]u8 = null,
+    link_hovered: bool = false,
+    last_click_tick: u32 = 0,
+    click_count: u32 = 0,
+    keyboard_layout: ?*anyopaque = null,
+    wheel_remainder_x: i32 = 0,
+    wheel_remainder_y: i32 = 0,
 };
 
 const HostState = struct {
@@ -272,6 +494,10 @@ var next_handle_generation: std.atomic.Value(u64) = .init(1);
 fn duplicate(value: ?[*:0]const u8) !?[:0]u8 {
     const source = value orelse return null;
     return try allocator.dupeZ(u8, std.mem.span(source));
+}
+
+fn duplicateSlice(value: []const u8) ![:0]u8 {
+    return try allocator.dupeZ(u8, value);
 }
 
 fn hostHandle(host: *HostState) *Host {
@@ -735,6 +961,7 @@ fn setUserData(hwnd: HWND, surface: ?*SurfaceState) void {
 
 fn notifyFocus(surface: *SurfaceState, focused: bool) void {
     if (surface.destroying.load(.acquire)) return;
+    surface.focused = focused;
     if (surface.options.callbacks.on_focus) |callback| {
         callback(
             surface.options.user_data,
@@ -749,6 +976,308 @@ fn notifyRedraw(surface: *SurfaceState) void {
     if (surface.options.callbacks.on_redraw) |callback| {
         callback(surface.options.user_data, surfaceHandle(surface));
     }
+}
+
+fn emitKey(surface: *SurfaceState, event: KeyEvent) void {
+    if (surface.destroying.load(.acquire)) return;
+    if (surface.options.input_callbacks.on_key) |callback| {
+        callback(
+            surface.options.user_data,
+            surfaceHandle(surface),
+            &event,
+        );
+    }
+}
+
+fn emitText(surface: *SurfaceState, text: []const u8) void {
+    if (surface.destroying.load(.acquire)) return;
+    const owned = allocator.dupeZ(u8, text) catch return;
+    defer allocator.free(owned);
+    if (surface.options.input_callbacks.on_text) |callback| {
+        callback(
+            surface.options.user_data,
+            surfaceHandle(surface),
+            owned,
+            @intCast(text.len),
+        );
+    }
+}
+
+fn emitImeUpdate(surface: *SurfaceState, text: []const u8, committed: bool) void {
+    if (surface.destroying.load(.acquire)) return;
+    const owned = allocator.dupeZ(u8, text) catch return;
+    defer allocator.free(owned);
+    if (surface.options.input_callbacks.on_ime_update) |callback| {
+        callback(
+            surface.options.user_data,
+            surfaceHandle(surface),
+            owned,
+            @intCast(text.len),
+            if (committed) 1 else 0,
+        );
+    }
+}
+
+fn emitMouse(surface: *SurfaceState, event: MouseEvent) void {
+    if (surface.destroying.load(.acquire)) return;
+    if (surface.options.input_callbacks.on_mouse) |callback| {
+        callback(surface.options.user_data, surfaceHandle(surface), &event);
+    }
+}
+
+fn emitSelection(surface: *SurfaceState) void {
+    if (surface.destroying.load(.acquire)) return;
+    const event = SelectionEvent{
+        .active = if (surface.selection_active) 1 else 0,
+        .dragging = if (surface.selection_dragging) 1 else 0,
+        .rectangular = 0,
+        .reserved = 0,
+        .anchor_x = surface.selection_anchor_x,
+        .anchor_y = surface.selection_anchor_y,
+        .current_x = surface.selection_current_x,
+        .current_y = surface.selection_current_y,
+    };
+    if (surface.options.input_callbacks.on_selection) |callback| {
+        callback(surface.options.user_data, surfaceHandle(surface), &event);
+    }
+}
+
+fn emitLink(surface: *SurfaceState, hovered: bool, clicked: bool) void {
+    if (surface.destroying.load(.acquire)) return;
+    const url = surface.link_url orelse return;
+    if (surface.options.input_callbacks.on_link) |callback| {
+        callback(
+            surface.options.user_data,
+            surfaceHandle(surface),
+            url,
+            if (hovered) 1 else 0,
+            if (clicked) 1 else 0,
+        );
+    }
+}
+
+fn emitPaste(surface: *SurfaceState, text: []const u8, bracketed: bool) void {
+    if (surface.destroying.load(.acquire)) return;
+    const owned = allocator.dupeZ(u8, text) catch return;
+    defer allocator.free(owned);
+    if (surface.options.input_callbacks.on_paste) |callback| {
+        callback(
+            surface.options.user_data,
+            surfaceHandle(surface),
+            owned,
+            @intCast(text.len),
+            if (bracketed) 1 else 0,
+        );
+    }
+}
+
+fn emitClipboardRead(surface: *SurfaceState, format: u32, text: []const u8) void {
+    if (surface.destroying.load(.acquire)) return;
+    const owned = allocator.dupeZ(u8, text) catch return;
+    defer allocator.free(owned);
+    if (surface.options.input_callbacks.on_clipboard_read) |callback| {
+        callback(
+            surface.options.user_data,
+            surfaceHandle(surface),
+            format,
+            owned,
+            @intCast(text.len),
+        );
+    }
+}
+
+fn emitClipboardWrite(surface: *SurfaceState, format: u32, text: []const u8) void {
+    if (surface.destroying.load(.acquire)) return;
+    const owned = allocator.dupeZ(u8, text) catch return;
+    defer allocator.free(owned);
+    if (surface.options.input_callbacks.on_clipboard_write) |callback| {
+        callback(
+            surface.options.user_data,
+            surfaceHandle(surface),
+            format,
+            owned,
+            @intCast(text.len),
+        );
+    }
+}
+
+fn signedWord(value: usize) i32 {
+    return @as(i16, @bitCast(@as(u16, @truncate(value))));
+}
+
+fn mouseModifiers(wparam: WPARAM) u32 {
+    var result: u32 = 0;
+    if ((wparam & MK_LBUTTON) != 0) result |= MK_LBUTTON;
+    if ((wparam & MK_RBUTTON) != 0) result |= MK_RBUTTON;
+    if ((wparam & MK_SHIFT) != 0 or (GetKeyState(VK_SHIFT) < 0)) result |= MK_SHIFT;
+    if ((wparam & MK_CONTROL) != 0 or (GetKeyState(VK_CONTROL) < 0)) result |= MK_CONTROL;
+    if ((wparam & MK_MBUTTON) != 0) result |= MK_MBUTTON;
+    if ((wparam & MK_XBUTTON1) != 0) result |= MK_XBUTTON1;
+    if ((wparam & MK_XBUTTON2) != 0) result |= MK_XBUTTON2;
+    return result;
+}
+
+fn keyModifiers() u32 {
+    var result: u32 = 0;
+    if (GetKeyState(VK_SHIFT) < 0) result |= MK_SHIFT;
+    if (GetKeyState(VK_CONTROL) < 0) result |= MK_CONTROL;
+    if (GetKeyState(VK_MENU) < 0) result |= 0x0080;
+    return result;
+}
+
+fn cellCoordinate(value: i32, cell: u32) i32 {
+    if (cell == 0) return value;
+    if (value < 0) return -1;
+    return @intCast(@divTrunc(@as(u32, @intCast(value)), cell));
+}
+
+fn mouseButton(message: UINT, wparam: WPARAM) u32 {
+    return switch (message) {
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK => 1,
+        WM_RBUTTONDOWN, WM_RBUTTONUP => 2,
+        WM_MBUTTONDOWN, WM_MBUTTONUP => 3,
+        WM_XBUTTONDOWN, WM_XBUTTONUP => if (((wparam >> 16) & 0xffff) == 2) 5 else 4,
+        else => 0,
+    };
+}
+
+fn mouseKind(message: UINT) u32 {
+    return switch (message) {
+        WM_MOUSEMOVE => mouse_move,
+        WM_LBUTTONDOWN,
+        WM_RBUTTONDOWN,
+        WM_MBUTTONDOWN,
+        WM_XBUTTONDOWN,
+        WM_LBUTTONDBLCLK,
+        => mouse_button_down,
+        WM_LBUTTONUP, WM_RBUTTONUP, WM_MBUTTONUP, WM_XBUTTONUP => mouse_button_up,
+        WM_MOUSEWHEEL, WM_MOUSEHWHEEL => mouse_wheel,
+        WM_MOUSELEAVE => mouse_leave,
+        else => mouse_move,
+    };
+}
+
+fn emitMouseMessage(surface: *SurfaceState, message: UINT, wparam: WPARAM, lparam: LPARAM) void {
+    if (surface.destroying.load(.acquire)) return;
+    const x = signedWord(@as(usize, @bitCast(lparam)));
+    const y = signedWord(@as(usize, @bitCast(lparam)) >> 16);
+    const kind = mouseKind(message);
+    const event = MouseEvent{
+        .kind = kind,
+        .button = mouseButton(message, wparam),
+        .modifiers = mouseModifiers(wparam),
+        .x = x,
+        .y = y,
+        .cell_x = cellCoordinate(x, surface.options.input.cell_width),
+        .cell_y = cellCoordinate(y, surface.options.input.cell_height),
+        .wheel_delta = if (kind == mouse_wheel)
+            @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(wparam)) >> 16))))
+        else
+            0,
+        .click_count = surface.click_count,
+    };
+    emitMouse(surface, event);
+}
+
+fn utf16ToUtf8(alloc: Allocator, units: []const u16) ![]u8 {
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(alloc);
+    var index: usize = 0;
+    while (index < units.len) : (index += 1) {
+        const first = units[index];
+        var codepoint: u21 = first;
+        if (first >= 0xD800 and first <= 0xDBFF and index + 1 < units.len) {
+            const second = units[index + 1];
+            if (second >= 0xDC00 and second <= 0xDFFF) {
+                codepoint = 0x10000 + (@as(u21, first - 0xD800) << 10) + (second - 0xDC00);
+                index += 1;
+            }
+        } else if (first >= 0xDC00 and first <= 0xDFFF) {
+            codepoint = 0xFFFD;
+        }
+        var encoded: [4]u8 = undefined;
+        const len = try std.unicode.utf8Encode(codepoint, &encoded);
+        try result.appendSlice(alloc, encoded[0..len]);
+    }
+    return try result.toOwnedSlice(alloc);
+}
+
+fn emitUtf16Text(surface: *SurfaceState, units: []const u16) void {
+    if (surface.destroying.load(.acquire)) return;
+    const utf8 = utf16ToUtf8(allocator, units) catch return;
+    defer allocator.free(utf8);
+    emitText(surface, utf8);
+}
+
+fn emitCodepointText(surface: *SurfaceState, codepoint: u21) void {
+    var encoded: [4]u8 = undefined;
+    const length = std.unicode.utf8Encode(codepoint, &encoded) catch return;
+    emitText(surface, encoded[0..length]);
+}
+
+fn handleUtf16Unit(surface: *SurfaceState, unit: u16) void {
+    if (surface.destroying.load(.acquire)) return;
+    if (unit >= 0xD800 and unit <= 0xDBFF) {
+        surface.pending_high_surrogate = unit;
+        return;
+    }
+    if (surface.pending_high_surrogate) |high| {
+        surface.pending_high_surrogate = null;
+        if (unit >= 0xDC00 and unit <= 0xDFFF) {
+            emitUtf16Text(surface, &.{ high, unit });
+            return;
+        }
+        emitUtf16Text(surface, &.{high});
+    }
+    emitUtf16Text(surface, &.{unit});
+    surface.dead_key_active = false;
+}
+
+fn emitImeComposition(surface: *SurfaceState, index: u32, committed: bool) void {
+    if (surface.destroying.load(.acquire)) return;
+    const hwnd = surface.hwnd orelse return;
+    const context = ImmGetContext(hwnd) orelse return;
+    defer _ = ImmReleaseContext(hwnd, context);
+    const byte_count = ImmGetCompositionStringW(context, index, null, 0);
+    if (byte_count <= 0) return;
+    const units_count: usize = @intCast(@divExact(byte_count, 2));
+    const units = allocator.alloc(u16, units_count) catch return;
+    defer allocator.free(units);
+    if (ImmGetCompositionStringW(
+        context,
+        index,
+        @ptrCast(units.ptr),
+        @intCast(byte_count),
+    ) < 0) return;
+    const utf8 = utf16ToUtf8(allocator, units) catch return;
+    defer allocator.free(utf8);
+    emitImeUpdate(surface, utf8, committed);
+}
+
+fn keyEventFromMessage(surface: *SurfaceState, message: UINT, wparam: WPARAM, lparam: LPARAM) KeyEvent {
+    const repeat_count: u32 = @intCast(@as(usize, @bitCast(lparam)) & 0xffff);
+    const scan_code: u32 = @intCast((@as(usize, @bitCast(lparam)) >> 16) & 0xff);
+    const previous_down = ((@as(usize, @bitCast(lparam)) >> 30) & 1) != 0;
+    const is_up = message == WM_KEYUP or message == WM_SYSKEYUP;
+    const layout = surface.keyboard_layout orelse GetKeyboardLayout(0);
+    return .{
+        .action = if (is_up) key_release else if (previous_down) key_repeat else key_press,
+        .virtual_key = @intCast(wparam & 0xffff),
+        .scan_code = scan_code,
+        .repeat_count = if (repeat_count == 0) 1 else repeat_count,
+        .flags = @intCast((@as(usize, @bitCast(lparam)) >> 24) & 0xff),
+        .modifiers = keyModifiers(),
+        .keyboard_layout = if (layout) |value| @intFromPtr(value) else 0,
+        .composing = if (surface.ime_composing or
+            surface.dead_key_active or
+            surface.pending_high_surrogate != null) 1 else 0,
+        .dead_key = if (message == WM_DEADCHAR or message == WM_SYSDEADCHAR) 1 else 0,
+        .reserved = .{0} ** 6,
+        .keyboard_layout_name = if (surface.options.input.keyboard_layout) |value|
+            value.ptr
+        else
+            null,
+    };
 }
 
 fn surfaceWindowProc(
@@ -773,6 +1302,156 @@ fn surfaceWindowProc(
         },
         WM_KILLFOCUS => {
             if (surface) |value| notifyFocus(value, false);
+            if (surface) |value| {
+                if (value.ime_composing) {
+                    value.ime_composing = false;
+                    if (value.options.input_callbacks.on_ime_end) |callback| {
+                        if (!value.destroying.load(.acquire)) {
+                            callback(value.options.user_data, surfaceHandle(value));
+                        }
+                    }
+                }
+            }
+            return 0;
+        },
+        WM_KEYDOWN, WM_SYSKEYDOWN, WM_KEYUP, WM_SYSKEYUP => {
+            if (surface) |value| {
+                if (value.focused or GetFocus() == hwnd) {
+                    const event = keyEventFromMessage(value, message, wparam, lparam);
+                    emitKey(value, event);
+                }
+            }
+            return 0;
+        },
+        WM_CHAR, WM_SYSCHAR, WM_UNICHAR => {
+            if (surface) |value| {
+                if ((value.focused or GetFocus() == hwnd) and wparam != UNICODE_NOCHAR) {
+                    if (message == WM_UNICHAR and wparam > 0xffff) {
+                        emitCodepointText(value, @intCast(wparam));
+                    } else {
+                        handleUtf16Unit(value, @intCast(wparam & 0xffff));
+                    }
+                }
+            }
+            return 0;
+        },
+        WM_DEADCHAR, WM_SYSDEADCHAR => {
+            if (surface) |value| {
+                if (value.focused or GetFocus() == hwnd) {
+                    value.dead_key_active = true;
+                    const event = keyEventFromMessage(value, message, wparam, lparam);
+                    emitKey(value, event);
+                }
+            }
+            return 0;
+        },
+        WM_IME_STARTCOMPOSITION => {
+            if (surface) |value| {
+                if (!value.destroying.load(.acquire) and
+                    (value.focused or GetFocus() == hwnd))
+                {
+                    value.ime_composing = true;
+                    if (value.options.input_callbacks.on_ime_start) |callback| {
+                        callback(value.options.user_data, surfaceHandle(value));
+                    }
+                }
+            }
+            return 0;
+        },
+        WM_IME_COMPOSITION => {
+            if (surface) |value| {
+                if ((value.focused or GetFocus() == hwnd) and
+                    (@as(usize, @bitCast(lparam)) & GCS_COMPSTR) != 0)
+                {
+                    emitImeComposition(value, GCS_COMPSTR, false);
+                }
+                if ((value.focused or GetFocus() == hwnd) and
+                    (@as(usize, @bitCast(lparam)) & GCS_RESULTSTR) != 0)
+                {
+                    emitImeComposition(value, GCS_RESULTSTR, true);
+                }
+            }
+            return 0;
+        },
+        WM_IME_ENDCOMPOSITION => {
+            if (surface) |value| {
+                if (!value.destroying.load(.acquire) and
+                    (value.focused or GetFocus() == hwnd))
+                {
+                    value.ime_composing = false;
+                    if (value.options.input_callbacks.on_ime_end) |callback| {
+                        callback(value.options.user_data, surfaceHandle(value));
+                    }
+                }
+            }
+            return 0;
+        },
+        WM_MOUSEMOVE,
+        WM_LBUTTONDOWN,
+        WM_LBUTTONUP,
+        WM_LBUTTONDBLCLK,
+        WM_RBUTTONDOWN,
+        WM_RBUTTONUP,
+        WM_MBUTTONDOWN,
+        WM_MBUTTONUP,
+        WM_XBUTTONDOWN,
+        WM_XBUTTONUP,
+        WM_MOUSEWHEEL,
+        WM_MOUSEHWHEEL,
+        WM_MOUSELEAVE,
+        => {
+            if (surface) |value| {
+                if (message == WM_LBUTTONDOWN or message == WM_LBUTTONDBLCLK) {
+                    _ = SetFocus(hwnd);
+                    if (value.options.input.selection_enabled != 0) {
+                        const x = signedWord(@as(usize, @bitCast(lparam)));
+                        const y = signedWord(@as(usize, @bitCast(lparam)) >> 16);
+                        value.selection_active = true;
+                        value.selection_dragging = true;
+                        value.selection_anchor_x = cellCoordinate(x, value.options.input.cell_width);
+                        value.selection_anchor_y = cellCoordinate(y, value.options.input.cell_height);
+                        value.selection_current_x = value.selection_anchor_x;
+                        value.selection_current_y = value.selection_anchor_y;
+                        emitSelection(value);
+                    }
+                    if (value.link_hovered) emitLink(value, true, true);
+                    value.click_count = if (message == WM_LBUTTONDBLCLK) 2 else 1;
+                } else if (message == WM_LBUTTONUP) {
+                    value.selection_dragging = false;
+                    if (value.selection_active) emitSelection(value);
+                } else if (message == WM_MOUSEMOVE and value.selection_dragging) {
+                    const x = signedWord(@as(usize, @bitCast(lparam)));
+                    const y = signedWord(@as(usize, @bitCast(lparam)) >> 16);
+                    value.selection_current_x = cellCoordinate(x, value.options.input.cell_width);
+                    value.selection_current_y = cellCoordinate(y, value.options.input.cell_height);
+                    emitSelection(value);
+                } else if (message == WM_MOUSELEAVE) {
+                    if (value.link_hovered) {
+                        value.link_hovered = false;
+                        emitLink(value, false, false);
+                    }
+                }
+                emitMouseMessage(value, message, wparam, lparam);
+                if (message == WM_MOUSEMOVE and
+                    value.options.input.links_enabled != 0 and
+                    value.link_url != null and
+                    !value.link_hovered)
+                {
+                    value.link_hovered = true;
+                    emitLink(value, true, false);
+                }
+            }
+            return 0;
+        },
+        WM_CAPTURECHANGED => {
+            if (surface) |value| {
+                value.selection_dragging = false;
+                if (value.selection_active) emitSelection(value);
+            }
+            return 0;
+        },
+        WM_INPUTLANGCHANGE => {
+            if (surface) |value| value.keyboard_layout = @ptrFromInt(@as(usize, @bitCast(lparam)));
             return 0;
         },
         WM_ERASEBKGND => return 1,
@@ -824,7 +1503,7 @@ fn destroySurfaceNow(
     disableClearAdmissionAndWait(surface, remaining_admissions);
     unregisterSurface(surface);
     freeRendererStorage(surface);
-    surface.options.deinit();
+    deinitSurfaceResources(surface);
 }
 
 fn cleanupUnregisteredSurface(
@@ -840,6 +1519,14 @@ fn cleanupUnregisteredSurface(
     closeSurfaceAdmission(surface);
     destroySurfaceNow(surface, 0);
     allocator.destroy(surface);
+}
+
+fn deinitSurfaceResources(surface: *SurfaceState) void {
+    if (surface.selection_text) |value| allocator.free(value);
+    if (surface.link_url) |value| allocator.free(value);
+    surface.selection_text = null;
+    surface.link_url = null;
+    surface.options.deinit();
 }
 
 fn finishUnregisteredSurfaceCreation(
@@ -913,6 +1600,29 @@ pub export fn winghostty_surface_options_init(options: *SurfaceOptions) void {
             .on_fatal_error = null,
         },
         .user_data = null,
+        .input_callbacks = .{
+            .on_key = null,
+            .on_text = null,
+            .on_ime_start = null,
+            .on_ime_update = null,
+            .on_ime_end = null,
+            .on_mouse = null,
+            .on_selection = null,
+            .on_link = null,
+            .on_paste = null,
+            .on_clipboard_read = null,
+            .on_clipboard_write = null,
+        },
+        .input = .{
+            .cell_width = 8,
+            .cell_height = 16,
+            .selection_enabled = 1,
+            .links_enabled = 1,
+            .paste_protection = 1,
+            .bracketed_paste = 1,
+            .reserved = .{0} ** 4,
+            .keyboard_layout = null,
+        },
     };
 }
 
@@ -1005,6 +1715,7 @@ pub export fn winghostty_host_create_surface(
         .host = state,
         .parent = parent_hwnd,
         .options = owned,
+        .keyboard_layout = GetKeyboardLayout(0),
     };
     registerSurface(surface) catch {
         surface.options.deinit();
@@ -1386,6 +2097,299 @@ pub export fn winghostty_surface_present(surface: ?*Surface) Result {
     };
     _ = state.present_count.fetchAdd(1, .release);
     return result_ok;
+}
+
+fn pasteSeverity(text: []const u8) u32 {
+    return switch (paste_protection.inspect(text).severity) {
+        .safe => 0,
+        .contains_newline => 1,
+        .shell_metachar => 2,
+        .control_chars => 3,
+        .mixed_content => 4,
+    };
+}
+
+fn bracketPaste(alloc: Allocator, text: []const u8) ![]u8 {
+    const prefix = "\x1b[200~";
+    const suffix = "\x1b[201~";
+    var result = try alloc.alloc(u8, prefix.len + text.len + suffix.len);
+    @memcpy(result[0..prefix.len], prefix);
+    @memcpy(result[prefix.len .. prefix.len + text.len], text);
+    @memcpy(result[prefix.len + text.len ..], suffix);
+    return result;
+}
+
+fn clipboardFormatId(format: u32) u32 {
+    if (format == clipboard_html) {
+        const name = std.unicode.utf8ToUtf16LeStringLiteral("HTML Format");
+        return RegisterClipboardFormatW(name);
+    }
+    return CF_UNICODETEXT;
+}
+
+fn clipboardBytes(format: u32) ?[]u8 {
+    const id = clipboardFormatId(format);
+    const preferred = GetClipboardData(id);
+    const using_html = preferred != null and format == clipboard_html;
+    const handle = preferred orelse if (format == clipboard_html)
+        GetClipboardData(CF_UNICODETEXT)
+    else
+        null;
+    const value = handle orelse return null;
+    const raw = GlobalLock(value) orelse return null;
+    defer _ = GlobalUnlock(value);
+    const bytes = GlobalSize(value);
+    if (bytes == 0) return null;
+    if (using_html) {
+        return allocator.dupe(u8, @as([*]const u8, @ptrCast(raw))[0..bytes]) catch null;
+    }
+    const units = @as([*]const u16, @ptrCast(@alignCast(raw)));
+    var count: usize = 0;
+    while (count * 2 + 1 < bytes and units[count] != 0) : (count += 1) {}
+    return utf16ToUtf8(allocator, units[0..count]) catch null;
+}
+
+fn setClipboardGlobal(format: u32, bytes: []const u8, utf16: bool) bool {
+    const size = if (utf16) (bytes.len + 1) * 2 else bytes.len + 1;
+    const memory = GlobalAlloc(GMEM_MOVEABLE, size) orelse return false;
+    const target = GlobalLock(memory) orelse {
+        _ = GlobalFree(memory);
+        return false;
+    };
+    if (utf16) {
+        const units = @as([*]u16, @ptrCast(@alignCast(target)));
+        var index: usize = 0;
+        var iterator = std.unicode.Utf8Iterator{ .bytes = bytes, .i = 0 };
+        while (iterator.nextCodepoint()) |codepoint| {
+            if (codepoint <= 0xffff) {
+                units[index] = @intCast(codepoint);
+                index += 1;
+            } else {
+                const value = codepoint - 0x10000;
+                units[index] = @intCast(0xD800 + (value >> 10));
+                units[index + 1] = @intCast(0xDC00 + (value & 0x3ff));
+                index += 2;
+            }
+        }
+        units[index] = 0;
+    } else {
+        const target_bytes = @as([*]u8, @ptrCast(target));
+        @memcpy(target_bytes[0..bytes.len], bytes);
+        target_bytes[bytes.len] = 0;
+    }
+    _ = GlobalUnlock(memory);
+    if (SetClipboardData(format, memory) == null) {
+        _ = GlobalFree(memory);
+        return false;
+    }
+    return true;
+}
+
+pub export fn winghostty_paste_validate(
+    text: ?[*]const u8,
+    length: u32,
+) u32 {
+    const source = text orelse return 3;
+    if (length > max_input_text_bytes) return 3;
+    return pasteSeverity(source[0..length]);
+}
+
+pub export fn winghostty_surface_paste_text(
+    surface: ?*Surface,
+    text: ?[*]const u8,
+    length: u32,
+    allow_unsafe: u8,
+) Result {
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const source = text orelse return result_invalid_argument;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    if (length > max_input_text_bytes) return result_invalid_argument;
+    const bytes = source[0..length];
+    if (!std.unicode.utf8ValidateSlice(bytes)) return result_invalid_utf8;
+    const severity = pasteSeverity(bytes);
+    if (state.options.input.paste_protection != 0 and severity != 0 and allow_unsafe == 0) {
+        return result_paste_requires_confirmation;
+    }
+    const bracketed = state.options.input.bracketed_paste != 0;
+    const payload = if (bracketed) bracketPaste(allocator, bytes) catch
+        return result_out_of_memory else allocator.dupe(u8, bytes) catch return result_out_of_memory;
+    defer allocator.free(payload);
+    emitPaste(state, payload, bracketed);
+    return result_ok;
+}
+
+pub export fn winghostty_surface_read_clipboard(
+    surface: ?*Surface,
+    format: u32,
+) Result {
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    if (format != clipboard_text and format != clipboard_html) {
+        return result_invalid_argument;
+    }
+    if (OpenClipboard(state.parent) == 0) return result_clipboard_unavailable;
+    defer _ = CloseClipboard();
+    const value = clipboardBytes(format) orelse return result_win32_error;
+    defer allocator.free(value);
+    emitClipboardRead(state, format, value);
+    return result_ok;
+}
+
+pub export fn winghostty_surface_write_clipboard(
+    surface: ?*Surface,
+    format: u32,
+    text: ?[*]const u8,
+    length: u32,
+) Result {
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const source = text orelse return result_invalid_argument;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    if (length > max_input_text_bytes) return result_invalid_argument;
+    if (format != clipboard_text and format != clipboard_html) {
+        return result_invalid_argument;
+    }
+    const bytes = source[0..length];
+    if (!std.unicode.utf8ValidateSlice(bytes)) return result_invalid_utf8;
+    if (OpenClipboard(state.parent) == 0) return result_clipboard_unavailable;
+    defer _ = CloseClipboard();
+    if (EmptyClipboard() == 0) return result_win32_error;
+    if (format == clipboard_html) {
+        const wrapped = win32_clipboard_html.wrapFragment(allocator, bytes) catch
+            return result_out_of_memory;
+        defer allocator.free(wrapped);
+        const id = clipboardFormatId(format);
+        if (!setClipboardGlobal(id, wrapped, false)) return result_win32_error;
+        if (!setClipboardGlobal(CF_UNICODETEXT, bytes, true)) return result_win32_error;
+    } else {
+        if (!setClipboardGlobal(CF_UNICODETEXT, bytes, true)) return result_win32_error;
+    }
+    emitClipboardWrite(state, format, bytes);
+    return result_ok;
+}
+
+pub export fn winghostty_surface_clipboard_read(
+    surface: ?*Surface,
+    format: u32,
+) Result {
+    return winghostty_surface_read_clipboard(surface, format);
+}
+
+pub export fn winghostty_surface_clipboard_write(
+    surface: ?*Surface,
+    format: u32,
+    text: ?[*]const u8,
+    length: u32,
+) Result {
+    return winghostty_surface_write_clipboard(surface, format, text, length);
+}
+
+pub export fn winghostty_surface_set_keyboard_layout(
+    surface: ?*Surface,
+    keyboard_layout: usize,
+) Result {
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    state.keyboard_layout = if (keyboard_layout == 0)
+        GetKeyboardLayout(0)
+    else
+        @ptrFromInt(keyboard_layout);
+    return result_ok;
+}
+
+pub export fn winghostty_surface_ime_update(
+    surface: ?*Surface,
+    text: ?[*]const u8,
+    length: u32,
+    committed: u8,
+) Result {
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const source = text orelse return result_invalid_argument;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    if (length > max_input_text_bytes) return result_invalid_argument;
+    const bytes = source[0..length];
+    if (!std.unicode.utf8ValidateSlice(bytes)) return result_invalid_utf8;
+    state.ime_composing = committed == 0;
+    emitImeUpdate(state, bytes, committed != 0);
+    return result_ok;
+}
+
+pub export fn winghostty_surface_set_link(
+    surface: ?*Surface,
+    url: ?[*:0]const u8,
+) Result {
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const value = url orelse return result_invalid_argument;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    if (std.mem.span(value).len == 0) return result_invalid_argument;
+    const owned = allocator.dupeZ(u8, std.mem.span(value)) catch return result_out_of_memory;
+    if (state.link_url) |old| allocator.free(old);
+    state.link_url = owned;
+    state.link_hovered = false;
+    return result_ok;
+}
+
+pub export fn winghostty_surface_clear_link(surface: ?*Surface) Result {
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    if (state.link_url) |old| allocator.free(old);
+    state.link_url = null;
+    if (state.link_hovered) {
+        state.link_hovered = false;
+        emitLink(state, false, false);
+    }
+    return result_ok;
+}
+
+pub export fn winghostty_surface_set_selection_text(
+    surface: ?*Surface,
+    text: ?[*]const u8,
+    length: u32,
+) Result {
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const source = text orelse return result_invalid_argument;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    if (length > max_input_text_bytes) return result_invalid_argument;
+    const bytes = source[0..length];
+    if (!std.unicode.utf8ValidateSlice(bytes)) return result_invalid_utf8;
+    const owned = allocator.dupeZ(u8, bytes) catch return result_out_of_memory;
+    if (state.selection_text) |old| allocator.free(old);
+    state.selection_text = owned;
+    state.selection_active = bytes.len != 0;
+    emitSelection(state);
+    return result_ok;
+}
+
+pub export fn winghostty_surface_clear_selection(surface: ?*Surface) Result {
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    if (state.selection_text) |old| allocator.free(old);
+    state.selection_text = null;
+    state.selection_active = false;
+    state.selection_dragging = false;
+    emitSelection(state);
+    return result_ok;
+}
+
+pub export fn winghostty_surface_copy_selection(surface: ?*Surface) Result {
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    const text = state.selection_text orelse return result_invalid_argument;
+    return winghostty_surface_write_clipboard(
+        surface,
+        clipboard_text,
+        text.ptr,
+        @intCast(text.len),
+    );
 }
 
 pub export fn winghostty_surface_notify_exit(
