@@ -83,6 +83,7 @@ const WM_MOUSEHWHEEL: u32 = 0x020E;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_INPUTLANGCHANGE: u32 = 0x0051;
 const WM_CAPTURECHANGED: u32 = 0x0215;
+const WM_UIA_SELECTION: u32 = 0x8000 + 0x41;
 
 const WS_CHILD: u32 = 0x40000000;
 const WS_VISIBLE: u32 = 0x10000000;
@@ -142,6 +143,12 @@ extern "user32" fn CreateWindowExW(
     param: ?*anyopaque,
 ) callconv(.winapi) ?HWND;
 extern "user32" fn DefWindowProcW(
+    hwnd: HWND,
+    message: UINT,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) callconv(.winapi) LRESULT;
+extern "user32" fn SendMessageW(
     hwnd: HWND,
     message: UINT,
     wparam: WPARAM,
@@ -275,6 +282,82 @@ const HandleIdentity = struct {
     id: usize,
     generation: u64,
     kind: HandleKind,
+};
+
+const SelectionDispatch = struct {
+    lock: std.Thread.Mutex = .{},
+    refs: usize = 1,
+    active: bool = true,
+    hwnd: ?HWND,
+    owner_thread_id: DWORD,
+
+    fn create(hwnd: HWND) !*SelectionDispatch {
+        const result = try allocator.create(SelectionDispatch);
+        result.* = .{
+            .hwnd = hwnd,
+            .owner_thread_id = GetCurrentThreadId(),
+        };
+        return result;
+    }
+
+    fn acquire(self: *SelectionDispatch) ?*SelectionDispatch {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (!self.active) return null;
+        self.refs += 1;
+        return self;
+    }
+
+    fn release(self: *SelectionDispatch) void {
+        self.lock.lock();
+        self.refs -= 1;
+        const destroy = self.refs == 0;
+        self.lock.unlock();
+        if (destroy) allocator.destroy(self);
+    }
+
+    fn deactivate(self: *SelectionDispatch) void {
+        self.lock.lock();
+        self.active = false;
+        self.hwnd = null;
+        self.refs -= 1;
+        const destroy = self.refs == 0;
+        self.lock.unlock();
+        if (destroy) allocator.destroy(self);
+    }
+
+    fn isActive(self: *SelectionDispatch) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.active;
+    }
+
+    fn invoke(self: *SelectionDispatch, start: usize, end: usize) void {
+        const retained = self.acquire() orelse return;
+        defer retained.release();
+        const hwnd = blk: {
+            self.lock.lock();
+            defer self.lock.unlock();
+            break :blk self.hwnd;
+        } orelse return;
+        var message = SelectionMessage{
+            .dispatch = self,
+            .start = start,
+            .end = end,
+        };
+        _ = SendMessageW(
+            hwnd,
+            WM_UIA_SELECTION,
+            0,
+            @bitCast(@as(isize, @intCast(@intFromPtr(&message)))),
+        );
+    }
+};
+
+const SelectionMessage = struct {
+    dispatch: *SelectionDispatch,
+    start: usize,
+    end: usize,
 };
 
 pub const ExitCallback = *const fn (?*anyopaque, *Surface, i32) callconv(.c) void;
@@ -517,6 +600,7 @@ const SurfaceState = struct {
     dpi: u32 = host_metrics.default_dpi,
     screen_origin: POINT = .{ .x = 0, .y = 0 },
     uia: ?*host_uia.SurfaceProvider = null,
+    selection_dispatch: ?*SelectionDispatch = null,
     creation_in_progress: bool = false,
     pin_count: usize = 0,
     destroying: std.atomic.Value(bool) = .init(false),
@@ -985,13 +1069,18 @@ fn accessibilitySelection(
     start: usize,
     end: usize,
 ) void {
-    const surface: *SurfaceState = @ptrCast(@alignCast(ctx));
-    if (surface.destroying.load(.acquire) or
-        surface.invalidated.load(.acquire) or
-        surface.host.shutting_down.load(.acquire))
-    {
-        return;
-    }
+    const dispatch: *SelectionDispatch = @ptrCast(@alignCast(ctx));
+    dispatch.invoke(start, end);
+}
+
+fn deliverAccessibilitySelection(
+    surface: *SurfaceState,
+    start: usize,
+    end: usize,
+) void {
+    if (GetCurrentThreadId() != surface.host.thread_id) return;
+    if (!beginSurfaceOperation(surface)) return;
+    defer endSurfaceOperation(surface);
     if (surface.options.callbacks.on_accessibility_selection) |callback| {
         beginDispatch(surface);
         defer endDispatch(surface);
@@ -1242,6 +1331,10 @@ fn detachSurfaceProvider(surface: *SurfaceState) void {
         _ = provider.disconnect();
         _ = host_uia.SurfaceProvider.Release(&provider.base);
         surface.uia = null;
+    }
+    if (surface.selection_dispatch) |dispatch| {
+        surface.selection_dispatch = null;
+        dispatch.deactivate();
     }
 }
 
@@ -1745,6 +1838,25 @@ fn surfaceWindowProc(
             }
             return DefWindowProcW(hwnd, message, wparam, lparam);
         },
+        WM_UIA_SELECTION => {
+            if (surface) |value| {
+                if (lparam != 0) {
+                    const message_ptr: *const SelectionMessage =
+                        @ptrFromInt(@as(usize, @bitCast(lparam)));
+                    if (value.selection_dispatch == message_ptr.dispatch and
+                        message_ptr.dispatch.owner_thread_id == GetCurrentThreadId() and
+                        message_ptr.dispatch.isActive())
+                    {
+                        deliverAccessibilitySelection(
+                            value,
+                            message_ptr.start,
+                            message_ptr.end,
+                        );
+                    }
+                }
+            }
+            return 0;
+        },
         WM_DPICHANGED => {
             if (surface) |value| {
                 const next_dpi: u32 = @as(u32, @intCast(wparam)) & 0xffff;
@@ -1964,6 +2076,7 @@ fn surfaceWindowProc(
             setUserData(hwnd, null);
             if (surface) |value| {
                 value.hwnd = null;
+                detachSurfaceProvider(value);
                 destroyRenderer(value);
                 if (!value.destroying.load(.acquire)) {
                     value.invalidated.store(true, .release);
@@ -1998,11 +2111,7 @@ fn destroySurfaceNow(
         retainRetiredSurface(surface.host, surface);
     }
     waitSurfaceAdmissions(surface, remaining_admissions);
-    if (surface.uia) |provider| {
-        _ = provider.disconnect();
-        _ = host_uia.SurfaceProvider.Release(&provider.base);
-        surface.uia = null;
-    }
+    detachSurfaceProvider(surface);
     destroyRenderer(surface);
     if (surface.hwnd) |hwnd| {
         setUserData(hwnd, null);
@@ -2019,11 +2128,7 @@ fn cleanupUnregisteredSurface(
     hwnd: ?HWND,
 ) void {
     surface.destroying.store(true, .release);
-    if (surface.uia) |provider| {
-        _ = provider.disconnect();
-        _ = host_uia.SurfaceProvider.Release(&provider.base);
-        surface.uia = null;
-    }
+    detachSurfaceProvider(surface);
     if (hwnd) |value| {
         setUserData(value, null);
         _ = DestroyWindow(value);
@@ -2372,6 +2477,15 @@ fn createSurface(
     surface.hwnd = hwnd;
     surface.dpi = getDpi(hwnd);
     surface.metrics = metricsFor(surface);
+    surface.selection_dispatch = SelectionDispatch.create(hwnd) catch {
+        return finishUnregisteredSurfaceCreation(
+            state,
+            surface,
+            hwnd,
+            result_out_of_memory,
+            host_admission,
+        );
+    };
     surface.uia = host_uia.SurfaceProvider.create(
         allocator,
         hwnd,
@@ -2383,7 +2497,7 @@ fn createSurface(
                 .cell_width = @floatFromInt(surface.metrics.cell_width),
                 .cell_height = @floatFromInt(surface.metrics.cell_height),
             },
-            .callback_ctx = surface,
+            .callback_ctx = surface.selection_dispatch,
             .on_selection = accessibilitySelection,
         },
     ) catch {
@@ -3630,4 +3744,12 @@ test "retired surface retention survives allocator failure" {
     retainRetiredSurface(&host, &second);
     try std.testing.expectEqual(@as(?*SurfaceState, &second), host.retired_surfaces);
     try std.testing.expectEqual(@as(?*SurfaceState, &first), second.retired_next);
+}
+
+test "selection dispatch retains state across owner-thread teardown" {
+    var dispatch = try SelectionDispatch.create(@ptrFromInt(1));
+    const retained = dispatch.acquire().?;
+    dispatch.deactivate();
+    try std.testing.expect(!retained.isActive());
+    retained.release();
 }

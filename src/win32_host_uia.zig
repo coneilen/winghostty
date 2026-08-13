@@ -138,7 +138,11 @@ fn displayCellWidthRange(text: []const u8, start: usize, end: usize) usize {
     return width;
 }
 
-fn lineColumnAtByte(snapshot: *const Snapshot, byte_index: usize) usize {
+fn lineColumnAtByte(
+    snapshot: *const Snapshot,
+    byte_index: usize,
+    anchor_combining: bool,
+) usize {
     const line_start = lineStartAtByte(snapshot, byte_index);
     const clamped = @min(byte_index, snapshot.text.len);
     const column = displayCellWidthRange(
@@ -146,7 +150,7 @@ fn lineColumnAtByte(snapshot: *const Snapshot, byte_index: usize) usize {
         line_start,
         clamped,
     );
-    if (clamped < snapshot.text.len) {
+    if (anchor_combining and clamped < snapshot.text.len) {
         const current = decodeCodepoint(snapshot.text, clamped);
         const is_control = current.value < 0x20 or current.value == 0x7f;
         if (!is_control and displayCellWidth(current.value) == 0 and column > 0) {
@@ -272,6 +276,7 @@ pub const SurfaceProvider = struct {
     hwnd: com.HWND,
     state_lock: std.Thread.RwLock,
     callback_lock: std.Thread.Mutex,
+    callback_inflight: usize,
     lifetime_lock: std.Thread.Mutex,
     active_calls: usize,
     destroying: bool,
@@ -361,6 +366,7 @@ pub const SurfaceProvider = struct {
             .hwnd = hwnd,
             .state_lock = .{},
             .callback_lock = .{},
+            .callback_inflight = 0,
             .lifetime_lock = .{},
             .active_calls = 0,
             .destroying = false,
@@ -384,7 +390,11 @@ pub const SurfaceProvider = struct {
         fn deinit(self: *CallGuard) void {
             self.provider.lifetime_lock.lock();
             self.provider.active_calls -= 1;
+            const destroy = self.provider.active_calls == 0 and
+                self.provider.destroying and
+                self.provider.refcount.load(.acquire) == 0;
             self.provider.lifetime_lock.unlock();
+            if (destroy) self.provider.destroyStorage();
         }
     };
 
@@ -412,10 +422,8 @@ pub const SurfaceProvider = struct {
     pub fn detach(self: *SurfaceProvider) void {
         self.detached.store(true, .release);
         self.callback_lock.lock();
-        self.state_lock.lock();
         self.on_selection = null;
         self.callback_ctx = null;
-        self.state_lock.unlock();
         self.callback_lock.unlock();
     }
 
@@ -636,20 +644,20 @@ pub const SurfaceProvider = struct {
         if (previous == 1) {
             self.lifetime_lock.lock();
             self.destroying = true;
-            while (self.active_calls != 0) {
-                self.lifetime_lock.unlock();
-                std.Thread.yield() catch {};
-                self.lifetime_lock.lock();
-            }
+            const destroy = self.active_calls == 0;
             self.lifetime_lock.unlock();
-            self.state_lock.lock();
-            self.snapshot.deinit(self.alloc);
-            self.alloc.free(self.name);
-            self.state_lock.unlock();
-            self.alloc.destroy(self);
+            if (destroy) self.destroyStorage();
             return 0;
         }
         return previous - 1;
+    }
+
+    fn destroyStorage(self: *SurfaceProvider) void {
+        self.state_lock.lock();
+        self.snapshot.deinit(self.alloc);
+        self.alloc.free(self.name);
+        self.state_lock.unlock();
+        self.alloc.destroy(self);
     }
 
     fn propertyBstr(self: *SurfaceProvider, text: []const u8) ?com.BSTR {
@@ -690,23 +698,26 @@ pub const SurfaceProvider = struct {
         const next = range.normalized(self.snapshot.utf16_len);
         self.snapshot.selection = next;
         self.snapshot.caret = next.end;
-        const callback = self.on_selection;
-        const callback_ctx = self.callback_ctx;
         self.state_lock.unlock();
+        var callback: ?SelectionCallback = null;
+        var callback_ctx: ?*anyopaque = null;
         self.callback_lock.lock();
-        self.state_lock.lockShared();
-        const still_attached = !self.detached.load(.acquire);
-        const current_callback = self.on_selection;
-        const current_ctx = self.callback_ctx;
-        self.state_lock.unlockShared();
-        if (still_attached and callback != null and
-            current_callback == callback and current_ctx == callback_ctx)
-        {
-            if (callback) |selection_callback| {
-                if (callback_ctx) |ctx| selection_callback(ctx, next.start, next.end);
+        if (!self.detached.load(.acquire)) {
+            callback = self.on_selection;
+            callback_ctx = self.callback_ctx;
+            if (callback != null and callback_ctx != null) {
+                self.callback_inflight += 1;
             }
         }
         self.callback_lock.unlock();
+        if (callback) |selection_callback| {
+            if (callback_ctx) |ctx| {
+                selection_callback(ctx, next.start, next.end);
+                self.callback_lock.lock();
+                self.callback_inflight -= 1;
+                self.callback_lock.unlock();
+            }
+        }
         raiseAutomationEvent(self, 20014);
         return com.S_OK;
     }
@@ -1400,10 +1411,10 @@ const SurfaceTextRangeProvider = struct {
             var line_end = line_start;
             while (line_end < bytes.end and self.snapshot.text[line_end] != '\n') line_end += 1;
             const start_column = if (line_index == 0)
-                lineColumnAtByte(&self.snapshot, bytes.start)
+                lineColumnAtByte(&self.snapshot, bytes.start, true)
             else
                 0;
-            const end_column = lineColumnAtByte(&self.snapshot, line_end);
+            const end_column = lineColumnAtByte(&self.snapshot, line_end, false);
             const line_width = end_column -| start_column;
             const rectangle = boundingRectangle(
                 metrics,
@@ -2075,6 +2086,68 @@ test "bounding rectangles use display-cell columns for Unicode text" {
     _ = com.SafeArrayDestroy(combining_start_rectangles);
 }
 
+test "range start anchors combining marks without shrinking wide end boundaries" {
+    var provider = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(1), .{
+        .text = "界\u{0301}x",
+        .metrics = .{
+            .cell_width = 10,
+            .cell_height = 20,
+            .origin_x = 100,
+            .origin_y = 200,
+        },
+    });
+    defer _ = SurfaceProvider.Release(&provider.base);
+
+    var wide = try SurfaceTextRangeProvider.create(
+        std.testing.allocator,
+        provider,
+        .{ .start = 0, .end = 1 },
+    );
+    defer _ = SurfaceTextRangeProvider.Release(&wide.base);
+    var wide_rectangles: ?*com.SAFEARRAY = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        SurfaceTextRangeProvider.GetBoundingRectangles(&wide.base, &wide_rectangles),
+    );
+    var wide_width: f64 = 0;
+    var width_index: i32 = 2;
+    try std.testing.expectEqual(
+        com.S_OK,
+        com.SafeArrayGetElement(wide_rectangles.?, &width_index, &wide_width),
+    );
+    try std.testing.expectEqual(@as(f64, 20), wide_width);
+    _ = com.SafeArrayDestroy(wide_rectangles);
+
+    var combining_start = try SurfaceTextRangeProvider.create(
+        std.testing.allocator,
+        provider,
+        .{ .start = 1, .end = 3 },
+    );
+    defer _ = SurfaceTextRangeProvider.Release(&combining_start.base);
+    var combining_rectangles: ?*com.SAFEARRAY = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        SurfaceTextRangeProvider.GetBoundingRectangles(
+            &combining_start.base,
+            &combining_rectangles,
+        ),
+    );
+    var combining_left: f64 = 0;
+    var combining_width: f64 = 0;
+    var left_index: i32 = 0;
+    try std.testing.expectEqual(
+        com.S_OK,
+        com.SafeArrayGetElement(combining_rectangles.?, &left_index, &combining_left),
+    );
+    try std.testing.expectEqual(
+        com.S_OK,
+        com.SafeArrayGetElement(combining_rectangles.?, &width_index, &combining_width),
+    );
+    try std.testing.expectEqual(@as(f64, 100), combining_left);
+    try std.testing.expectEqual(@as(f64, 30), combining_width);
+    _ = com.SafeArrayDestroy(combining_rectangles);
+}
+
 test "display-cell geometry covers wide Unicode outside the BMP" {
     var provider = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(1), .{
         .text = "\u{1b000}x",
@@ -2235,6 +2308,31 @@ test "selection callbacks are detached without post-teardown calls" {
 
     try std.testing.expect(callback_state.callbacks.load(.acquire) > 0);
     try std.testing.expectEqual(@as(usize, 0), callback_state.after_detach.load(.acquire));
+}
+
+test "selection callback may detach and release its provider without deadlock" {
+    const CallbackTeardown = struct {
+        provider: *SurfaceProvider,
+        calls: usize = 0,
+
+        fn run(ctx: *anyopaque, _: usize, _: usize) void {
+            const state: *@This() = @ptrCast(@alignCast(ctx));
+            state.calls += 1;
+            state.provider.detach();
+            _ = SurfaceProvider.Release(&state.provider.base);
+        }
+    };
+    var provider = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(1), .{
+        .text = "initial",
+    });
+    var state = CallbackTeardown{ .provider = provider };
+    provider.callback_ctx = &state;
+    provider.on_selection = CallbackTeardown.run;
+    try std.testing.expectEqual(
+        com.S_OK,
+        provider.setSelectedRange(.{ .start = 0, .end = 1 }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
 }
 
 test "caret ranges expose empty bounding rectangles" {
