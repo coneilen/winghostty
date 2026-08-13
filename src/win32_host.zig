@@ -2,6 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const win32_types = @import("apprt/win32_types.zig");
+const win32_context = @import("renderer/win32_context.zig");
+const win32_presentation = @import("renderer/win32_presentation.zig");
 
 comptime {
     if (builtin.target.os.tag != .windows) {
@@ -16,6 +18,7 @@ const HBRUSH = win32_types.HBRUSH;
 const HCURSOR = win32_types.HCURSOR;
 const HICON = win32_types.HICON;
 const HDC = win32_types.HDC;
+const HGLRC = win32_types.HGLRC;
 const LPCWSTR = win32_types.LPCWSTR;
 const LPARAM = win32_types.LPARAM;
 const WPARAM = win32_types.WPARAM;
@@ -105,6 +108,7 @@ extern "user32" fn SetWindowPos(
 ) callconv(.winapi) BOOL;
 extern "user32" fn ShowWindow(hwnd: HWND, command: i32) callconv(.winapi) BOOL;
 extern "kernel32" fn GetCurrentThreadId() callconv(.winapi) DWORD;
+extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
 extern "kernel32" fn GetModuleHandleW(module: ?LPCWSTR) callconv(.winapi) HINSTANCE;
 
 pub const Result = i32;
@@ -117,6 +121,9 @@ const result_out_of_memory: Result = 3;
 const result_shutting_down: Result = 4;
 const result_win32_error: Result = 5;
 const result_surface_invalidated: Result = 6;
+const result_renderer_error: Result = 7;
+const result_context_error: Result = 8;
+const result_present_error: Result = 9;
 
 const theme_system: Theme = 0;
 
@@ -207,6 +214,14 @@ const SurfaceState = struct {
     parent: HWND,
     hwnd: ?HWND = null,
     options: OwnedOptions,
+    options_mutex: std.Thread.Mutex = .{},
+    renderer: ?*win32_context.Context = null,
+    renderer_mutex: std.Thread.Mutex = .{},
+    renderer_done: std.Thread.Condition = .{},
+    active_renderer_operations: usize = 0,
+    renderer_destroying: bool = false,
+    last_error: std.atomic.Value(DWORD) = .init(0),
+    present_count: std.atomic.Value(u64) = .init(0),
     invalidated: bool = false,
     creation_in_progress: bool = false,
     destroying: bool = false,
@@ -218,6 +233,8 @@ const HostState = struct {
     shutting_down: bool = false,
     deinitialize_requested: bool = false,
     creation_depth: usize = 0,
+    render_thread_mutex: std.Thread.Mutex = .{},
+    render_thread_id: DWORD = 0,
 };
 
 fn duplicate(value: ?[*:0]const u8) !?[:0]u8 {
@@ -254,6 +271,116 @@ fn checkSurface(surface: *SurfaceState) Result {
     if (result != result_ok) return result;
     if (surface.invalidated) return result_surface_invalidated;
     return result_ok;
+}
+
+fn checkRenderSurface(surface: *SurfaceState) Result {
+    if (surface.host.shutting_down) return result_shutting_down;
+    if (surface.invalidated or surface.destroying) return result_surface_invalidated;
+    return result_ok;
+}
+
+fn claimRenderThread(host: *HostState) Result {
+    if (host.shutting_down) return result_shutting_down;
+    const thread_id = GetCurrentThreadId();
+    host.render_thread_mutex.lock();
+    defer host.render_thread_mutex.unlock();
+    if (host.render_thread_id == 0) {
+        host.render_thread_id = thread_id;
+        return result_ok;
+    }
+    return if (host.render_thread_id == thread_id)
+        result_ok
+    else
+        result_wrong_thread;
+}
+
+fn rendererResult(surface: *SurfaceState, err: win32_context.Error) Result {
+    surface.last_error.store(GetLastError(), .release);
+    return switch (err) {
+        error.WrongThread => result_wrong_thread,
+        error.Destroying => result_shutting_down,
+        error.SwapBuffersFailed => result_present_error,
+        error.MakeCurrentFailed => result_context_error,
+        else => result_renderer_error,
+    };
+}
+
+fn destroyRenderer(surface: *SurfaceState) void {
+    surface.renderer_mutex.lock();
+    surface.renderer_destroying = true;
+    while (surface.active_renderer_operations != 0) {
+        surface.renderer_done.wait(&surface.renderer_mutex);
+    }
+    const renderer = surface.renderer;
+    surface.renderer_mutex.unlock();
+
+    if (renderer) |value| {
+        value.deinit();
+        allocator.destroy(value);
+    }
+
+    surface.renderer_mutex.lock();
+    surface.renderer = null;
+    surface.renderer_destroying = false;
+    surface.renderer_done.broadcast();
+    surface.renderer_mutex.unlock();
+}
+
+fn beginRendererOperation(surface: *SurfaceState) ?*win32_context.Context {
+    if (surface.host.shutting_down) return null;
+    surface.renderer_mutex.lock();
+    defer surface.renderer_mutex.unlock();
+    if (surface.invalidated or surface.destroying or surface.renderer_destroying) {
+        return null;
+    }
+    const renderer = surface.renderer orelse return null;
+    surface.active_renderer_operations += 1;
+    return renderer;
+}
+
+fn beginClearRendererOperation(surface: *SurfaceState) ?*win32_context.Context {
+    surface.renderer_mutex.lock();
+    defer surface.renderer_mutex.unlock();
+    if (surface.host.render_thread_id != GetCurrentThreadId()) return null;
+    const renderer = surface.renderer orelse return null;
+    surface.active_renderer_operations += 1;
+    return renderer;
+}
+
+fn endRendererOperation(surface: *SurfaceState) void {
+    surface.renderer_mutex.lock();
+    std.debug.assert(surface.active_renderer_operations > 0);
+    surface.active_renderer_operations -= 1;
+    if (surface.active_renderer_operations == 0) {
+        surface.renderer_done.broadcast();
+    }
+    surface.renderer_mutex.unlock();
+}
+
+fn rendererHdc(surface: *SurfaceState) HDC {
+    surface.renderer_mutex.lock();
+    defer surface.renderer_mutex.unlock();
+    if (surface.invalidated or surface.destroying or surface.renderer_destroying) {
+        return null;
+    }
+    return if (surface.renderer) |renderer| renderer.hdc else null;
+}
+
+fn rendererHglrc(surface: *SurfaceState) HGLRC {
+    surface.renderer_mutex.lock();
+    defer surface.renderer_mutex.unlock();
+    if (surface.invalidated or surface.destroying or surface.renderer_destroying) {
+        return null;
+    }
+    return if (surface.renderer) |renderer| renderer.hglrc else null;
+}
+
+fn storeRendererError(surface: *SurfaceState) void {
+    surface.last_error.store(GetLastError(), .release);
+}
+
+fn loadRendererError(surface: *SurfaceState) DWORD {
+    return surface.last_error.load(.acquire);
 }
 
 fn registerSurfaceClass() void {
@@ -342,6 +469,7 @@ fn surfaceWindowProc(
             setUserData(hwnd, null);
             if (surface) |value| {
                 value.hwnd = null;
+                destroyRenderer(value);
                 if (!value.destroying) value.invalidated = true;
             }
             return DefWindowProcW(hwnd, message, wparam, lparam);
@@ -368,6 +496,7 @@ fn destroySurfaceNow(surface: *SurfaceState) void {
         _ = DestroyWindow(hwnd);
         surface.hwnd = null;
     }
+    destroyRenderer(surface);
     surface.options.deinit();
     allocator.destroy(surface);
 }
@@ -387,6 +516,7 @@ fn cleanupUnregisteredSurface(
         _ = DestroyWindow(value);
         surface.hwnd = null;
     }
+    destroyRenderer(surface);
     surface.options.deinit();
     allocator.destroy(surface);
 }
@@ -482,6 +612,9 @@ pub export fn winghostty_host_create_surface(
     if (source.font_scale <= 0 or !std.math.isFinite(source.font_scale)) {
         return result_invalid_argument;
     }
+    if (source.theme < 0 or source.theme > 2) {
+        return result_invalid_argument;
+    }
     if (source.bounds.width > std.math.maxInt(i32) or
         source.bounds.height > std.math.maxInt(i32))
     {
@@ -532,6 +665,33 @@ pub export fn winghostty_host_create_surface(
             result_shutting_down,
         );
     }
+
+    const renderer = allocator.create(win32_context.Context) catch {
+        return finishUnregisteredSurfaceCreation(
+            state,
+            surface,
+            hwnd,
+            result_out_of_memory,
+        );
+    };
+    renderer.* = win32_context.Context.init(hwnd) catch |err| {
+        storeRendererError(surface);
+        allocator.destroy(renderer);
+        return finishUnregisteredSurfaceCreation(
+            state,
+            surface,
+            hwnd,
+            switch (err) {
+                error.GetDCFailed,
+                error.ChoosePixelFormatFailed,
+                error.SetPixelFormatFailed,
+                => result_renderer_error,
+                error.CreateContextFailed => result_context_error,
+                else => result_renderer_error,
+            },
+        );
+    };
+    surface.renderer = renderer;
 
     state.surfaces.append(allocator, surface) catch {
         return finishUnregisteredSurfaceCreation(
@@ -587,7 +747,9 @@ pub export fn winghostty_surface_set_bounds(
     if (next.width > std.math.maxInt(i32) or next.height > std.math.maxInt(i32)) {
         return result_invalid_argument;
     }
+    state.options_mutex.lock();
     state.options.bounds = next.*;
+    state.options_mutex.unlock();
     const hwnd = state.hwnd orelse return result_shutting_down;
     if (SetWindowPos(
         hwnd,
@@ -638,7 +800,10 @@ pub export fn winghostty_surface_set_theme(
     const state = surfaceState(surface) orelse return result_invalid_argument;
     const result = checkSurface(state);
     if (result != result_ok) return result;
+    if (theme < 0 or theme > 2) return result_invalid_argument;
+    state.options_mutex.lock();
     state.options.theme = theme;
+    state.options_mutex.unlock();
     if (state.hwnd) |hwnd| _ = InvalidateRect(hwnd, null, 0);
     return result_ok;
 }
@@ -653,8 +818,84 @@ pub export fn winghostty_surface_set_font_scale(
     if (font_scale <= 0 or !std.math.isFinite(font_scale)) {
         return result_invalid_argument;
     }
+    state.options_mutex.lock();
     state.options.font_scale = font_scale;
+    state.options_mutex.unlock();
     if (state.hwnd) |hwnd| _ = InvalidateRect(hwnd, null, 0);
+    return result_ok;
+}
+
+pub export fn winghostty_surface_make_current(surface: ?*Surface) Result {
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    const result = checkRenderSurface(state);
+    if (result != result_ok) return result;
+    const render_result = claimRenderThread(state.host);
+    if (render_result != result_ok) return render_result;
+    const renderer = beginRendererOperation(state) orelse
+        return if (state.host.shutting_down)
+            result_shutting_down
+        else
+            result_surface_invalidated;
+    defer endRendererOperation(state);
+    renderer.makeCurrent() catch |err| return rendererResult(state, err);
+    return result_ok;
+}
+
+pub export fn winghostty_surface_clear_current(surface: ?*Surface) Result {
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    if (GetCurrentThreadId() != state.host.render_thread_id) {
+        return result_wrong_thread;
+    }
+    const renderer = beginClearRendererOperation(state) orelse
+        return result_surface_invalidated;
+    defer endRendererOperation(state);
+    renderer.clearCurrent();
+    return result_ok;
+}
+
+pub export fn winghostty_surface_render(surface: ?*Surface) Result {
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    if (state.invalidated or state.destroying) return result_surface_invalidated;
+    const render_result = claimRenderThread(state.host);
+    if (render_result != result_ok) return render_result;
+    const renderer = beginRendererOperation(state) orelse
+        return if (state.host.shutting_down)
+            result_shutting_down
+        else
+            result_surface_invalidated;
+    defer endRendererOperation(state);
+
+    state.options_mutex.lock();
+    const render_state = win32_presentation.RenderState{
+        .theme = @enumFromInt(state.options.theme),
+        .font_scale = state.options.font_scale,
+        .width = state.options.bounds.width,
+        .height = state.options.bounds.height,
+    };
+    state.options_mutex.unlock();
+
+    win32_presentation.render(renderer, render_state) catch |err| {
+        return rendererResult(state, err);
+    };
+    _ = state.present_count.fetchAdd(1, .release);
+    return result_ok;
+}
+
+pub export fn winghostty_surface_present(surface: ?*Surface) Result {
+    const state = surfaceState(surface) orelse return result_invalid_argument;
+    if (state.invalidated or state.destroying) return result_surface_invalidated;
+    const render_result = claimRenderThread(state.host);
+    if (render_result != result_ok) return render_result;
+    const renderer = beginRendererOperation(state) orelse
+        return if (state.host.shutting_down)
+            result_shutting_down
+        else
+            result_surface_invalidated;
+    defer endRendererOperation(state);
+    win32_presentation.present(renderer) catch |err| {
+        return rendererResult(state, err);
+    };
+    _ = state.present_count.fetchAdd(1, .release);
     return result_ok;
 }
 
@@ -761,6 +1002,42 @@ pub export fn winghostty_surface_get_hwnd(surface: ?*const Surface) ?HWND {
     const state = surfaceState(@constCast(surface)) orelse return null;
     if (checkSurface(state) != result_ok or state.destroying) return null;
     return state.hwnd;
+}
+
+pub export fn winghostty_surface_get_hdc(surface: ?*const Surface) HDC {
+    const state = surfaceState(@constCast(surface)) orelse return null;
+    return rendererHdc(state);
+}
+
+pub export fn winghostty_surface_get_hglrc(surface: ?*const Surface) HGLRC {
+    const state = surfaceState(@constCast(surface)) orelse return null;
+    return rendererHglrc(state);
+}
+
+pub export fn winghostty_host_get_ui_thread_id(host: ?*const Host) DWORD {
+    const state = hostState(@constCast(host)) orelse return 0;
+    return state.thread_id;
+}
+
+pub export fn winghostty_host_get_render_thread_id(host: ?*const Host) DWORD {
+    const state = hostState(@constCast(host)) orelse return 0;
+    state.render_thread_mutex.lock();
+    defer state.render_thread_mutex.unlock();
+    return state.render_thread_id;
+}
+
+pub export fn winghostty_surface_get_last_error(
+    surface: ?*const Surface,
+) DWORD {
+    const state = surfaceState(@constCast(surface)) orelse return 0;
+    return loadRendererError(state);
+}
+
+pub export fn winghostty_surface_get_present_count(
+    surface: ?*const Surface,
+) u64 {
+    const state = surfaceState(@constCast(surface)) orelse return 0;
+    return state.present_count.load(.acquire);
 }
 
 pub export fn winghostty_host_drain(

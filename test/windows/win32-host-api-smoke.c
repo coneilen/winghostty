@@ -373,6 +373,8 @@ int main(void) {
     HWND second_hwnd = winghostty_surface_get_hwnd(second);
     DestroyWindow(context.parent);
     if (winghostty_surface_get_hwnd(second) != NULL ||
+        winghostty_surface_get_hdc(second) != NULL ||
+        winghostty_surface_get_hglrc(second) != NULL ||
         IsWindow(second_hwnd) ||
         winghostty_surface_notify_redraw(second) != WINGHOSTTY_SURFACE_INVALIDATED ||
         winghostty_surface_destroy(second) != WINGHOSTTY_OK ||

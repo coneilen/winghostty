@@ -247,3 +247,14 @@ ghostty_info: <version string>
 The ghostty_info call verifies the DLL loads and the CRT is initialized.
 Before the fix, loading the DLL would crash with "access violation writing
 0x0000000000000024".
+
+## run-win32-host-renderer.ps1
+
+External host contract for the embeddable renderer. It validates caller-owned
+parenting, child HWND/HDC/HGLRC ownership, UI/render thread affinity,
+visibility/bounds/theme/font-scale updates, synchronous WGL presentation and
+teardown, plus 100 create/destroy cycles with USER/GDI handle counts.
+
+```powershell
+.\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\test\windows\run-win32-host-renderer.ps1
+```

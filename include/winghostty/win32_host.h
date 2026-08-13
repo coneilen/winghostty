@@ -20,6 +20,9 @@ typedef int32_t winghostty_result;
 #define WINGHOSTTY_SHUTTING_DOWN ((winghostty_result)4)
 #define WINGHOSTTY_WIN32_ERROR ((winghostty_result)5)
 #define WINGHOSTTY_SURFACE_INVALIDATED ((winghostty_result)6)
+#define WINGHOSTTY_RENDERER_ERROR ((winghostty_result)7)
+#define WINGHOSTTY_CONTEXT_ERROR ((winghostty_result)8)
+#define WINGHOSTTY_PRESENT_ERROR ((winghostty_result)9)
 
 typedef int32_t winghostty_theme;
 
@@ -115,6 +118,27 @@ winghostty_result winghostty_surface_set_theme(
 winghostty_result winghostty_surface_set_font_scale(
     winghostty_surface *surface,
     float font_scale
+);
+
+/*
+ * Renderer ownership is explicit. Window creation and surface mutation are
+ * UI-thread-affine. The first render-context operation claims the host's
+ * render thread; subsequent render operations must use that same thread. A
+ * pending teardown may be released by calling clear_current from the owning
+ * render thread.
+ */
+winghostty_result winghostty_surface_make_current(winghostty_surface *surface);
+winghostty_result winghostty_surface_clear_current(winghostty_surface *surface);
+winghostty_result winghostty_surface_render(winghostty_surface *surface);
+winghostty_result winghostty_surface_present(winghostty_surface *surface);
+
+HDC winghostty_surface_get_hdc(const winghostty_surface *surface);
+HGLRC winghostty_surface_get_hglrc(const winghostty_surface *surface);
+uint32_t winghostty_host_get_ui_thread_id(const winghostty_host *host);
+uint32_t winghostty_host_get_render_thread_id(const winghostty_host *host);
+uint32_t winghostty_surface_get_last_error(const winghostty_surface *surface);
+uint64_t winghostty_surface_get_present_count(
+    const winghostty_surface *surface
 );
 
 winghostty_result winghostty_surface_notify_exit(
