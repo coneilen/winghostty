@@ -66,6 +66,13 @@ typedef struct input_context {
     char clipboard[128];
 } input_context;
 
+typedef struct input_admission_stress {
+    winghostty_surface *surface;
+    volatile LONG stop;
+    volatile LONG entered;
+    volatile LONG failures;
+} input_admission_stress;
+
 static void record(input_context *context, void *user_data);
 
 static void maybe_deinit_legacy(input_context *context, int kind) {
@@ -483,6 +490,222 @@ static int run_link_reentrant_case(
         : 1;
 }
 
+static int input_result_allowed(winghostty_result result) {
+    return result >= WINGHOSTTY_OK && result <= WINGHOSTTY_CLIPBOARD_UNAVAILABLE;
+}
+
+static void record_input_result(
+    input_admission_stress *stress,
+    winghostty_result result
+) {
+    if (!input_result_allowed(result)) {
+        InterlockedIncrement(&stress->failures);
+    }
+}
+
+static DWORD WINAPI input_admission_stress_thread(void *parameter) {
+    input_admission_stress *stress = (input_admission_stress *)parameter;
+    char text[] = "stress";
+    char name[] = "stress";
+    char output[64];
+    uint64_t written = 0;
+    InterlockedExchange(&stress->entered, 1);
+    for (int i = 0; i < 4096 &&
+                    InterlockedCompareExchange(&stress->stop, 0, 0) == 0;
+         ++i) {
+        record_input_result(
+            stress,
+            winghostty_surface_paste_text(stress->surface, text, 6, 0)
+        );
+        record_input_result(
+            stress,
+            winghostty_surface_read_clipboard(
+                stress->surface,
+                WINGHOSTTY_CLIPBOARD_TEXT
+            )
+        );
+        record_input_result(
+            stress,
+            winghostty_surface_write_clipboard(
+                stress->surface,
+                WINGHOSTTY_CLIPBOARD_TEXT,
+                text,
+                6
+            )
+        );
+        record_input_result(
+            stress,
+            winghostty_surface_clipboard_read(
+                stress->surface,
+                WINGHOSTTY_CLIPBOARD_TEXT
+            )
+        );
+        record_input_result(
+            stress,
+            winghostty_surface_clipboard_write(
+                stress->surface,
+                WINGHOSTTY_CLIPBOARD_TEXT,
+                text,
+                6
+            )
+        );
+        record_input_result(
+            stress,
+            winghostty_surface_set_keyboard_layout(stress->surface, 0)
+        );
+        record_input_result(
+            stress,
+            winghostty_surface_ime_update(stress->surface, text, 6, 0)
+        );
+        record_input_result(
+            stress,
+            winghostty_surface_set_link(stress->surface, "https://stress")
+        );
+        record_input_result(
+            stress,
+            winghostty_surface_clear_link(stress->surface)
+        );
+        record_input_result(
+            stress,
+            winghostty_surface_set_selection_text(stress->surface, text, 6)
+        );
+        record_input_result(
+            stress,
+            winghostty_surface_clear_selection(stress->surface)
+        );
+        record_input_result(
+            stress,
+            winghostty_surface_copy_selection(stress->surface)
+        );
+        record_input_result(
+            stress,
+            winghostty_surface_notify_accessibility_name(
+                stress->surface,
+                name
+            )
+        );
+        record_input_result(
+            stress,
+            winghostty_surface_notify_accessibility_text(
+                stress->surface,
+                text,
+                6,
+                0,
+                6,
+                0,
+                0,
+                0
+            )
+        );
+        record_input_result(
+            stress,
+            winghostty_surface_notify_terminal_text(
+                stress->surface,
+                text,
+                6,
+                0,
+                6,
+                0,
+                0,
+                0
+            )
+        );
+        record_input_result(
+            stress,
+            winghostty_surface_notify_accessibility_focus(
+                stress->surface,
+                1
+            )
+        );
+        record_input_result(
+            stress,
+            winghostty_surface_set_accessibility_role(stress->surface, 0)
+        );
+        written = 0;
+        record_input_result(
+            stress,
+            winghostty_surface_copy_accessibility_range(
+                stress->surface,
+                0,
+                6,
+                output,
+                sizeof(output),
+                &written
+            )
+        );
+    }
+    return 0;
+}
+
+static int run_input_admission_stress(
+    HWND parent,
+    const winghostty_surface_options_v2 *template_options
+) {
+    for (int cycle = 0; cycle < 64; ++cycle) {
+        winghostty_host *host = NULL;
+        winghostty_surface *surface = NULL;
+        winghostty_surface_options_v2 options = *template_options;
+        input_admission_stress stress = {0};
+        options.focus = 0;
+        options.visible = 0;
+        options.user_data = NULL;
+        options.callbacks = (winghostty_callbacks_v2){0};
+        options.input_callbacks = (winghostty_input_callbacks){0};
+        if (winghostty_host_initialize(&host) != WINGHOSTTY_OK ||
+            winghostty_host_create_surface_v2(
+                host,
+                parent,
+                &options,
+                &surface
+            ) != WINGHOSTTY_OK ||
+            surface == NULL) {
+            if (host != NULL) winghostty_host_deinitialize(host);
+            return 1;
+        }
+
+        stress.surface = surface;
+        HANDLE thread = CreateThread(
+            NULL,
+            0,
+            input_admission_stress_thread,
+            &stress,
+            0,
+            NULL
+        );
+        if (thread == NULL) {
+            winghostty_surface_destroy(surface);
+            winghostty_host_deinitialize(host);
+            return 1;
+        }
+        for (int i = 0; i < 100 && stress.entered == 0; ++i) {
+            Sleep(1);
+        }
+        if (stress.entered == 0) {
+            InterlockedExchange(&stress.stop, 1);
+            WaitForSingleObject(thread, 10000);
+            CloseHandle(thread);
+            winghostty_surface_destroy(surface);
+            winghostty_host_deinitialize(host);
+            return 1;
+        }
+        if (winghostty_surface_destroy(surface) != WINGHOSTTY_OK ||
+            winghostty_host_deinitialize(host) != WINGHOSTTY_OK) {
+            InterlockedExchange(&stress.stop, 1);
+            WaitForSingleObject(thread, 10000);
+            CloseHandle(thread);
+            return 1;
+        }
+        InterlockedExchange(&stress.stop, 1);
+        if (WaitForSingleObject(thread, 10000) != WAIT_OBJECT_0) {
+            CloseHandle(thread);
+            return 1;
+        }
+        CloseHandle(thread);
+        if (stress.failures != 0) return 1;
+    }
+    return 0;
+}
+
 int main(void) {
     const wchar_t class_name[] = L"WinghosttyHostApiInput";
     WNDCLASSW parent_class = {
@@ -794,6 +1017,9 @@ int main(void) {
         }
     }
     if (context.link_reentrant_callbacks != 3) return fail();
+    if (run_input_admission_stress(context.parent, &options) != 0) {
+        return fail();
+    }
 
     DestroyWindow(context.parent);
     UnregisterClassW(class_name, parent_class.hInstance);

@@ -286,6 +286,14 @@ pub const Context = struct {
         if (persistent_context == self) persistent_context = null;
     }
 
+    pub fn ownsPersistentCurrent(self: *Context) bool {
+        self.operation_mutex.lock();
+        defer self.operation_mutex.unlock();
+        return self.persistent_current and
+            self.render_thread_id == GetCurrentThreadId() and
+            currentBinding().matches(self);
+    }
+
     pub fn present(self: *Context) Error!void {
         try self.claimRenderThread();
         self.beginOperation() catch |err| return err;

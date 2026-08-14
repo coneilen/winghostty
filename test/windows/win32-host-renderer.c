@@ -64,6 +64,15 @@ typedef struct teardown_stress {
     volatile LONG failures;
 } teardown_stress;
 
+typedef struct clear_admission_stress {
+    winghostty_surface *surface;
+    volatile LONG stop;
+    volatile LONG entered;
+    volatile LONG failures;
+    volatile LONG clear_ok;
+    volatile LONG clear_rejected;
+} clear_admission_stress;
+
 typedef struct process_heap_usage {
     SIZE_T busy_blocks;
     SIZE_T busy_bytes;
@@ -395,6 +404,112 @@ static int read_process_heap_usage(process_heap_usage *usage) {
     DWORD error = GetLastError();
     HeapUnlock(heap);
     return error == ERROR_NO_MORE_ITEMS;
+}
+
+static int clear_result_allowed(winghostty_result result) {
+    return result == WINGHOSTTY_OK ||
+        result == WINGHOSTTY_INVALID_ARGUMENT ||
+        result == WINGHOSTTY_SHUTTING_DOWN ||
+        result == WINGHOSTTY_SURFACE_INVALIDATED;
+}
+
+static DWORD WINAPI clear_admission_stress_thread(void *parameter) {
+    clear_admission_stress *stress = (clear_admission_stress *)parameter;
+    winghostty_result result = winghostty_surface_make_current(stress->surface);
+    if (result != WINGHOSTTY_OK) {
+        InterlockedIncrement(&stress->failures);
+        return 0;
+    }
+    InterlockedExchange(&stress->entered, 1);
+    while (InterlockedCompareExchange(&stress->stop, 0, 0) == 0) {
+        result = winghostty_surface_clear_current(stress->surface);
+        if (result == WINGHOSTTY_OK) {
+            InterlockedIncrement(&stress->clear_ok);
+        } else {
+            if (!clear_result_allowed(result)) {
+                InterlockedIncrement(&stress->failures);
+            }
+            InterlockedIncrement(&stress->clear_rejected);
+        }
+    }
+    return 0;
+}
+
+static int run_clear_admission_stress(HWND parent) {
+    winghostty_surface_options options;
+    winghostty_surface_options_init(&options);
+    options.visible = 0;
+    options.bounds.width = 80;
+    options.bounds.height = 40;
+
+    for (int cycle = 0; cycle < 64; ++cycle) {
+        winghostty_host *host = NULL;
+        winghostty_surface *surface = NULL;
+        clear_admission_stress stress = {0};
+        if (winghostty_host_initialize(&host) != WINGHOSTTY_OK ||
+            winghostty_host_create_surface(
+                host,
+                parent,
+                &options,
+                &surface
+            ) != WINGHOSTTY_OK ||
+            surface == NULL) {
+            if (host != NULL) winghostty_host_deinitialize(host);
+            return fail("clear-admission setup failed");
+        }
+
+        stress.surface = surface;
+        HANDLE thread = CreateThread(
+            NULL,
+            0,
+            clear_admission_stress_thread,
+            &stress,
+            0,
+            NULL
+        );
+        if (thread == NULL) {
+            winghostty_surface_destroy(surface);
+            winghostty_host_deinitialize(host);
+            return fail("clear-admission worker creation failed");
+        }
+        for (int i = 0; i < 100 && stress.entered == 0; ++i) {
+            Sleep(1);
+        }
+        if (stress.entered == 0) {
+            InterlockedExchange(&stress.stop, 1);
+            WaitForSingleObject(thread, 10000);
+            CloseHandle(thread);
+            winghostty_surface_destroy(surface);
+            winghostty_host_deinitialize(host);
+            return fail("clear-admission worker did not enter");
+        }
+        Sleep(1);
+        if (winghostty_surface_destroy(surface) != WINGHOSTTY_OK) {
+            InterlockedExchange(&stress.stop, 1);
+            WaitForSingleObject(thread, 10000);
+            CloseHandle(thread);
+            winghostty_host_deinitialize(host);
+            return fail("clear-admission destroy failed");
+        }
+        Sleep(1);
+        InterlockedExchange(&stress.stop, 1);
+        if (WaitForSingleObject(thread, 10000) != WAIT_OBJECT_0) {
+            CloseHandle(thread);
+            winghostty_host_deinitialize(host);
+            return fail("clear-admission worker did not finish");
+        }
+        CloseHandle(thread);
+        if (stress.failures != 0 ||
+            stress.clear_ok == 0 ||
+            stress.clear_rejected == 0) {
+            winghostty_host_deinitialize(host);
+            return fail("clear-admission pre-admitted/late race failed");
+        }
+        if (winghostty_host_deinitialize(host) != WINGHOSTTY_OK) {
+            return fail("clear-admission host teardown failed");
+        }
+    }
+    return 0;
 }
 
 static int current_matches(winghostty_surface *surface) {
@@ -1087,6 +1202,10 @@ int main(void) {
         return 1;
     }
     if (run_numeric_handle_heap_contract(state.parent) != 0) {
+        DestroyWindow(state.parent);
+        return 1;
+    }
+    if (run_clear_admission_stress(state.parent) != 0) {
         DestroyWindow(state.parent);
         return 1;
     }

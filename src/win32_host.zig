@@ -783,13 +783,6 @@ fn hostState(handle: ?*Host) ?*HostState {
     return hostStateFromId(@intFromPtr(pointer));
 }
 
-fn surfaceState(handle: ?*Surface) ?*SurfaceState {
-    const pointer = handle orelse return null;
-    admission_registry_mutex.lock();
-    defer admission_registry_mutex.unlock();
-    return surfaceStateFromId(@intFromPtr(pointer));
-}
-
 const HostAdmission = struct {
     state: *HostState,
     released: bool = false,
@@ -911,7 +904,19 @@ fn admitClearSurface(handle: ?*Surface) ?SurfaceAdmission {
     const surface = surfaceStateFromId(@intFromPtr(pointer)) orelse return null;
     surface.admission.mutex.lock();
     defer surface.admission.mutex.unlock();
-    if (!surface.admission.clearable) return null;
+    surface.renderer_mutex.lock();
+    defer surface.renderer_mutex.unlock();
+    const renderer = surface.renderer orelse return null;
+    const persistent_release = renderer.ownsPersistentCurrent();
+    if (!surface.admission.clearable or
+        (!persistent_release and
+            (surface.destroying.load(.acquire) or
+                surface.invalidated.load(.acquire) or
+                surface.host.shutting_down.load(.acquire) or
+                surface.renderer_destroying)))
+    {
+        return null;
+    }
     surface.admission.clear_admitted += 1;
     return .{
         .surface = surface,
@@ -1000,6 +1005,15 @@ fn disableClearAdmissionAndWait(
     while (state.admission.admitted > remaining or
         state.admission.clear_admitted != 0)
     {
+        state.admission.done.wait(&state.admission.mutex);
+    }
+    state.admission.mutex.unlock();
+}
+
+fn disableClearAdmissionOnlyAndWait(state: *SurfaceState) void {
+    state.admission.mutex.lock();
+    state.admission.clearable = false;
+    while (state.admission.clear_admitted != 0) {
         state.admission.done.wait(&state.admission.mutex);
     }
     state.admission.mutex.unlock();
@@ -1245,6 +1259,15 @@ fn beginClearRendererOperation(surface: *SurfaceState) ?*win32_context.Context {
     surface.renderer_mutex.lock();
     defer surface.renderer_mutex.unlock();
     const renderer = surface.renderer orelse return null;
+    const persistent_release = renderer.ownsPersistentCurrent();
+    if ((!persistent_release and surface.host.shutting_down.load(.acquire)) or
+        ((!persistent_release) and
+            (surface.invalidated.load(.acquire) or
+                surface.destroying.load(.acquire) or
+                surface.renderer_destroying)))
+    {
+        return null;
+    }
     surface.active_renderer_operations += 1;
     return renderer;
 }
@@ -2143,6 +2166,7 @@ fn surfaceWindowProc(
                 detachSurfaceProvider(value);
                 value.hwnd = null;
                 destroyRenderer(value);
+                disableClearAdmissionOnlyAndWait(value);
                 if (!value.destroying.load(.acquire)) {
                     value.invalidated.store(true, .release);
                 }
@@ -2184,17 +2208,15 @@ fn destroySurfaceNow(
     }
     detachSurfaceProvider(surface);
     destroyRenderer(surface);
+    if (reentrant_dispatch) {
+        disableClearAdmissionOnlyAndWait(surface);
+    } else {
+        disableClearAdmissionAndWait(surface, remaining_admissions);
+    }
     if (surface.hwnd) |hwnd| {
         setUserData(hwnd, null);
         _ = DestroyWindow(hwnd);
         surface.hwnd = null;
-    }
-    if (reentrant_dispatch) {
-        surface.admission.mutex.lock();
-        surface.admission.clearable = false;
-        surface.admission.mutex.unlock();
-    } else {
-        disableClearAdmissionAndWait(surface, remaining_admissions);
     }
     if (!surface.storage_retained) unregisterSurface(surface);
     freeRendererStorage(surface);
@@ -2213,7 +2235,7 @@ fn cleanupUnregisteredSurface(
     }
     closeSurfaceAdmission(surface);
     destroyRenderer(surface);
-    disableClearAdmissionAndWait(surface, 0);
+    disableClearAdmissionOnlyAndWait(surface);
     unregisterSurface(surface);
     freeRendererStorage(surface);
     deinitSurfaceResources(surface);
@@ -3177,7 +3199,10 @@ pub export fn winghostty_surface_paste_text(
     length: u32,
     allow_unsafe: u8,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
     const source = text orelse return result_invalid_argument;
     const result = checkSurface(state);
     if (result != result_ok) return result;
@@ -3200,7 +3225,10 @@ pub export fn winghostty_surface_read_clipboard(
     surface: ?*Surface,
     format: u32,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
     const result = checkSurface(state);
     if (result != result_ok) return result;
     if (format != clipboard_text and format != clipboard_html) {
@@ -3220,7 +3248,10 @@ pub export fn winghostty_surface_write_clipboard(
     text: ?[*]const u8,
     length: u32,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
     const source = text orelse return result_invalid_argument;
     const result = checkSurface(state);
     if (result != result_ok) return result;
@@ -3267,7 +3298,10 @@ pub export fn winghostty_surface_set_keyboard_layout(
     surface: ?*Surface,
     keyboard_layout: usize,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
     const result = checkSurface(state);
     if (result != result_ok) return result;
     state.keyboard_layout = if (keyboard_layout == 0)
@@ -3283,7 +3317,10 @@ pub export fn winghostty_surface_ime_update(
     length: u32,
     committed: u8,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
     const source = text orelse return result_invalid_argument;
     const result = checkSurface(state);
     if (result != result_ok) return result;
@@ -3299,7 +3336,10 @@ pub export fn winghostty_surface_set_link(
     surface: ?*Surface,
     url: ?[*:0]const u8,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
     const value = url orelse return result_invalid_argument;
     const result = checkSurface(state);
     if (result != result_ok) return result;
@@ -3312,7 +3352,10 @@ pub export fn winghostty_surface_set_link(
 }
 
 pub export fn winghostty_surface_clear_link(surface: ?*Surface) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
     const result = checkSurface(state);
     if (result != result_ok) return result;
     if (state.link_url) |old| allocator.free(old);
@@ -3329,7 +3372,10 @@ pub export fn winghostty_surface_set_selection_text(
     text: ?[*]const u8,
     length: u32,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
     const source = text orelse return result_invalid_argument;
     const result = checkSurface(state);
     if (result != result_ok) return result;
@@ -3345,7 +3391,10 @@ pub export fn winghostty_surface_set_selection_text(
 }
 
 pub export fn winghostty_surface_clear_selection(surface: ?*Surface) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
     const result = checkSurface(state);
     if (result != result_ok) return result;
     if (state.selection_text) |old| allocator.free(old);
@@ -3357,7 +3406,10 @@ pub export fn winghostty_surface_clear_selection(surface: ?*Surface) Result {
 }
 
 pub export fn winghostty_surface_copy_selection(surface: ?*Surface) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
     const result = checkSurface(state);
     if (result != result_ok) return result;
     const text = state.selection_text orelse return result_invalid_argument;
@@ -3573,7 +3625,10 @@ pub export fn winghostty_surface_notify_accessibility_name(
     surface: ?*Surface,
     name: ?[*:0]const u8,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
     const value = name orelse return result_invalid_argument;
     const result = checkSurface(state);
     if (result != result_ok) return result;
@@ -3596,7 +3651,10 @@ pub export fn winghostty_surface_notify_accessibility_text(
     selection_end: u64,
     caret: u64,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
     const result = checkSurface(state);
     if (result != result_ok) return result;
     const length = std.math.cast(usize, text_length) orelse return result_invalid_argument;
@@ -3655,7 +3713,10 @@ pub export fn winghostty_surface_notify_accessibility_focus(
     surface: ?*Surface,
     focused: u8,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
     const result = checkSurface(state);
     if (result != result_ok) return result;
     if (state.uia) |provider| provider.updateFocus(focused != 0);
@@ -3666,7 +3727,10 @@ pub export fn winghostty_surface_set_accessibility_role(
     surface: ?*Surface,
     role: i32,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
     const result = checkSurface(state);
     if (result != result_ok) return result;
     const value: host_uia.Role = switch (role) {
@@ -3686,7 +3750,10 @@ pub export fn winghostty_surface_copy_accessibility_range(
     buffer_length: u64,
     out_written: ?*u64,
 ) Result {
-    const state = surfaceState(surface) orelse return result_invalid_argument;
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
     const output_length = out_written orelse return result_invalid_argument;
     const result = checkSurface(state);
     if (result != result_ok) return result;
