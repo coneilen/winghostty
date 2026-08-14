@@ -84,6 +84,8 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_INPUTLANGCHANGE: u32 = 0x0051;
 const WM_CAPTURECHANGED: u32 = 0x0215;
 const WM_UIA_SELECTION: u32 = 0x8000 + 0x41;
+const WM_HOST_DEFERRED_FINALIZE: u32 = WM_UIA_SELECTION + 1;
+const WM_SURFACE_DEFERRED_FINALIZE: u32 = WM_UIA_SELECTION + 2;
 
 const WS_CHILD: u32 = 0x40000000;
 const WS_VISIBLE: u32 = 0x10000000;
@@ -123,6 +125,9 @@ const TrackMouseEventArgs = extern struct {
 const class_name = std.unicode.utf8ToUtf16LeStringLiteral(
     "WinghosttyEmbeddableSurface",
 );
+const host_dispatch_class_name = std.unicode.utf8ToUtf16LeStringLiteral(
+    "WinghosttyHostDispatch",
+);
 const empty_title = std.unicode.utf8ToUtf16LeStringLiteral("");
 
 extern "user32" fn RegisterClassExW(
@@ -155,6 +160,12 @@ extern "user32" fn SendMessageW(
     lparam: LPARAM,
 ) callconv(.winapi) LRESULT;
 extern "user32" fn DestroyWindow(hwnd: HWND) callconv(.winapi) BOOL;
+extern "user32" fn PostMessageW(
+    hwnd: HWND,
+    message: UINT,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) callconv(.winapi) BOOL;
 extern "user32" fn BeginPaint(hwnd: HWND, paint: *PAINTSTRUCT) callconv(.winapi) HDC;
 extern "user32" fn EndPaint(hwnd: HWND, paint: *const PAINTSTRUCT) callconv(.winapi) BOOL;
 extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
@@ -356,17 +367,16 @@ const SelectionDispatch = struct {
             defer self.lock.unlock();
             break :blk self.hwnd;
         } orelse return;
-        var message = SelectionMessage{
-            .dispatch = self,
-            .start = start,
-            .end = end,
-        };
+        const token = enqueueSelectionMessage(self, start, end) orelse return;
         _ = SendMessageW(
             hwnd,
             WM_UIA_SELECTION,
             0,
-            @bitCast(@as(isize, @intCast(@intFromPtr(&message)))),
+            @bitCast(@as(isize, @intCast(token))),
         );
+        if (takeSelectionMessage(token)) |message| {
+            releaseSelectionMessage(message);
+        }
     }
 };
 
@@ -375,6 +385,74 @@ const SelectionMessage = struct {
     start: usize,
     end: usize,
 };
+
+var selection_message_registry_mutex: std.Thread.Mutex = .{};
+var selection_message_registry: std.AutoHashMapUnmanaged(
+    usize,
+    *SelectionMessage,
+) = .empty;
+var next_selection_message_token: std.atomic.Value(usize) = .init(1);
+
+fn nextSelectionMessageToken() ?usize {
+    var current = next_selection_message_token.load(.monotonic);
+    while (current != 0) {
+        const next = if (current == std.math.maxInt(usize))
+            0
+        else
+            current + 1;
+        if (next_selection_message_token.cmpxchgWeak(
+            current,
+            next,
+            .monotonic,
+            .monotonic,
+        ) == null) {
+            return current;
+        }
+        current = next_selection_message_token.load(.monotonic);
+    }
+    return null;
+}
+
+fn enqueueSelectionMessage(
+    dispatch: *SelectionDispatch,
+    start: usize,
+    end: usize,
+) ?usize {
+    const token = nextSelectionMessageToken() orelse return null;
+    const message = allocator.create(SelectionMessage) catch return null;
+    message.* = .{
+        .dispatch = dispatch,
+        .start = start,
+        .end = end,
+    };
+    dispatch.retain();
+    selection_message_registry_mutex.lock();
+    selection_message_registry.put(allocator, token, message) catch {
+        selection_message_registry_mutex.unlock();
+        dispatch.release();
+        allocator.destroy(message);
+        return null;
+    };
+    selection_message_registry_mutex.unlock();
+    return token;
+}
+
+fn takeSelectionMessage(token: usize) ?*SelectionMessage {
+    selection_message_registry_mutex.lock();
+    defer selection_message_registry_mutex.unlock();
+    const entry = selection_message_registry.fetchRemove(token) orelse
+        return null;
+    if (selection_message_registry.count() == 0) {
+        selection_message_registry.deinit(allocator);
+        selection_message_registry = .empty;
+    }
+    return entry.value;
+}
+
+fn releaseSelectionMessage(message: *SelectionMessage) void {
+    message.dispatch.release();
+    allocator.destroy(message);
+}
 
 const SelectionDispatchTestGate = struct {
     entered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -643,7 +721,6 @@ const SurfaceState = struct {
     pin_count: usize = 0,
     destroying: std.atomic.Value(bool) = .init(false),
     retired: bool = false,
-    retain_until_host_teardown: bool = false,
     retired_next: ?*SurfaceState = null,
     focused: bool = false,
     ime_composing: bool = false,
@@ -665,6 +742,8 @@ const SurfaceState = struct {
     wheel_remainder_y: i32 = 0,
     active_dispatches: usize = 0,
     storage_retained: bool = false,
+    finalize_mutex: std.Thread.Mutex = .{},
+    finalize_posted: bool = false,
 };
 
 const HostState = struct {
@@ -674,13 +753,16 @@ const HostState = struct {
     admission: AdmissionState = .{},
     shutting_down: std.atomic.Value(bool) = .init(false),
     retired_surfaces: ?*SurfaceState = null,
-    deinitialize_requested: bool = false,
+    deinitialize_requested: std.atomic.Value(bool) = .init(false),
     creation_depth: usize = 0,
     destroy_surface_depth: usize = 0,
     active_operations: usize = 0,
     render_thread_mutex: std.Thread.Mutex = .{},
     render_thread_id: DWORD = 0,
     active_dispatches: usize = 0,
+    deinit_mutex: std.Thread.Mutex = .{},
+    deinit_posted: bool = false,
+    marshal_hwnd: ?HWND = null,
 };
 
 var admission_registry_mutex: std.Thread.Mutex = .{};
@@ -1330,8 +1412,36 @@ fn endDispatch(surface: *SurfaceState) void {
     maybeFinishHostDeinitialize(surface.host);
 }
 
+fn postHostDeferredFinalize(state: *HostState) void {
+    state.deinit_mutex.lock();
+    if (!state.deinitialize_requested.load(.acquire) or
+        state.deinit_posted or
+        state.marshal_hwnd == null)
+    {
+        state.deinit_mutex.unlock();
+        return;
+    }
+    state.deinit_posted = true;
+    const hwnd = state.marshal_hwnd.?;
+    state.deinit_mutex.unlock();
+    if (PostMessageW(
+        hwnd,
+        WM_HOST_DEFERRED_FINALIZE,
+        @intCast(state.handle.id),
+        0,
+    ) == 0) {
+        state.deinit_mutex.lock();
+        state.deinit_posted = false;
+        state.deinit_mutex.unlock();
+    }
+}
+
 fn maybeFinishHostDeinitialize(state: *HostState) void {
-    if (state.deinitialize_requested and
+    if (GetCurrentThreadId() != state.thread_id) {
+        postHostDeferredFinalize(state);
+        return;
+    }
+    if (state.deinitialize_requested.load(.acquire) and
         state.creation_depth == 0 and
         state.destroy_surface_depth == 0 and
         state.active_dispatches == 0 and
@@ -1341,7 +1451,7 @@ fn maybeFinishHostDeinitialize(state: *HostState) void {
         const admitted = state.admission.admitted;
         state.admission.mutex.unlock();
         if (admitted != 0) return;
-        state.deinitialize_requested = false;
+        state.deinitialize_requested.store(false, .release);
         deinitializeHost(state, 0);
         allocator.destroy(state);
     }
@@ -1354,10 +1464,51 @@ fn retainRetiredSurface(host: *HostState, surface: *SurfaceState) void {
     host.retired_surfaces = surface;
 }
 
+fn postSurfaceDeferredFinalize(surface: *SurfaceState) void {
+    const host = surface.host;
+    surface.finalize_mutex.lock();
+    if (!surface.storage_retained or surface.finalize_posted) {
+        surface.finalize_mutex.unlock();
+        return;
+    }
+    host.deinit_mutex.lock();
+    const hwnd = host.marshal_hwnd;
+    host.deinit_mutex.unlock();
+    if (hwnd == null) {
+        surface.finalize_mutex.unlock();
+        return;
+    }
+    surface.finalize_posted = true;
+    surface.finalize_mutex.unlock();
+    if (PostMessageW(
+        hwnd.?,
+        WM_SURFACE_DEFERRED_FINALIZE,
+        @intCast(surface.handle.id),
+        0,
+    ) == 0) {
+        surface.finalize_mutex.lock();
+        surface.finalize_posted = false;
+        surface.finalize_mutex.unlock();
+    }
+}
+
 fn maybeFinalizeRetiredSurface(surface: *SurfaceState) void {
     if (!surface.storage_retained or
+        surface.active_dispatches != 0)
+    {
+        return;
+    }
+    if (GetCurrentThreadId() != surface.host.thread_id) {
+        postSurfaceDeferredFinalize(surface);
+        return;
+    }
+    postSurfaceDeferredFinalize(surface);
+}
+
+fn finalizeRetiredSurface(surface: *SurfaceState) void {
+    if (!surface.storage_retained or
         surface.active_dispatches != 0 or
-        surface.retain_until_host_teardown)
+        GetCurrentThreadId() != surface.host.thread_id)
     {
         return;
     }
@@ -1398,6 +1549,102 @@ fn registerSurfaceClass() void {
         .hIconSm = null,
     };
     _ = RegisterClassExW(&class);
+}
+
+fn setDispatcherUserData(hwnd: HWND, state: ?*HostState) void {
+    const value: LONG_PTR = if (state) |ptr|
+        @intCast(@intFromPtr(ptr))
+    else
+        0;
+    _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, value);
+}
+
+fn hostDispatcherProc(
+    hwnd: HWND,
+    message: UINT,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) callconv(.winapi) LRESULT {
+    if (message == WM_NCCREATE) {
+        const create: *const CREATESTRUCTW =
+            @ptrFromInt(@as(usize, @bitCast(lparam)));
+        if (create.lpCreateParams) |ptr| {
+            setDispatcherUserData(hwnd, @ptrCast(@alignCast(ptr)));
+        }
+    }
+
+    switch (message) {
+        WM_HOST_DEFERRED_FINALIZE => {
+            const state = blk: {
+                admission_registry_mutex.lock();
+                defer admission_registry_mutex.unlock();
+                break :blk hostStateFromId(@intCast(wparam));
+            } orelse return 0;
+            if (GetCurrentThreadId() != state.thread_id) return 0;
+            state.deinit_mutex.lock();
+            state.deinit_posted = false;
+            state.deinit_mutex.unlock();
+            maybeFinishHostDeinitialize(state);
+            return 0;
+        },
+        WM_SURFACE_DEFERRED_FINALIZE => {
+            const surface = blk: {
+                admission_registry_mutex.lock();
+                defer admission_registry_mutex.unlock();
+                break :blk surfaceStateFromId(@intCast(wparam));
+            } orelse return 0;
+            if (GetCurrentThreadId() != surface.host.thread_id) return 0;
+            surface.finalize_mutex.lock();
+            surface.finalize_posted = false;
+            surface.finalize_mutex.unlock();
+            finalizeRetiredSurface(surface);
+            return 0;
+        },
+        WM_NCDESTROY => {
+            setDispatcherUserData(hwnd, null);
+            return DefWindowProcW(hwnd, message, wparam, lparam);
+        },
+        else => return DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+fn registerHostDispatcherClass() void {
+    const class: WNDCLASSEXW = .{
+        .cbSize = @sizeOf(WNDCLASSEXW),
+        .style = 0,
+        .lpfnWndProc = hostDispatcherProc,
+        .cbClsExtra = 0,
+        .cbWndExtra = 0,
+        .hInstance = GetModuleHandleW(null),
+        .hIcon = null,
+        .hCursor = null,
+        .hbrBackground = null,
+        .lpszMenuName = null,
+        .lpszClassName = host_dispatch_class_name,
+        .hIconSm = null,
+    };
+    _ = RegisterClassExW(&class);
+}
+
+fn createHostDispatcher(state: *HostState) ?HWND {
+    registerHostDispatcherClass();
+    const message_parent: HWND = @ptrFromInt(
+        @as(usize, @bitCast(@as(isize, -3))),
+    );
+    return CreateWindowExW(
+        0,
+        host_dispatch_class_name,
+        empty_title,
+        0,
+        0,
+        0,
+        0,
+        0,
+        message_parent,
+        null,
+        GetModuleHandleW(null),
+        state,
+    );
 }
 
 fn getSurface(hwnd: HWND) ?*SurfaceState {
@@ -1929,17 +2176,19 @@ fn surfaceWindowProc(
         WM_UIA_SELECTION => {
             if (surface) |value| {
                 if (lparam != 0) {
-                    const message_ptr: *const SelectionMessage =
-                        @ptrFromInt(@as(usize, @bitCast(lparam)));
-                    if (value.selection_dispatch == message_ptr.dispatch and
-                        message_ptr.dispatch.owner_thread_id == GetCurrentThreadId() and
-                        message_ptr.dispatch.isActive())
-                    {
-                        deliverAccessibilitySelection(
-                            value,
-                            message_ptr.start,
-                            message_ptr.end,
-                        );
+                    const token = @as(usize, @bitCast(lparam));
+                    if (takeSelectionMessage(token)) |message_ptr| {
+                        defer releaseSelectionMessage(message_ptr);
+                        if (value.selection_dispatch == message_ptr.dispatch and
+                            message_ptr.dispatch.owner_thread_id == GetCurrentThreadId() and
+                            message_ptr.dispatch.isActive())
+                        {
+                            deliverAccessibilitySelection(
+                                value,
+                                message_ptr.start,
+                                message_ptr.end,
+                            );
+                        }
                     }
                 }
             }
@@ -2195,7 +2444,6 @@ fn destroySurfaceNow(
         surface.active_dispatches != 0 and
         GetCurrentThreadId() == surface.host.thread_id;
     if (surface.retired) return;
-    if (reentrant_dispatch) surface.retain_until_host_teardown = true;
     surface.destroying.store(true, .release);
     surface.invalidated.store(true, .release);
     surface.retired = true;
@@ -2260,12 +2508,13 @@ fn finishUnregisteredSurfaceCreation(
     surface.creation_in_progress = false;
     cleanupUnregisteredSurface(surface, hwnd);
     state.creation_depth -= 1;
-    const deinitialize_requested = state.deinitialize_requested;
+    const deinitialize_requested =
+        state.deinitialize_requested.load(.acquire);
     if (deinitialize_requested and state.creation_depth == 0 and
         state.active_dispatches == 0 and
         state.active_operations == 0)
     {
-        state.deinitialize_requested = false;
+        state.deinitialize_requested.store(false, .release);
         deinitializeHost(state, 1);
         releaseHostAdmission(host_admission);
         allocator.destroy(state);
@@ -2277,6 +2526,7 @@ fn deinitializeHost(
     state: *HostState,
     remaining_host_admissions: usize,
 ) void {
+    std.debug.assert(GetCurrentThreadId() == state.thread_id);
     closeHostAdmission(state);
     waitHostAdmissions(state, remaining_host_admissions);
     while (state.surfaces.items.len > 0) {
@@ -2293,20 +2543,27 @@ fn deinitializeHost(
         deinitSurfaceResources(surface);
         allocator.destroy(surface);
     }
+    state.deinit_mutex.lock();
+    const marshal_hwnd = state.marshal_hwnd;
+    state.marshal_hwnd = null;
+    state.deinit_mutex.unlock();
+    if (marshal_hwnd) |hwnd| {
+        _ = DestroyWindow(hwnd);
+    }
 }
 
 fn finishDeferredHostDeinitialize(
     state: *HostState,
     remaining_host_admissions: usize,
 ) bool {
-    if (!state.deinitialize_requested or
+    if (!state.deinitialize_requested.load(.acquire) or
         state.creation_depth != 0 or
         state.destroy_surface_depth != 0 or
         state.active_dispatches != 0)
     {
         return false;
     }
-    state.deinitialize_requested = false;
+    state.deinitialize_requested.store(false, .release);
     deinitializeHost(state, remaining_host_admissions);
     return true;
 }
@@ -2458,6 +2715,11 @@ pub export fn winghostty_host_initialize(out_host: ?*?*Host) Result {
         return result_out_of_memory;
     };
     registerSurfaceClass();
+    host.marshal_hwnd = createHostDispatcher(host) orelse {
+        unregisterHost(host);
+        allocator.destroy(host);
+        return result_win32_error;
+    };
     output.* = hostHandle(host);
     return result_ok;
 }
@@ -2478,7 +2740,7 @@ pub export fn winghostty_host_deinitialize(host: ?*Host) Result {
         state.active_dispatches != 0 or
         state.active_operations != 0)
     {
-        state.deinitialize_requested = true;
+        state.deinitialize_requested.store(true, .release);
         releaseHostAdmission(&admission);
         return result_ok;
     }
@@ -2681,12 +2943,13 @@ fn createSurface(
         }
         closeSurfaceAdmission(surface);
         destroySurfaceNow(surface, 0);
-        const deinitialize_requested = state.deinitialize_requested;
+        const deinitialize_requested =
+            state.deinitialize_requested.load(.acquire);
         if (deinitialize_requested and state.creation_depth == 0 and
             state.active_operations == 0 and
             state.active_dispatches == 0)
         {
-            state.deinitialize_requested = false;
+            state.deinitialize_requested.store(false, .release);
             deinitializeHost(state, 1);
             releaseHostAdmission(host_admission);
             allocator.destroy(state);

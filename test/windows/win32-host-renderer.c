@@ -15,6 +15,7 @@ typedef struct test_state {
     LONG callback_mismatch;
     int deinit_on_child_destroy;
     LONG parent_destroy_notifications;
+    LONG parent_destroy_wrong_thread;
     winghostty_result parent_deinit_result;
 } test_state;
 
@@ -73,12 +74,36 @@ typedef struct clear_admission_stress {
     volatile LONG clear_rejected;
 } clear_admission_stress;
 
+typedef struct reentrant_destroy_cycle {
+    volatile LONG destroyed;
+    volatile LONG failures;
+    winghostty_result destroy_result;
+} reentrant_destroy_cycle;
+
+typedef struct deferred_deinit_stress {
+    winghostty_host *host;
+    winghostty_surface *surface;
+    volatile LONG stop;
+    volatile LONG entered;
+    volatile LONG failures;
+} deferred_deinit_stress;
+
 typedef struct process_heap_usage {
     SIZE_T busy_blocks;
     SIZE_T busy_bytes;
 } process_heap_usage;
 
+#define WM_UIA_SELECTION_TEST (0x8000 + 0x41)
+
 static int read_process_heap_usage(process_heap_usage *usage);
+
+static void drain_messages(void) {
+    MSG message;
+    while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+}
 
 static LRESULT CALLBACK parent_window_proc(
     HWND hwnd,
@@ -95,10 +120,14 @@ static LRESULT CALLBACK parent_window_proc(
         LOWORD(wparam) == WM_DESTROY &&
         state != NULL) {
         InterlockedIncrement(&state->parent_destroy_notifications);
+        if (GetCurrentThreadId() != state->ui_thread) {
+            InterlockedIncrement(&state->parent_destroy_wrong_thread);
+        }
         if (state->deinit_on_child_destroy && state->host != NULL) {
             state->parent_deinit_result =
                 winghostty_host_deinitialize(state->host);
         }
+
     }
     if (message == WM_NCDESTROY) {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -127,6 +156,18 @@ static void on_focus(
         InterlockedIncrement(&state->callback_mismatch);
     }
     InterlockedIncrement(&state->focus_count);
+}
+
+static void on_reentrant_destroy_redraw(
+    void *user_data,
+    winghostty_surface *surface
+) {
+    reentrant_destroy_cycle *cycle = (reentrant_destroy_cycle *)user_data;
+    cycle->destroy_result = winghostty_surface_destroy(surface);
+    if (cycle->destroy_result != WINGHOSTTY_OK) {
+        InterlockedIncrement(&cycle->failures);
+    }
+    InterlockedIncrement(&cycle->destroyed);
 }
 
 static DWORD WINAPI render_thread(void *parameter) {
@@ -435,6 +476,18 @@ static DWORD WINAPI clear_admission_stress_thread(void *parameter) {
     return 0;
 }
 
+static DWORD WINAPI deferred_deinit_stress_thread(void *parameter) {
+    deferred_deinit_stress *stress = (deferred_deinit_stress *)parameter;
+    InterlockedExchange(&stress->entered, 1);
+    while (InterlockedCompareExchange(&stress->stop, 0, 0) == 0) {
+        (void)winghostty_surface_get_hdc(stress->surface);
+        (void)winghostty_surface_get_hglrc(stress->surface);
+        (void)winghostty_surface_get_present_count(stress->surface);
+        Sleep(0);
+    }
+    return 0;
+}
+
 static int run_clear_admission_stress(HWND parent) {
     winghostty_surface_options options;
     winghostty_surface_options_init(&options);
@@ -507,6 +560,173 @@ static int run_clear_admission_stress(HWND parent) {
         }
         if (winghostty_host_deinitialize(host) != WINGHOSTTY_OK) {
             return fail("clear-admission host teardown failed");
+        }
+    }
+    return 0;
+}
+
+static int run_uia_selection_token_contract(HWND parent) {
+    winghostty_host *host = NULL;
+    winghostty_surface *surface = NULL;
+    winghostty_surface_options options;
+    winghostty_surface_options_init(&options);
+    options.visible = 0;
+    options.bounds.width = 80;
+    options.bounds.height = 40;
+    if (winghostty_host_initialize(&host) != WINGHOSTTY_OK ||
+        winghostty_host_create_surface(
+            host,
+            parent,
+            &options,
+            &surface
+        ) != WINGHOSTTY_OK ||
+        surface == NULL) {
+        if (host != NULL) winghostty_host_deinitialize(host);
+        return fail("UIA selection token setup failed");
+    }
+
+    HWND hwnd = winghostty_surface_get_hwnd(surface);
+    if (hwnd == NULL) {
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return fail("UIA selection token HWND lookup failed");
+    }
+    (void)SendMessageW(hwnd, WM_UIA_SELECTION_TEST, 0, (LPARAM)1);
+    (void)SendMessageW(hwnd, WM_UIA_SELECTION_TEST, 0, (LPARAM)-1);
+    (void)SendMessageW(hwnd, WM_UIA_SELECTION_TEST, 0, (LPARAM)0x7fffffff);
+
+    if (winghostty_surface_destroy(surface) != WINGHOSTTY_OK ||
+        winghostty_host_deinitialize(host) != WINGHOSTTY_OK) {
+        return fail("UIA selection token teardown failed");
+    }
+    return 0;
+}
+
+static int run_reentrant_destroy_heap_contract(HWND parent) {
+    winghostty_host *host = NULL;
+    winghostty_surface_options options;
+    winghostty_surface_options_init(&options);
+    options.visible = 0;
+    options.bounds.width = 80;
+    options.bounds.height = 40;
+    if (winghostty_host_initialize(&host) != WINGHOSTTY_OK) {
+        return fail("reentrant callback host setup failed");
+    }
+
+    process_heap_usage before;
+    process_heap_usage after;
+    if (!read_process_heap_usage(&before)) {
+        winghostty_host_deinitialize(host);
+        return fail("reentrant callback heap measurement failed before");
+    }
+
+    for (int cycle = 0; cycle < 100; ++cycle) {
+        reentrant_destroy_cycle state = {0};
+        options.user_data = &state;
+        options.callbacks.on_redraw = on_reentrant_destroy_redraw;
+        winghostty_surface *surface = NULL;
+        if (winghostty_host_create_surface(
+                host,
+                parent,
+                &options,
+                &surface
+            ) != WINGHOSTTY_OK ||
+            surface == NULL) {
+            winghostty_host_deinitialize(host);
+            return fail("reentrant callback surface setup failed");
+        }
+        if (winghostty_surface_notify_redraw(surface) != WINGHOSTTY_OK ||
+            state.destroyed != 1 ||
+            state.failures != 0 ||
+            !invalid_state_result(winghostty_surface_destroy(surface))) {
+            winghostty_host_deinitialize(host);
+            return fail("reentrant callback destroy failed");
+        }
+        drain_messages();
+    }
+
+    if (!read_process_heap_usage(&after)) {
+        winghostty_host_deinitialize(host);
+        return fail("reentrant callback heap measurement failed after");
+    }
+    if (after.busy_blocks > before.busy_blocks + 64 ||
+        after.busy_bytes > before.busy_bytes + (2 * 1024 * 1024)) {
+        winghostty_host_deinitialize(host);
+        return fail("reentrant callback surfaces remained retained");
+    }
+    if (winghostty_host_deinitialize(host) != WINGHOSTTY_OK) {
+        return fail("reentrant callback host teardown failed");
+    }
+    return 0;
+}
+
+static int run_deferred_host_ui_thread_contract(test_state *state) {
+    winghostty_surface_options options;
+    winghostty_surface_options_init(&options);
+    options.visible = 0;
+    options.bounds.width = 80;
+    options.bounds.height = 40;
+    state->parent_destroy_wrong_thread = 0;
+
+    for (int cycle = 0; cycle < 64; ++cycle) {
+        winghostty_host *host = NULL;
+        winghostty_surface *surface = NULL;
+        deferred_deinit_stress stress = {0};
+        if (winghostty_host_initialize(&host) != WINGHOSTTY_OK ||
+            winghostty_host_create_surface(
+                host,
+                state->parent,
+                &options,
+                &surface
+            ) != WINGHOSTTY_OK ||
+            surface == NULL) {
+            if (host != NULL) winghostty_host_deinitialize(host);
+            return fail("deferred host teardown setup failed");
+        }
+        stress.host = host;
+        stress.surface = surface;
+        HANDLE thread = CreateThread(
+            NULL,
+            0,
+            deferred_deinit_stress_thread,
+            &stress,
+            0,
+            NULL
+        );
+        if (thread == NULL) {
+            winghostty_surface_destroy(surface);
+            winghostty_host_deinitialize(host);
+            return fail("deferred host teardown worker creation failed");
+        }
+        for (int i = 0; i < 100 && stress.entered == 0; ++i) {
+            Sleep(1);
+        }
+        if (stress.entered == 0 ||
+            winghostty_host_deinitialize(host) != WINGHOSTTY_OK) {
+            InterlockedExchange(&stress.stop, 1);
+            WaitForSingleObject(thread, 10000);
+            CloseHandle(thread);
+            return fail("deferred host teardown request failed");
+        }
+        for (int i = 0; i < 1000; ++i) {
+            MSG message;
+            while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            if (winghostty_host_get_ui_thread_id(host) == 0) break;
+            Sleep(1);
+        }
+        InterlockedExchange(&stress.stop, 1);
+        if (WaitForSingleObject(thread, 10000) != WAIT_OBJECT_0) {
+            CloseHandle(thread);
+            return fail("deferred host teardown worker did not finish");
+        }
+        CloseHandle(thread);
+        if (stress.failures != 0 ||
+            winghostty_host_get_ui_thread_id(host) != 0 ||
+            state->parent_destroy_wrong_thread != 0) {
+            return fail("deferred host teardown finalized off the UI thread");
         }
     }
     return 0;
@@ -1206,6 +1426,18 @@ int main(void) {
         return 1;
     }
     if (run_clear_admission_stress(state.parent) != 0) {
+        DestroyWindow(state.parent);
+        return 1;
+    }
+    if (run_uia_selection_token_contract(state.parent) != 0) {
+        DestroyWindow(state.parent);
+        return 1;
+    }
+    if (run_reentrant_destroy_heap_contract(state.parent) != 0) {
+        DestroyWindow(state.parent);
+        return 1;
+    }
+    if (run_deferred_host_ui_thread_contract(&state) != 0) {
         DestroyWindow(state.parent);
         return 1;
     }

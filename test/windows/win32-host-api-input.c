@@ -884,14 +884,17 @@ int main(void) {
     context.destroyed = 0;
     SendMessageW(second_hwnd, WM_KEYDOWN, 'D', 1u << 16);
     context.destroy_on_key = 0;
+    winghostty_result destroyed_redraw = winghostty_surface_notify_redraw(second);
     if (!context.destroyed ||
-        winghostty_surface_notify_redraw(second) != WINGHOSTTY_SURFACE_INVALIDATED ||
+        (destroyed_redraw != WINGHOSTTY_INVALID_ARGUMENT &&
+            destroyed_redraw != WINGHOSTTY_SURFACE_INVALIDATED &&
+            destroyed_redraw != WINGHOSTTY_SHUTTING_DOWN) ||
         context.callbacks_after_destroy != 0) {
         fprintf(
             stderr,
             "destroy check destroyed=%d redraw=%d after=%ld keys=%ld focus=%ld\n",
             context.destroyed,
-            winghostty_surface_notify_redraw(second),
+            destroyed_redraw,
             context.callbacks_after_destroy,
             context.keys,
             context.focus
