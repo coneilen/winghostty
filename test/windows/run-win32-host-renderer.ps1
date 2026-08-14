@@ -1,3 +1,8 @@
+param(
+    [ValidateRange(1, 32)]
+    [int] $RepeatCount = 3
+)
+
 $ErrorActionPreference = "Stop"
 
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
@@ -31,13 +36,16 @@ try {
         "-lkernel32", "-limm32", "-loleaut32", "-lole32",
         "-luiautomationcore", "-o", $executable
     )
-    & $executable
-    if ($LASTEXITCODE -ne 0) {
-        throw "Win32 host renderer executable failed with exit code $LASTEXITCODE."
+    for ($iteration = 1; $iteration -le $RepeatCount; $iteration++) {
+        Write-Host "Win32 host renderer external contract run $iteration/$RepeatCount."
+        & $executable
+        if ($LASTEXITCODE -ne 0) {
+            throw "Win32 host renderer executable failed on run $iteration with exit code $LASTEXITCODE."
+        }
     }
 }
 finally {
     Remove-Item -LiteralPath $object, $executable -Force -ErrorAction SilentlyContinue
 }
 
-Write-Host "Win32 host renderer external contract passed."
+Write-Host "Win32 host renderer external contract passed ($RepeatCount fresh processes)."

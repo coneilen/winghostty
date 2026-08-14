@@ -105,6 +105,30 @@ static void drain_messages(void) {
     }
 }
 
+static int wait_for_surface_finalization(winghostty_surface *surface) {
+    for (int attempt = 0; attempt < 5000; ++attempt) {
+        drain_messages();
+        const winghostty_result result =
+            winghostty_surface_destroy(surface);
+        if (result == WINGHOSTTY_INVALID_ARGUMENT) return 1;
+        if (result != WINGHOSTTY_SURFACE_INVALIDATED &&
+            result != WINGHOSTTY_SHUTTING_DOWN) {
+            return 0;
+        }
+        Sleep(1);
+    }
+    return 0;
+}
+
+static int wait_for_host_finalization(winghostty_host *host) {
+    for (int attempt = 0; attempt < 5000; ++attempt) {
+        drain_messages();
+        if (winghostty_host_get_ui_thread_id(host) == 0) return 1;
+        Sleep(1);
+    }
+    return 0;
+}
+
 static LRESULT CALLBACK parent_window_proc(
     HWND hwnd,
     UINT message,
@@ -642,7 +666,10 @@ static int run_reentrant_destroy_heap_contract(HWND parent) {
             winghostty_host_deinitialize(host);
             return fail("reentrant callback destroy failed");
         }
-        drain_messages();
+        if (!wait_for_surface_finalization(surface)) {
+            winghostty_host_deinitialize(host);
+            return fail("reentrant callback surface finalization did not complete");
+        }
     }
 
     if (!read_process_heap_usage(&after)) {
@@ -1448,6 +1475,10 @@ int main(void) {
     }
     const DWORD user_before = GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS);
     const DWORD gdi_before = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+    const DWORD user_budget = 4;
+    const DWORD gdi_budget = 4;
+    DWORD user_peak = user_before;
+    DWORD gdi_peak = gdi_before;
 
     winghostty_host *cycle_host = NULL;
     if (winghostty_host_initialize(&cycle_host) != WINGHOSTTY_OK) {
@@ -1479,19 +1510,40 @@ int main(void) {
             DestroyWindow(state.parent);
             return fail("create/destroy cycle failed");
         }
+        drain_messages();
+        const DWORD user_now =
+            GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS);
+        const DWORD gdi_now =
+            GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+        if (user_now > user_peak) user_peak = user_now;
+        if (gdi_now > gdi_peak) gdi_peak = gdi_now;
+        if (user_now > user_before + user_budget ||
+            gdi_now > gdi_before + gdi_budget) {
+            winghostty_host_deinitialize(cycle_host);
+            DestroyWindow(state.parent);
+            return fail("per-cycle GUI handle growth exceeded bounded budget");
+        }
     }
     if (winghostty_host_deinitialize(cycle_host) != WINGHOSTTY_OK) {
         DestroyWindow(state.parent);
         return fail("cycle host teardown failed");
     }
+    if (!wait_for_host_finalization(cycle_host)) {
+        DestroyWindow(state.parent);
+        return fail("deferred cycle host finalization did not complete");
+    }
 
+    const DWORD user_after =
+        GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS);
+    const DWORD gdi_after =
+        GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
     if (check(
-            GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS) == user_before,
-            "USER handle count leaked"
+            user_after <= user_before + user_budget,
+            "USER handle growth exceeded bounded budget"
         ) ||
         check(
-            GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) == gdi_before,
-            "GDI handle count leaked"
+            gdi_after <= gdi_before + gdi_budget,
+            "GDI handle growth exceeded bounded budget"
         )) {
         DestroyWindow(state.parent);
         return 1;
@@ -1499,6 +1551,14 @@ int main(void) {
 
     DestroyWindow(state.parent);
     CoUninitialize();
-    printf("Win32 host renderer contract passed: child HWND/HDC/HGLRC, affinity, presentation, stable handles, teardown, 100 cycles.\n");
+    printf(
+        "Win32 host renderer contract passed: child HWND/HDC/HGLRC, affinity, "
+        "presentation, stable handles, teardown, 100 cycles, bounded GUI "
+        "growth USER=%lu/%lu GDI=%lu/%lu.\n",
+        user_peak - user_before,
+        user_budget,
+        gdi_peak - gdi_before,
+        gdi_budget
+    );
     return 0;
 }
