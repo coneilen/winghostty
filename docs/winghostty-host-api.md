@@ -92,6 +92,11 @@ ranges, caret, selection, and update notifications. UIA state is detached
 before a surface is destroyed, so retained providers return
 `UIA_E_ELEMENTNOTAVAILABLE` and never call back into the embedding application
 after teardown.
+Embedders that own a parsed libghostty-vt render state can push a copied
+`winghostty_terminal_cell` snapshot with
+`winghostty_surface_set_terminal_cells`. The provider renderer consumes that
+snapshot for the visible cell frame; `notify_accessibility_*` remains a
+separate UI Automation channel and is not used as renderer state.
 Retained UIA providers synchronize concurrent queries, updates, selection
 callbacks, and teardown; provider options advertise COM-threaded access.
 UIA selection callbacks synchronously marshal through the surface window to the

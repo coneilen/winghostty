@@ -40,6 +40,18 @@ typedef struct winghostty_rect {
     uint32_t height;
 } winghostty_rect;
 
+/*
+ * A copied terminal render cell. Colors are packed RGB values
+ * (0xRRGGBB); codepoint zero represents an empty cell. The host keeps its
+ * own copy, so callers may release the input buffer after the update.
+ */
+typedef struct {
+    uint32_t codepoint;
+    uint32_t foreground;
+    uint32_t background;
+    uint32_t flags;
+} winghostty_terminal_cell;
+
 typedef struct winghostty_cell_metrics {
     uint32_t font_width;
     uint32_t font_height;
@@ -435,6 +447,19 @@ winghostty_result winghostty_surface_make_current(winghostty_surface *surface);
 winghostty_result winghostty_surface_clear_current(winghostty_surface *surface);
 winghostty_result winghostty_surface_render(winghostty_surface *surface);
 winghostty_result winghostty_surface_present(winghostty_surface *surface);
+
+/*
+ * Replace the parsed VT/render-state cell snapshot used by the provider
+ * renderer. The UI Automation text APIs below remain an independent
+ * accessibility channel.
+ */
+winghostty_result winghostty_surface_set_terminal_cells(
+    winghostty_surface *surface,
+    uint32_t columns,
+    uint32_t rows,
+    const winghostty_terminal_cell *cells,
+    uint64_t cell_count
+);
 
 HDC winghostty_surface_get_hdc(const winghostty_surface *surface);
 HGLRC winghostty_surface_get_hglrc(const winghostty_surface *surface);

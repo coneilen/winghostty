@@ -702,6 +702,10 @@ const SurfaceState = struct {
     options: OwnedOptions,
     admission: AdmissionState = .{},
     options_mutex: std.Thread.Mutex = .{},
+    terminal_mutex: std.Thread.Mutex = .{},
+    terminal_cells: []win32_context.TerminalCell = &.{},
+    terminal_columns: u32 = 0,
+    terminal_rows: u32 = 0,
     renderer: ?*win32_context.Context = null,
     retired_renderer: ?*win32_context.Context = null,
     renderer_mutex: std.Thread.Mutex = .{},
@@ -1513,6 +1517,37 @@ fn postSurfaceDeferredFinalize(surface: *SurfaceState) void {
         surface.finalize_posted = false;
         surface.finalize_mutex.unlock();
     }
+}
+
+fn drainRetiredSurface(surface: *SurfaceState) void {
+    if (!surface.storage_retained) return;
+    const host = surface.host;
+    if (GetCurrentThreadId() != host.thread_id) {
+        postSurfaceDeferredFinalize(surface);
+        return;
+    }
+    if (surface.active_dispatches != 0 or
+        host.destroy_surface_depth != 0 or
+        host.active_dispatches != 0 or
+        host.active_operations != 0)
+    {
+        postSurfaceDeferredFinalize(surface);
+        return;
+    }
+    finalizeRetiredSurface(surface);
+}
+
+fn drainRetiredSurfaceByHandle(handle: ?*Surface) void {
+    const pointer = handle orelse return;
+    admission_registry_mutex.lock();
+    const surface = surfaceStateFromId(@intFromPtr(pointer)) orelse {
+        admission_registry_mutex.unlock();
+        return;
+    };
+    const owner_thread = surface.host.thread_id;
+    admission_registry_mutex.unlock();
+    if (GetCurrentThreadId() != owner_thread) return;
+    drainRetiredSurface(surface);
 }
 
 fn maybeFinalizeRetiredSurface(surface: *SurfaceState) void {
@@ -2531,6 +2566,12 @@ fn cleanupUnregisteredSurface(
 fn deinitSurfaceResources(surface: *SurfaceState) void {
     if (surface.selection_text) |value| allocator.free(value);
     if (surface.link_url) |value| allocator.free(value);
+    surface.terminal_mutex.lock();
+    if (surface.terminal_cells.len != 0) allocator.free(surface.terminal_cells);
+    surface.terminal_cells = &.{};
+    surface.terminal_columns = 0;
+    surface.terminal_rows = 0;
+    surface.terminal_mutex.unlock();
     surface.selection_text = null;
     surface.link_url = null;
     surface.options.deinit();
@@ -3056,8 +3097,11 @@ pub export fn winghostty_host_create_surface_v2(
 }
 
 pub export fn winghostty_surface_destroy(surface: ?*Surface) Result {
-    var admission = admitSurface(surface) orelse
-        return unavailableSurfaceResult(surface);
+    var admission = admitSurface(surface) orelse {
+        const result = unavailableSurfaceResult(surface);
+        drainRetiredSurfaceByHandle(surface);
+        return result;
+    };
     const state = admission.surface;
     admission.defer_finalize = true;
     const result = checkHost(state.host);
@@ -3351,6 +3395,43 @@ pub export fn winghostty_surface_clear_current(surface: ?*Surface) Result {
     return result_ok;
 }
 
+pub export fn winghostty_surface_set_terminal_cells(
+    surface: ?*Surface,
+    columns: u32,
+    rows: u32,
+    cells: ?[*]const win32_context.TerminalCell,
+    cell_count: u64,
+) Result {
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+
+    const expected = std.math.mul(u64, columns, rows) catch
+        return result_invalid_argument;
+    if (expected != cell_count) return result_invalid_argument;
+    if (cell_count != 0 and cells == null) return result_invalid_argument;
+    const count = std.math.cast(usize, cell_count) orelse
+        return result_invalid_argument;
+    var next: []win32_context.TerminalCell = &.{};
+    if (count != 0) {
+        next = allocator.alloc(win32_context.TerminalCell, count) catch
+            return result_out_of_memory;
+        errdefer allocator.free(next);
+    }
+    if (count != 0) @memcpy(next, cells.?[0..count]);
+
+    state.terminal_mutex.lock();
+    defer state.terminal_mutex.unlock();
+    if (state.terminal_cells.len != 0) allocator.free(state.terminal_cells);
+    state.terminal_cells = next;
+    state.terminal_columns = columns;
+    state.terminal_rows = rows;
+    return result_ok;
+}
+
 pub export fn winghostty_surface_render(surface: ?*Surface) Result {
     var admission = admitSurface(surface) orelse
         return unavailableSurfaceResult(surface);
@@ -3371,17 +3452,23 @@ pub export fn winghostty_surface_render(surface: ?*Surface) Result {
     defer endRendererOperation(state);
 
     state.options_mutex.lock();
+    state.terminal_mutex.lock();
     const render_state = win32_presentation.RenderState{
         .theme = @enumFromInt(state.options.theme),
         .font_scale = state.options.font_scale,
         .width = state.options.bounds.width,
         .height = state.options.bounds.height,
+        .terminal_columns = state.terminal_columns,
+        .terminal_rows = state.terminal_rows,
+        .terminal_cells = state.terminal_cells,
     };
     state.options_mutex.unlock();
 
     win32_presentation.render(renderer, render_state) catch |err| {
+        state.terminal_mutex.unlock();
         return rendererResult(state, err);
     };
+    state.terminal_mutex.unlock();
     _ = state.present_count.fetchAdd(1, .release);
     return result_ok;
 }

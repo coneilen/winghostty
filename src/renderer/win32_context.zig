@@ -108,11 +108,21 @@ pub const Theme = enum(i32) {
     dark = 2,
 };
 
+pub const TerminalCell = extern struct {
+    codepoint: u32,
+    foreground: u32,
+    background: u32,
+    flags: u32,
+};
+
 pub const RenderState = struct {
     theme: Theme = .system,
     font_scale: f32 = 1.0,
     width: u32 = 1,
     height: u32 = 1,
+    terminal_columns: u32 = 0,
+    terminal_rows: u32 = 0,
+    terminal_cells: []const TerminalCell = &.{},
 };
 
 const CurrentBinding = struct {
@@ -334,23 +344,7 @@ pub const Context = struct {
         glClearColor(background[0], background[1], background[2], 1.0);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        // A small deterministic foreground mark makes the host's presentation
-        // contract observable without taking ownership of Ghostty's terminal
-        // model. Real embedders can use makeCurrent for the full renderer.
-        const scale = std.math.clamp(state.font_scale, 0.25, 4.0);
-        const mark_width = @min(0.25 * scale, 1.0);
-        const mark_height = @min(0.10 * scale, 1.0);
-        glBegin(GL_QUADS);
-        if (state.theme == .light) {
-            glColor3f(0.10, 0.10, 0.12);
-        } else {
-            glColor3f(0.90, 0.90, 0.92);
-        }
-        glVertex2f(-1.0, 1.0);
-        glVertex2f(-1.0 + mark_width, 1.0);
-        glVertex2f(-1.0 + mark_width, 1.0 - mark_height);
-        glVertex2f(-1.0, 1.0 - mark_height);
-        glEnd();
+        renderTerminalCells(state);
 
         var operation_error: ?Error = null;
         if (SwapBuffers(self.hdc) == 0) operation_error = error.SwapBuffersFailed;
@@ -360,6 +354,100 @@ pub const Context = struct {
             };
         }
         if (operation_error) |err| return err;
+    }
+
+    fn renderTerminalCells(state: RenderState) void {
+        if (state.terminal_columns == 0 or
+            state.terminal_rows == 0 or
+            state.terminal_cells.len == 0)
+        {
+            return;
+        }
+
+        const columns = @min(
+            state.terminal_columns,
+            @as(u32, @intCast(state.terminal_cells.len)),
+        );
+        const rows = @min(
+            state.terminal_rows,
+            @divFloor(
+                @as(u32, @intCast(state.terminal_cells.len)),
+                columns,
+            ),
+        );
+        if (columns == 0 or rows == 0) return;
+
+        const cell_width = 2.0 / @as(f32, @floatFromInt(columns));
+        const cell_height = 2.0 / @as(f32, @floatFromInt(rows));
+        const scale = std.math.clamp(state.font_scale, 0.25, 4.0);
+        const glyph_width = @min(cell_width * 0.72 * scale, cell_width * 0.86);
+        const glyph_height = @min(cell_height * 0.72 * scale, cell_height * 0.86);
+
+        for (0..@intCast(rows)) |row| {
+            for (0..@intCast(columns)) |column| {
+                const cell = state.terminal_cells[row * @as(usize, @intCast(columns)) + column];
+                const left = -1.0 + @as(f32, @floatFromInt(column)) * cell_width;
+                const top = 1.0 - @as(f32, @floatFromInt(row)) * cell_height;
+
+                if (cell.background != 0) {
+                    drawRect(
+                        left,
+                        top,
+                        cell_width,
+                        -cell_height,
+                        rgb(cell.background),
+                    );
+                }
+                if (cell.codepoint == 0 or cell.codepoint == ' ') continue;
+
+                const foreground = if (cell.foreground == 0)
+                    .{ 0.90, 0.90, 0.92 }
+                else
+                    rgb(cell.foreground);
+                const seed = cell.codepoint *% 0x9E3779B1;
+                const glyph_left = left + (cell_width - glyph_width) * 0.5;
+                const glyph_top = top - (cell_height - glyph_height) * 0.5;
+                const pixel_width = glyph_width / 5.0;
+                const pixel_height = glyph_height / 7.0;
+                for (0..7) |glyph_y| {
+                    for (0..5) |glyph_x| {
+                        const bit = (glyph_y * 5 + glyph_x) % 32;
+                        if ((seed & (@as(u32, 1) << @intCast(bit))) == 0) continue;
+                        drawRect(
+                            glyph_left + @as(f32, @floatFromInt(glyph_x)) * pixel_width,
+                            glyph_top - @as(f32, @floatFromInt(glyph_y)) * pixel_height,
+                            pixel_width * 0.9,
+                            -pixel_height * 0.9,
+                            foreground,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn drawRect(
+        left: f32,
+        top: f32,
+        width: f32,
+        height: f32,
+        color: [3]f32,
+    ) void {
+        glBegin(GL_QUADS);
+        glColor3f(color[0], color[1], color[2]);
+        glVertex2f(left, top);
+        glVertex2f(left + width, top);
+        glVertex2f(left + width, top + height);
+        glVertex2f(left, top + height);
+        glEnd();
+    }
+
+    fn rgb(value: u32) [3]f32 {
+        return .{
+            @as(f32, @floatFromInt((value >> 16) & 0xFF)) / 255.0,
+            @as(f32, @floatFromInt((value >> 8) & 0xFF)) / 255.0,
+            @as(f32, @floatFromInt(value & 0xFF)) / 255.0,
+        };
     }
 
     fn currentBinding() CurrentBinding {

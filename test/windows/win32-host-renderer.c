@@ -5,6 +5,17 @@
 #include <objbase.h>
 #include <windows.h>
 
+extern void WINAPI glReadPixels(
+    int x,
+    int y,
+    int width,
+    int height,
+    unsigned int format,
+    unsigned int type,
+    void *pixels
+);
+extern void WINAPI glReadBuffer(unsigned int mode);
+
 typedef struct test_state {
     HWND parent;
     winghostty_host *host;
@@ -27,12 +38,14 @@ typedef struct render_call {
     winghostty_result clear_current_result;
     winghostty_result render_result;
     winghostty_result present_result;
+    winghostty_result terminal_cells_result;
     winghostty_result ui_call_result;
     DWORD thread_id;
     int current_after_make;
     int current_after_other_present;
     int current_after_render;
     int current_after_clear;
+    unsigned char terminal_pixel[4];
 } render_call;
 
 typedef struct persistent_switch_call {
@@ -107,9 +120,9 @@ static void drain_messages(void) {
 
 static int wait_for_surface_finalization(winghostty_surface *surface) {
     for (int attempt = 0; attempt < 5000; ++attempt) {
-        drain_messages();
         const winghostty_result result =
             winghostty_surface_destroy(surface);
+        drain_messages();
         if (result == WINGHOSTTY_INVALID_ARGUMENT) return 1;
         if (result != WINGHOSTTY_SURFACE_INVALIDATED &&
             result != WINGHOSTTY_SHUTTING_DOWN) {
@@ -205,6 +218,16 @@ static DWORD WINAPI render_thread(void *parameter) {
     call->current_after_other_present = current_matches(call->surface);
     call->render_result = winghostty_surface_render(call->surface);
     call->current_after_render = current_matches(call->surface);
+    glReadBuffer(0x0404);
+    glReadPixels(
+        1,
+        1,
+        1,
+        1,
+        0x1908,
+        0x1401,
+        call->terminal_pixel
+    );
     call->clear_current_result =
         winghostty_surface_clear_current(call->surface);
     call->current_after_clear = current_is_clear();
@@ -931,6 +954,7 @@ static int run_renderer_contract(test_state *state) {
         .clear_current_result = WINGHOSTTY_INVALID_ARGUMENT,
         .render_result = WINGHOSTTY_INVALID_ARGUMENT,
         .present_result = WINGHOSTTY_INVALID_ARGUMENT,
+        .terminal_cells_result = WINGHOSTTY_INVALID_ARGUMENT,
         .ui_call_result = WINGHOSTTY_INVALID_ARGUMENT,
         .thread_id = 0,
         .current_after_make = 0,
@@ -938,6 +962,19 @@ static int run_renderer_contract(test_state *state) {
         .current_after_render = 0,
         .current_after_clear = 0,
     };
+    const winghostty_terminal_cell cell = {
+        .codepoint = 'A',
+        .foreground = 0xFFFFFF,
+        .background = 0xCC2211,
+        .flags = 0,
+    };
+    call.terminal_cells_result = winghostty_surface_set_terminal_cells(
+        state->surface,
+        1,
+        1,
+        &cell,
+        1
+    );
     HANDLE thread = CreateThread(NULL, 0, render_thread, &call, 0, NULL);
     if (check(thread != NULL, "render thread creation failed")) return 1;
     WaitForSingleObject(thread, INFINITE);
@@ -965,6 +1002,16 @@ static int run_renderer_contract(test_state *state) {
             "surface B presentation did not restore surface A"
         ) ||
         check(call.render_result == WINGHOSTTY_OK, "render/presentation failed") ||
+        check(
+            call.terminal_cells_result == WINGHOSTTY_OK,
+            "terminal render-state cell update failed"
+        ) ||
+        check(
+            call.terminal_pixel[0] == 0xCC &&
+                call.terminal_pixel[1] == 0x22 &&
+                call.terminal_pixel[2] == 0x11,
+            "terminal render-state cell was not pixel-observable"
+        ) ||
         check(
             call.current_after_render,
             "surface A render lost its persistent context"
