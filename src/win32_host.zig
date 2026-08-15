@@ -273,12 +273,23 @@ const mouse_wheel: u32 = 3;
 const mouse_leave: u32 = 4;
 const clipboard_text: u32 = 0;
 const clipboard_html: u32 = 1;
+const terminal_snapshot_version: u32 = 1;
 
 pub const Rect = extern struct {
     x: i32,
     y: i32,
     width: u32,
     height: u32,
+};
+
+pub const TerminalSnapshot = extern struct {
+    size: u32,
+    version: u32,
+    columns: u32,
+    rows: u32,
+    cells: ?[*]const win32_context.TerminalCell,
+    cell_count: u64,
+    generation: u64,
 };
 
 pub const Host = opaque {};
@@ -3391,20 +3402,13 @@ pub export fn winghostty_surface_clear_current(surface: ?*Surface) Result {
     return result_ok;
 }
 
-pub export fn winghostty_surface_set_terminal_cells(
-    surface: ?*Surface,
+fn setTerminalCells(
+    state: *SurfaceState,
     columns: u32,
     rows: u32,
     cells: ?[*]const win32_context.TerminalCell,
     cell_count: u64,
 ) Result {
-    var admission = admitSurface(surface) orelse
-        return unavailableSurfaceResult(surface);
-    defer releaseSurfaceAdmission(&admission);
-    const state = admission.surface;
-    const result = checkSurface(state);
-    if (result != result_ok) return result;
-
     const expected = std.math.mul(u64, columns, rows) catch
         return result_invalid_argument;
     if (expected != cell_count) return result_invalid_argument;
@@ -3426,6 +3430,60 @@ pub export fn winghostty_surface_set_terminal_cells(
     state.terminal_columns = columns;
     state.terminal_rows = rows;
     return result_ok;
+}
+
+pub export fn winghostty_terminal_snapshot_init(snapshot: ?*TerminalSnapshot) void {
+    const output = snapshot orelse return;
+    output.* = .{
+        .size = @intCast(@sizeOf(TerminalSnapshot)),
+        .version = terminal_snapshot_version,
+        .columns = 0,
+        .rows = 0,
+        .cells = null,
+        .cell_count = 0,
+        .generation = 0,
+    };
+}
+
+pub export fn winghostty_surface_set_terminal_cells(
+    surface: ?*Surface,
+    columns: u32,
+    rows: u32,
+    cells: ?[*]const win32_context.TerminalCell,
+    cell_count: u64,
+) Result {
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    return setTerminalCells(state, columns, rows, cells, cell_count);
+}
+
+pub export fn winghostty_surface_set_terminal_snapshot(
+    surface: ?*Surface,
+    snapshot: ?*const TerminalSnapshot,
+) Result {
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    const source = snapshot orelse return result_invalid_argument;
+    if (source.size < @as(u32, @intCast(@sizeOf(TerminalSnapshot))) or
+        source.version != terminal_snapshot_version)
+    {
+        return result_invalid_argument;
+    }
+    return setTerminalCells(
+        state,
+        source.columns,
+        source.rows,
+        source.cells,
+        source.cell_count,
+    );
 }
 
 pub export fn winghostty_surface_render(surface: ?*Surface) Result {

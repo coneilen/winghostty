@@ -52,6 +52,22 @@ typedef struct {
     uint32_t flags;
 } winghostty_terminal_cell;
 
+#define WINGHOSTTY_TERMINAL_SNAPSHOT_VERSION 1u
+
+/*
+ * Versioned, caller-owned render-state view. The host copies every cell
+ * before returning, so the source snapshot may be reused or released.
+ */
+typedef struct {
+    uint32_t size;
+    uint32_t version;
+    uint32_t columns;
+    uint32_t rows;
+    const winghostty_terminal_cell *cells;
+    uint64_t cell_count;
+    uint64_t generation;
+} winghostty_terminal_snapshot;
+
 typedef struct winghostty_cell_metrics {
     uint32_t font_width;
     uint32_t font_height;
@@ -459,6 +475,11 @@ winghostty_result winghostty_surface_set_terminal_cells(
     uint32_t rows,
     const winghostty_terminal_cell *cells,
     uint64_t cell_count
+);
+void winghostty_terminal_snapshot_init(winghostty_terminal_snapshot *snapshot);
+winghostty_result winghostty_surface_set_terminal_snapshot(
+    winghostty_surface *surface,
+    const winghostty_terminal_snapshot *snapshot
 );
 
 HDC winghostty_surface_get_hdc(const winghostty_surface *surface);

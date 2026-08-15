@@ -94,9 +94,20 @@ before a surface is destroyed, so retained providers return
 after teardown.
 Embedders that own a parsed libghostty-vt render state can push a copied
 `winghostty_terminal_cell` snapshot with
-`winghostty_surface_set_terminal_cells`. The provider renderer consumes that
-snapshot for the visible cell frame; `notify_accessibility_*` remains a
-separate UI Automation channel and is not used as renderer state.
+`winghostty_surface_set_terminal_snapshot` (or the legacy
+`winghostty_surface_set_terminal_cells` entry point). Initialize the
+versioned snapshot with `winghostty_terminal_snapshot_init`; the host copies
+the cells before returning and does not retain caller memory. The provider
+renderer consumes that snapshot for the visible cell frame;
+`notify_accessibility_*` remains a separate UI Automation channel and is not
+used as renderer state. The optional generation identifies a replayed
+render-state snapshot to the embedder.
+The external renderer contract builds against libghostty-vt, feeds VT output
+through `ghostty_terminal_vt_write`, converts the resulting
+`GhosttyRenderState` rows/cells into this snapshot, and verifies the rendered
+`visible` output. A reconnecting surface can replay the same caller-owned
+snapshot before its first render; no renderer state is inferred from
+`winghostty_surface_notify_terminal_text`.
 Retained UIA providers synchronize concurrent queries, updates, selection
 callbacks, and teardown; provider options advertise COM-threaded access.
 UIA selection callbacks synchronously marshal through the surface window to the

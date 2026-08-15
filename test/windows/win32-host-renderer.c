@@ -1,7 +1,11 @@
 #include "../../include/winghostty/win32_host.h"
+#include "../../include/ghostty/vt.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <objbase.h>
 #include <windows.h>
 
@@ -106,9 +110,266 @@ typedef struct process_heap_usage {
     SIZE_T busy_bytes;
 } process_heap_usage;
 
+typedef struct vt_snapshot {
+    winghostty_terminal_cell *cells;
+    uint32_t columns;
+    uint32_t rows;
+    uint32_t visible_column;
+    uint32_t visible_row;
+} vt_snapshot;
+
+typedef struct vt_render_call {
+    winghostty_surface *surface;
+    uint32_t pixel_x;
+    uint32_t pixel_y;
+    winghostty_result make_current_result;
+    winghostty_result render_result;
+    winghostty_result present_result;
+    winghostty_result clear_current_result;
+    unsigned char pixel[4];
+} vt_render_call;
+
 #define WM_UIA_SELECTION_TEST (0x8000 + 0x41)
 
 static int read_process_heap_usage(process_heap_usage *usage);
+
+static int vt_snapshot_contains(
+    const vt_snapshot *snapshot,
+    const char *text
+) {
+    const size_t text_length = strlen(text);
+    for (uint32_t row = 0; row < snapshot->rows; ++row) {
+        for (uint32_t column = 0; column + text_length <= snapshot->columns; ++column) {
+            size_t index = 0;
+            while (
+                index < text_length &&
+                snapshot->cells[row * snapshot->columns + column + index].codepoint ==
+                    (uint32_t)(unsigned char)text[index]
+            ) {
+                index++;
+            }
+            if (index == text_length) return 1;
+        }
+    }
+    return 0;
+}
+
+static void vt_snapshot_free(vt_snapshot *snapshot) {
+    free(snapshot->cells);
+    memset(snapshot, 0, sizeof(*snapshot));
+}
+
+static int vt_snapshot_from_output(
+    const char *output,
+    vt_snapshot *snapshot
+) {
+    memset(snapshot, 0, sizeof(*snapshot));
+    GhosttyTerminal terminal = NULL;
+    GhosttyRenderState render_state = NULL;
+    GhosttyRenderStateRowIterator row_iterator = NULL;
+    GhosttyRenderStateRowCells row_cells = NULL;
+    int success = 0;
+
+    const GhosttyTerminalOptions terminal_options = {
+        .cols = 80,
+        .rows = 5,
+        .max_scrollback = 64,
+    };
+    if (
+        ghostty_terminal_new(NULL, &terminal, terminal_options) !=
+            GHOSTTY_SUCCESS ||
+        ghostty_render_state_new(NULL, &render_state) != GHOSTTY_SUCCESS
+    ) {
+        goto cleanup;
+    }
+    ghostty_terminal_vt_write(
+        terminal,
+        (const uint8_t *)output,
+        strlen(output)
+    );
+    if (
+        ghostty_render_state_update(render_state, terminal) !=
+        GHOSTTY_SUCCESS
+    ) {
+        goto cleanup;
+    }
+
+    uint16_t columns = 0;
+    uint16_t rows = 0;
+    if (
+        ghostty_render_state_get(
+            render_state,
+            GHOSTTY_RENDER_STATE_DATA_COLS,
+            &columns
+        ) != GHOSTTY_SUCCESS ||
+        ghostty_render_state_get(
+            render_state,
+            GHOSTTY_RENDER_STATE_DATA_ROWS,
+            &rows
+        ) != GHOSTTY_SUCCESS ||
+        columns == 0 ||
+        rows == 0
+    ) {
+        goto cleanup;
+    }
+    snapshot->columns = columns;
+    snapshot->rows = rows;
+    snapshot->cells = calloc(
+        (size_t)columns * rows,
+        sizeof(*snapshot->cells)
+    );
+    if (snapshot->cells == NULL) goto cleanup;
+
+    GhosttyRenderStateColors colors =
+        GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
+    if (
+        ghostty_render_state_colors_get(render_state, &colors) !=
+        GHOSTTY_SUCCESS
+    ) {
+        goto cleanup;
+    }
+    if (
+        ghostty_render_state_row_iterator_new(NULL, &row_iterator) !=
+            GHOSTTY_SUCCESS ||
+        ghostty_render_state_get(
+            render_state,
+            GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR,
+            &row_iterator
+        ) != GHOSTTY_SUCCESS ||
+        ghostty_render_state_row_cells_new(NULL, &row_cells) !=
+            GHOSTTY_SUCCESS
+    ) {
+        goto cleanup;
+    }
+
+    uint32_t row = 0;
+    while (
+        row < snapshot->rows &&
+        ghostty_render_state_row_iterator_next(row_iterator)
+    ) {
+        if (
+            ghostty_render_state_row_get(
+                row_iterator,
+                GHOSTTY_RENDER_STATE_ROW_DATA_CELLS,
+                &row_cells
+            ) != GHOSTTY_SUCCESS
+        ) {
+            goto cleanup;
+        }
+        uint32_t column = 0;
+        while (
+            column < snapshot->columns &&
+            ghostty_render_state_row_cells_next(row_cells)
+        ) {
+            winghostty_terminal_cell *cell =
+                &snapshot->cells[row * snapshot->columns + column];
+            uint32_t graphemes_len = 0;
+            if (
+                ghostty_render_state_row_cells_get(
+                    row_cells,
+                    GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN,
+                    &graphemes_len
+                ) != GHOSTTY_SUCCESS
+            ) {
+                goto cleanup;
+            }
+            if (graphemes_len != 0) {
+                uint32_t codepoints[16] = {0};
+                if (
+                    ghostty_render_state_row_cells_get(
+                        row_cells,
+                        GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF,
+                        codepoints
+                    ) != GHOSTTY_SUCCESS
+                ) {
+                    goto cleanup;
+                }
+                cell->codepoint = codepoints[0];
+            }
+
+            GhosttyColorRgb color;
+            cell->foreground =
+                colors.foreground.r << 16 |
+                colors.foreground.g << 8 |
+                colors.foreground.b;
+            if (
+                ghostty_render_state_row_cells_get(
+                    row_cells,
+                    GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR,
+                    &color
+                ) == GHOSTTY_SUCCESS
+            ) {
+                cell->foreground =
+                    color.r << 16 | color.g << 8 | color.b;
+            }
+            cell->background =
+                colors.background.r << 16 |
+                colors.background.g << 8 |
+                colors.background.b;
+            if (
+                ghostty_render_state_row_cells_get(
+                    row_cells,
+                    GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR,
+                    &color
+                ) == GHOSTTY_SUCCESS
+            ) {
+                cell->background =
+                    color.r << 16 | color.g << 8 | color.b;
+            }
+            column++;
+        }
+        row++;
+    }
+    if (row != snapshot->rows) goto cleanup;
+
+    for (row = 0; row < snapshot->rows; ++row) {
+        for (uint32_t column = 0; column < snapshot->columns; ++column) {
+            if (
+                snapshot->cells[row * snapshot->columns + column].codepoint ==
+                    'v' &&
+                snapshot->cells[row * snapshot->columns + column].background ==
+                    0xCC2211
+            ) {
+                snapshot->visible_column = column;
+                snapshot->visible_row = row;
+                success = 1;
+                goto cleanup;
+            }
+        }
+    }
+
+cleanup:
+    if (row_cells != NULL) ghostty_render_state_row_cells_free(row_cells);
+    if (row_iterator != NULL) {
+        ghostty_render_state_row_iterator_free(row_iterator);
+    }
+    if (render_state != NULL) ghostty_render_state_free(render_state);
+    if (terminal != NULL) ghostty_terminal_free(terminal);
+    if (!success) vt_snapshot_free(snapshot);
+    return success;
+}
+
+static DWORD WINAPI vt_render_thread(void *parameter) {
+    vt_render_call *call = (vt_render_call *)parameter;
+    call->make_current_result =
+        winghostty_surface_make_current(call->surface);
+    if (call->make_current_result != WINGHOSTTY_OK) return 0;
+    call->render_result = winghostty_surface_render(call->surface);
+    glReadBuffer(0x0404);
+    glReadPixels(
+        (int)call->pixel_x,
+        (int)call->pixel_y,
+        1,
+        1,
+        0x1908,
+        0x1401,
+        call->pixel
+    );
+    call->present_result = winghostty_surface_present(call->surface);
+    call->clear_current_result =
+        winghostty_surface_clear_current(call->surface);
+    return 0;
+}
 
 static void drain_messages(void) {
     MSG message;
@@ -968,13 +1229,18 @@ static int run_renderer_contract(test_state *state) {
         .background = 0xCC2211,
         .flags = 0,
     };
-    call.terminal_cells_result = winghostty_surface_set_terminal_cells(
-        state->surface,
-        1,
-        1,
-        &cell,
-        1
-    );
+    winghostty_terminal_snapshot marker_snapshot;
+    winghostty_terminal_snapshot_init(&marker_snapshot);
+    marker_snapshot.columns = 1;
+    marker_snapshot.rows = 1;
+    marker_snapshot.cells = &cell;
+    marker_snapshot.cell_count = 1;
+    marker_snapshot.generation = 1;
+    call.terminal_cells_result =
+        winghostty_surface_set_terminal_snapshot(
+            state->surface,
+            &marker_snapshot
+        );
     HANDLE thread = CreateThread(NULL, 0, render_thread, &call, 0, NULL);
     if (check(thread != NULL, "render thread creation failed")) return 1;
     WaitForSingleObject(thread, INFINITE);
@@ -1053,6 +1319,134 @@ static int run_renderer_contract(test_state *state) {
     }
     state->surface = NULL;
     state->host = NULL;
+    return 0;
+}
+
+static int run_vt_render_state_contract(HWND parent) {
+    const char *output =
+        "\033[2J\033[H$ echo visible\r\n"
+        "\033[48;2;204;34;17mvisible\033[0m\r\n";
+    vt_snapshot snapshot;
+    if (
+        check(
+            vt_snapshot_from_output(output, &snapshot),
+            "libghostty-vt render-state snapshot extraction failed"
+        ) ||
+        check(
+            vt_snapshot_contains(&snapshot, "visible"),
+            "libghostty-vt render-state snapshot lost visible output"
+        )
+    ) {
+        return 1;
+    }
+
+    for (int reconnect = 0; reconnect < 2; ++reconnect) {
+        winghostty_host *host = NULL;
+        winghostty_surface *surface = NULL;
+        winghostty_surface_options options;
+        winghostty_surface_options_init(&options);
+        options.visible = 0;
+        options.bounds.width = 640;
+        options.bounds.height = 240;
+        if (
+            winghostty_host_initialize(&host) != WINGHOSTTY_OK ||
+            winghostty_host_create_surface(
+                host,
+                parent,
+                &options,
+                &surface
+            ) != WINGHOSTTY_OK ||
+            surface == NULL
+        ) {
+            if (host != NULL) winghostty_host_deinitialize(host);
+            vt_snapshot_free(&snapshot);
+            return fail("VT render-state surface setup failed");
+        }
+        winghostty_terminal_snapshot terminal_snapshot;
+        winghostty_terminal_snapshot_init(&terminal_snapshot);
+        terminal_snapshot.columns = snapshot.columns;
+        terminal_snapshot.rows = snapshot.rows;
+        terminal_snapshot.cells = snapshot.cells;
+        terminal_snapshot.cell_count =
+            (uint64_t)snapshot.columns * snapshot.rows;
+        terminal_snapshot.generation = (uint64_t)reconnect + 2;
+        if (
+            winghostty_surface_set_terminal_snapshot(
+                surface,
+                &terminal_snapshot
+            ) != WINGHOSTTY_OK
+        ) {
+            winghostty_surface_destroy(surface);
+            winghostty_host_deinitialize(host);
+            vt_snapshot_free(&snapshot);
+            return fail("VT render-state feed failed");
+        }
+
+        vt_render_call call = {
+            .surface = surface,
+            .pixel_x = snapshot.visible_column * 8 + 1,
+            .pixel_y =
+                (snapshot.rows - snapshot.visible_row - 1) * 48 + 1,
+            .make_current_result = WINGHOSTTY_INVALID_ARGUMENT,
+            .render_result = WINGHOSTTY_INVALID_ARGUMENT,
+            .present_result = WINGHOSTTY_INVALID_ARGUMENT,
+            .clear_current_result = WINGHOSTTY_INVALID_ARGUMENT,
+        };
+        HANDLE thread = CreateThread(
+            NULL,
+            0,
+            vt_render_thread,
+            &call,
+            0,
+            NULL
+        );
+        if (thread == NULL) {
+            winghostty_surface_destroy(surface);
+            winghostty_host_deinitialize(host);
+            vt_snapshot_free(&snapshot);
+            return fail("VT render-state thread creation failed");
+        }
+        WaitForSingleObject(thread, INFINITE);
+        CloseHandle(thread);
+        if (
+            call.make_current_result != WINGHOSTTY_OK ||
+            call.render_result != WINGHOSTTY_OK ||
+            call.present_result != WINGHOSTTY_OK ||
+            call.clear_current_result != WINGHOSTTY_OK
+        ) {
+            winghostty_surface_destroy(surface);
+            winghostty_host_deinitialize(host);
+            vt_snapshot_free(&snapshot);
+            return fail("VT render-state render/present failed");
+        }
+        if (
+            call.pixel[0] != 0xCC ||
+            call.pixel[1] != 0x22 ||
+            call.pixel[2] != 0x11
+        ) {
+            fprintf(
+                stderr,
+                "VT render-state pixel=%02x %02x %02x %02x\n",
+                call.pixel[0],
+                call.pixel[1],
+                call.pixel[2],
+                call.pixel[3]
+            );
+            winghostty_surface_destroy(surface);
+            winghostty_host_deinitialize(host);
+            vt_snapshot_free(&snapshot);
+            return fail("VT render-state cell was not pixel-observable");
+        }
+        if (
+            winghostty_surface_destroy(surface) != WINGHOSTTY_OK ||
+            winghostty_host_deinitialize(host) != WINGHOSTTY_OK
+        ) {
+            vt_snapshot_free(&snapshot);
+            return fail("VT render-state reconnect teardown failed");
+        }
+    }
+
+    vt_snapshot_free(&snapshot);
     return 0;
 }
 
@@ -1520,6 +1914,10 @@ int main(void) {
 
     if (run_renderer_contract(&state) != 0) {
         if (state.host) winghostty_host_deinitialize(state.host);
+        DestroyWindow(state.parent);
+        return 1;
+    }
+    if (run_vt_render_state_contract(state.parent) != 0) {
         DestroyWindow(state.parent);
         return 1;
     }
