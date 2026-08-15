@@ -100,8 +100,15 @@ versioned snapshot with `winghostty_terminal_snapshot_init`; the host copies
 the cells before returning and does not retain caller memory. The provider
 renderer consumes that snapshot for the visible cell frame;
 `notify_accessibility_*` remains a separate UI Automation channel and is not
-used as renderer state. The optional generation identifies a replayed
-render-state snapshot to the embedder.
+used as renderer state. Set
+`WINGHOSTTY_TERMINAL_CELL_FOREGROUND_SET` and
+`WINGHOSTTY_TERMINAL_CELL_BACKGROUND_SET` in each cell's flags when the
+corresponding packed RGB value is present; this preserves valid black
+(`0x000000`) rather than treating it as unset. Use the corresponding
+`*_DEFAULT` flags for explicit theme defaults. A zero flags value retains
+legacy behavior for callers that use nonzero colors and zero for defaults.
+The optional generation identifies a replayed render-state snapshot to the
+embedder.
 The external renderer contract builds against libghostty-vt, feeds VT output
 through `ghostty_terminal_vt_write`, converts the resulting
 `GhosttyRenderState` rows/cells into this snapshot, and verifies the rendered

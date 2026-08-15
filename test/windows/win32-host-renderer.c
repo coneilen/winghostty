@@ -43,12 +43,18 @@ typedef struct render_call {
     winghostty_result render_result;
     winghostty_result present_result;
     winghostty_result terminal_cells_result;
+    winghostty_result black_snapshot_result;
+    winghostty_result black_render_result;
+    winghostty_result black_make_current_result;
+    winghostty_result black_restore_result;
     winghostty_result ui_call_result;
     DWORD thread_id;
     int current_after_make;
     int current_after_other_present;
     int current_after_render;
     int current_after_clear;
+    int black_foreground_seen;
+    int black_background_seen;
     unsigned char terminal_pixel[4];
 } render_call;
 
@@ -316,6 +322,33 @@ static int vt_snapshot_from_output(
                 cell->background =
                     color.r << 16 | color.g << 8 | color.b;
             }
+            cell->flags =
+                WINGHOSTTY_TERMINAL_CELL_FOREGROUND_DEFAULT |
+                WINGHOSTTY_TERMINAL_CELL_BACKGROUND_DEFAULT;
+            if (
+                ghostty_render_state_row_cells_get(
+                    row_cells,
+                    GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR,
+                    &color
+                ) == GHOSTTY_SUCCESS
+            ) {
+                    cell->flags =
+                        (cell->flags &
+                            ~WINGHOSTTY_TERMINAL_CELL_FOREGROUND_DEFAULT) |
+                        WINGHOSTTY_TERMINAL_CELL_FOREGROUND_SET;
+                }
+            if (
+                ghostty_render_state_row_cells_get(
+                    row_cells,
+                    GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR,
+                    &color
+                ) == GHOSTTY_SUCCESS
+            ) {
+                    cell->flags =
+                        (cell->flags &
+                            ~WINGHOSTTY_TERMINAL_CELL_BACKGROUND_DEFAULT) |
+                        WINGHOSTTY_TERMINAL_CELL_BACKGROUND_SET;
+                }
             column++;
         }
         row++;
@@ -489,6 +522,32 @@ static DWORD WINAPI render_thread(void *parameter) {
         0x1401,
         call->terminal_pixel
     );
+    call->black_render_result =
+        winghostty_surface_render(call->other_surface);
+    call->black_make_current_result =
+        winghostty_surface_make_current(call->other_surface);
+    unsigned char pixels[320 * 240 * 4];
+    memset(pixels, 0, sizeof(pixels));
+    glReadPixels(0, 0, 320, 240, 0x1908, 0x1401, pixels);
+    for (int y = 0; y < 240; ++y) {
+        for (int x = 0; x < 320; ++x) {
+            const unsigned char *pixel = &pixels[(y * 320 + x) * 4];
+            if (x < 160 &&
+                pixel[0] == 0 &&
+                pixel[1] == 0 &&
+                pixel[2] == 0) {
+                call->black_foreground_seen = 1;
+            }
+            if (x >= 160 &&
+                pixel[0] == 0 &&
+                pixel[1] == 0 &&
+                pixel[2] == 0) {
+                call->black_background_seen = 1;
+            }
+        }
+    }
+    call->black_restore_result =
+        winghostty_surface_make_current(call->surface);
     call->clear_current_result =
         winghostty_surface_clear_current(call->surface);
     call->current_after_clear = current_is_clear();
@@ -1216,6 +1275,10 @@ static int run_renderer_contract(test_state *state) {
         .render_result = WINGHOSTTY_INVALID_ARGUMENT,
         .present_result = WINGHOSTTY_INVALID_ARGUMENT,
         .terminal_cells_result = WINGHOSTTY_INVALID_ARGUMENT,
+        .black_snapshot_result = WINGHOSTTY_INVALID_ARGUMENT,
+        .black_render_result = WINGHOSTTY_INVALID_ARGUMENT,
+        .black_make_current_result = WINGHOSTTY_INVALID_ARGUMENT,
+        .black_restore_result = WINGHOSTTY_INVALID_ARGUMENT,
         .ui_call_result = WINGHOSTTY_INVALID_ARGUMENT,
         .thread_id = 0,
         .current_after_make = 0,
@@ -1227,7 +1290,27 @@ static int run_renderer_contract(test_state *state) {
         .codepoint = 'A',
         .foreground = 0xFFFFFF,
         .background = 0xCC2211,
-        .flags = 0,
+        .flags =
+            WINGHOSTTY_TERMINAL_CELL_FOREGROUND_SET |
+            WINGHOSTTY_TERMINAL_CELL_BACKGROUND_SET,
+    };
+    const winghostty_terminal_cell black_cells[] = {
+        {
+            .codepoint = 'B',
+            .foreground = 0x000000,
+            .background = 0xCC2211,
+            .flags =
+                WINGHOSTTY_TERMINAL_CELL_FOREGROUND_SET |
+                WINGHOSTTY_TERMINAL_CELL_BACKGROUND_SET,
+        },
+        {
+            .codepoint = 'C',
+            .foreground = 0xFFFFFF,
+            .background = 0x000000,
+            .flags =
+                WINGHOSTTY_TERMINAL_CELL_FOREGROUND_SET |
+                WINGHOSTTY_TERMINAL_CELL_BACKGROUND_SET,
+        },
     };
     winghostty_terminal_snapshot marker_snapshot;
     winghostty_terminal_snapshot_init(&marker_snapshot);
@@ -1240,6 +1323,18 @@ static int run_renderer_contract(test_state *state) {
         winghostty_surface_set_terminal_snapshot(
             state->surface,
             &marker_snapshot
+        );
+    winghostty_terminal_snapshot black_snapshot;
+    winghostty_terminal_snapshot_init(&black_snapshot);
+    black_snapshot.columns = 2;
+    black_snapshot.rows = 1;
+    black_snapshot.cells = black_cells;
+    black_snapshot.cell_count = 2;
+    black_snapshot.generation = 2;
+    call.black_snapshot_result =
+        winghostty_surface_set_terminal_snapshot(
+            second,
+            &black_snapshot
         );
     HANDLE thread = CreateThread(NULL, 0, render_thread, &call, 0, NULL);
     if (check(thread != NULL, "render thread creation failed")) return 1;
@@ -1273,6 +1368,15 @@ static int run_renderer_contract(test_state *state) {
             "terminal render-state cell update failed"
         ) ||
         check(
+            call.black_snapshot_result == WINGHOSTTY_OK &&
+                call.black_render_result == WINGHOSTTY_OK &&
+                call.black_make_current_result == WINGHOSTTY_OK &&
+                call.black_restore_result == WINGHOSTTY_OK &&
+                call.black_foreground_seen &&
+                call.black_background_seen,
+            "explicit black foreground/background colors were not rendered"
+        ) ||
+        check(
             call.terminal_pixel[0] == 0xCC &&
                 call.terminal_pixel[1] == 0x22 &&
                 call.terminal_pixel[2] == 0x11,
@@ -1294,7 +1398,7 @@ static int run_renderer_contract(test_state *state) {
             "presentation count did not advance"
         ) ||
         check(
-            winghostty_surface_get_present_count(second) == 1,
+            winghostty_surface_get_present_count(second) == 2,
             "surface B presentation count did not advance"
         )) {
         return 1;

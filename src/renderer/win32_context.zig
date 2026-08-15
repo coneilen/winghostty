@@ -115,6 +115,11 @@ pub const TerminalCell = extern struct {
     flags: u32,
 };
 
+pub const terminal_cell_foreground_set: u32 = 1 << 0;
+pub const terminal_cell_background_set: u32 = 1 << 1;
+pub const terminal_cell_foreground_default: u32 = 1 << 2;
+pub const terminal_cell_background_default: u32 = 1 << 3;
+
 pub const RenderState = struct {
     theme: Theme = .system,
     font_scale: f32 = 1.0,
@@ -382,6 +387,8 @@ pub const Context = struct {
         const scale = std.math.clamp(state.font_scale, 0.25, 4.0);
         const glyph_width = @min(cell_width * 0.72 * scale, cell_width * 0.86);
         const glyph_height = @min(cell_height * 0.72 * scale, cell_height * 0.86);
+        const default_background = backgroundColor(state.theme);
+        const default_foreground = .{ 0.90, 0.90, 0.92 };
 
         for (0..@intCast(rows)) |row| {
             for (0..@intCast(columns)) |column| {
@@ -389,19 +396,22 @@ pub const Context = struct {
                 const left = -1.0 + @as(f32, @floatFromInt(column)) * cell_width;
                 const top = 1.0 - @as(f32, @floatFromInt(row)) * cell_height;
 
-                if (cell.background != 0) {
-                    drawRect(
-                        left,
-                        top,
-                        cell_width,
-                        -cell_height,
-                        rgb(cell.background),
-                    );
-                }
+                const legacy_colors = cell.flags == 0;
+                const background_set =
+                    (cell.flags & terminal_cell_background_set) != 0 or
+                    (legacy_colors and cell.background != 0);
+                const foreground_set =
+                    (cell.flags & terminal_cell_foreground_set) != 0 or
+                    (legacy_colors and cell.foreground != 0);
+                const background = if (background_set)
+                    rgb(cell.background)
+                else
+                    default_background;
+                drawRect(left, top, cell_width, -cell_height, background);
                 if (cell.codepoint == 0 or cell.codepoint == ' ') continue;
 
-                const foreground = if (cell.foreground == 0)
-                    .{ 0.90, 0.90, 0.92 }
+                const foreground = if (!foreground_set)
+                    default_foreground
                 else
                     rgb(cell.foreground);
                 const seed = cell.codepoint *% 0x9E3779B1;

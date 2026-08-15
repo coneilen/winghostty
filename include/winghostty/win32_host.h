@@ -45,6 +45,11 @@ typedef struct winghostty_rect {
  * (0xRRGGBB); codepoint zero represents an empty cell. The host keeps its
  * own copy, so callers may release the input buffer after the update.
  */
+#define WINGHOSTTY_TERMINAL_CELL_FOREGROUND_SET (1u << 0)
+#define WINGHOSTTY_TERMINAL_CELL_BACKGROUND_SET (1u << 1)
+#define WINGHOSTTY_TERMINAL_CELL_FOREGROUND_DEFAULT (1u << 2)
+#define WINGHOSTTY_TERMINAL_CELL_BACKGROUND_DEFAULT (1u << 3)
+
 typedef struct {
     uint32_t codepoint;
     uint32_t foreground;
