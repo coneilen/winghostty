@@ -55,6 +55,9 @@ typedef struct input_context {
     int saw_unicode;
     int saw_dead_composition;
     int saw_wheel;
+    int metrics_phase;
+    int saw_initial_hit;
+    int saw_initial_selection;
     int saw_scaled_hit;
     int saw_scaled_selection;
     int wheel_x;
@@ -256,7 +259,13 @@ static void on_mouse(
         context->wheel_x = event->x;
         context->wheel_y = event->y;
     }
-    if (event->x == 14 && event->y == 29 &&
+    if (context->metrics_phase == 1 &&
+        event->x == 9 && event->y == 19 &&
+        event->cell_x == 0 && event->cell_y == 0) {
+        context->saw_initial_hit = 1;
+    }
+    if (context->metrics_phase == 2 &&
+        event->x == 14 && event->y == 29 &&
         event->cell_x == 0 && event->cell_y == 0) {
         context->saw_scaled_hit = 1;
     }
@@ -281,7 +290,13 @@ static void on_selection(
     record(context, user_data);
     InterlockedIncrement(&context->selection);
     if (event->dragging) context->saw_selection_drag = 1;
-    if (event->anchor_x == 0 && event->anchor_y == 0 &&
+    if (context->metrics_phase == 1 &&
+        event->anchor_x == 0 && event->anchor_y == 0 &&
+        event->current_x == 0 && event->current_y == 0) {
+        context->saw_initial_selection = 1;
+    }
+    if (context->metrics_phase == 2 &&
+        event->anchor_x == 0 && event->anchor_y == 0 &&
         event->current_x == 0 && event->current_y == 0) {
         context->saw_scaled_selection = 1;
     }
@@ -773,6 +788,21 @@ int main(void) {
     options.input_callbacks.on_paste = on_paste;
     options.input_callbacks.on_clipboard_read = on_clipboard_read;
     options.input_callbacks.on_clipboard_write = on_clipboard_write;
+    options.input.cell_width = 10;
+    options.input.cell_height = 20;
+
+    winghostty_surface_options_v2 invalid_options = options;
+    invalid_options.input.cell_width = 0;
+    winghostty_surface *invalid_surface = NULL;
+    if (winghostty_host_create_surface_v2(
+            host,
+            context.parent,
+            &invalid_options,
+            &invalid_surface
+        ) != WINGHOSTTY_INVALID_ARGUMENT ||
+        invalid_surface != NULL) {
+        return fail();
+    }
 
     winghostty_surface *first = NULL;
     if (winghostty_host_create_surface_v2(host, context.parent, &options, &first) !=
@@ -783,6 +813,18 @@ int main(void) {
     layout[0] = 'X';
     HWND first_hwnd = winghostty_surface_get_hwnd(first);
     if (!first_hwnd) return fail();
+    SendMessageW(first_hwnd, WM_DPICHANGED, MAKELPARAM(96, 96), 0);
+    context.metrics_phase = 1;
+    SendMessageW(first_hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(9, 19));
+    SendMessageW(first_hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(9, 19));
+    SendMessageW(first_hwnd, WM_LBUTTONUP, 0, MAKELPARAM(9, 19));
+
+    SendMessageW(first_hwnd, WM_DPICHANGED, MAKELPARAM(144, 144), 0);
+    context.metrics_phase = 2;
+    SendMessageW(first_hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(14, 29));
+    SendMessageW(first_hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(14, 29));
+    SendMessageW(first_hwnd, WM_LBUTTONUP, 0, MAKELPARAM(14, 29));
+
     winghostty_cell_metrics changed_metrics = {
         .font_width = 10,
         .font_height = 20,
@@ -983,6 +1025,8 @@ int main(void) {
         context.links < 1 ||
         !context.saw_link_click ||
         !context.saw_selection_drag ||
+        !context.saw_initial_hit ||
+        !context.saw_initial_selection ||
         !context.saw_scaled_hit ||
         !context.saw_scaled_selection ||
         !context.saw_wheel ||

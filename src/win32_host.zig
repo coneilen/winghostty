@@ -2785,6 +2785,9 @@ fn createSurface(
     if (source.theme < 0 or source.theme > 2) {
         return result_invalid_argument;
     }
+    if (source.input.cell_width == 0 or source.input.cell_height == 0) {
+        return result_invalid_argument;
+    }
     if (source.bounds.width > std.math.maxInt(i32) or
         source.bounds.height > std.math.maxInt(i32))
     {
@@ -2809,6 +2812,10 @@ fn createSurface(
         .parent = parent_hwnd,
         .options = owned,
         .keyboard_layout = GetKeyboardLayout(0),
+        .base_metrics = .{
+            .cell_width = source.input.cell_width,
+            .cell_height = source.input.cell_height,
+        },
     };
     registerSurface(surface) catch {
         surface.options.deinit();
