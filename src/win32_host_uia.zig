@@ -1257,7 +1257,10 @@ pub const SurfaceProvider = struct {
 };
 
 const SurfaceTextRangeProvider = struct {
+    const implementation_magic: usize = 0x53545250;
+
     base: com.ITextRangeProvider,
+    magic: usize,
     refcount: std.atomic.Value(u32),
     alloc: std.mem.Allocator,
     parent: *SurfaceProvider,
@@ -1311,6 +1314,7 @@ const SurfaceTextRangeProvider = struct {
         errdefer _ = SurfaceProvider.Release(&parent.base);
         self.* = .{
             .base = .{ .vtbl = &vtbl },
+            .magic = implementation_magic,
             .refcount = std.atomic.Value(u32).init(1),
             .alloc = alloc,
             .parent = parent,
@@ -1323,6 +1327,11 @@ const SurfaceTextRangeProvider = struct {
 
     fn fromBase(value: *com.ITextRangeProvider) *SurfaceTextRangeProvider {
         return @fieldParentPtr("base", value);
+    }
+    fn fromOwnedBase(value: *com.ITextRangeProvider) ?*SurfaceTextRangeProvider {
+        if (value.vtbl != &vtbl) return null;
+        const candidate: *SurfaceTextRangeProvider = @fieldParentPtr("base", value);
+        return if (candidate.magic == implementation_magic) candidate else null;
     }
     fn available(self: *const SurfaceTextRangeProvider) bool {
         return self.parent.available();
@@ -1428,11 +1437,12 @@ const SurfaceTextRangeProvider = struct {
     }
     fn Compare(value: *com.ITextRangeProvider, other: ?*com.ITextRangeProvider, out: *com.BOOL) callconv(.winapi) com.HRESULT {
         const self = fromBase(value);
+        out.* = 0;
         const rhs = other orelse {
-            out.* = 0;
             return com.E_INVALIDARG;
         };
-        const other_range = fromBase(rhs);
+        const other_range = fromOwnedBase(rhs) orelse return com.S_OK;
+        if (self.parent != other_range.parent) return com.S_OK;
         if (!self.available() or !other_range.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         const lhs = self.rangeCopy();
         const rhs_range = other_range.rangeCopy();
@@ -1450,7 +1460,8 @@ const SurfaceTextRangeProvider = struct {
     ) callconv(.winapi) com.HRESULT {
         const self = fromBase(value);
         const rhs = other orelse return com.E_INVALIDARG;
-        const other_range = fromBase(rhs);
+        const other_range = fromOwnedBase(rhs) orelse return com.E_INVALIDARG;
+        if (self.parent != other_range.parent) return com.E_INVALIDARG;
         if (!self.available() or !other_range.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         const lhs_range = self.rangeCopy();
         const rhs_range = other_range.rangeCopy();
@@ -1738,7 +1749,8 @@ const SurfaceTextRangeProvider = struct {
     ) callconv(.winapi) com.HRESULT {
         const self = fromBase(value);
         const rhs = other orelse return com.E_INVALIDARG;
-        const other_range = fromBase(rhs);
+        const other_range = fromOwnedBase(rhs) orelse return com.E_INVALIDARG;
+        if (self.parent != other_range.parent) return com.E_INVALIDARG;
         if (!self.available() or !other_range.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         const other_copy = other_range.rangeCopy();
         self.range_lock.lock();
@@ -2223,6 +2235,98 @@ test "clones and FindText retain the source snapshot" {
     try std.testing.expectEqualStrings(
         "target",
         found_utf8,
+    );
+}
+
+test "foreign UIA ranges are rejected without unsafe casts" {
+    var first = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(1), .{
+        .text = "same",
+    });
+    defer _ = SurfaceProvider.Release(&first.base);
+    var second = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(2), .{
+        .text = "same",
+    });
+    defer _ = SurfaceProvider.Release(&second.base);
+
+    var lhs = try SurfaceTextRangeProvider.create(
+        std.testing.allocator,
+        first,
+        .{ .start = 0, .end = 2 },
+    );
+    defer _ = SurfaceTextRangeProvider.Release(&lhs.base);
+    var same_owner = try SurfaceTextRangeProvider.create(
+        std.testing.allocator,
+        first,
+        .{ .start = 0, .end = 2 },
+    );
+    defer _ = SurfaceTextRangeProvider.Release(&same_owner.base);
+    var foreign = try SurfaceTextRangeProvider.create(
+        std.testing.allocator,
+        second,
+        .{ .start = 0, .end = 2 },
+    );
+    defer _ = SurfaceTextRangeProvider.Release(&foreign.base);
+
+    var equal: com.BOOL = 0;
+    try std.testing.expectEqual(
+        com.S_OK,
+        SurfaceTextRangeProvider.Compare(&lhs.base, &same_owner.base, &equal),
+    );
+    try std.testing.expectEqual(@as(com.BOOL, 1), equal);
+    try std.testing.expectEqual(
+        com.S_OK,
+        SurfaceTextRangeProvider.Compare(&lhs.base, &foreign.base, &equal),
+    );
+    try std.testing.expectEqual(@as(com.BOOL, 0), equal);
+
+    var comparison: i32 = 99;
+    try std.testing.expectEqual(
+        com.E_INVALIDARG,
+        SurfaceTextRangeProvider.CompareEndpoints(
+            &lhs.base,
+            com.TextPatternRangeEndpoint_Start,
+            &foreign.base,
+            com.TextPatternRangeEndpoint_Start,
+            &comparison,
+        ),
+    );
+    try std.testing.expectEqual(
+        com.E_INVALIDARG,
+        SurfaceTextRangeProvider.MoveEndpointByRange(
+            &lhs.base,
+            com.TextPatternRangeEndpoint_Start,
+            &foreign.base,
+            com.TextPatternRangeEndpoint_Start,
+        ),
+    );
+    try std.testing.expectEqual(Range{ .start = 0, .end = 2 }, lhs.range);
+
+    var fake_vtbl: com.ITextRangeProviderVtbl = undefined;
+    var fake = com.ITextRangeProvider{ .vtbl = &fake_vtbl };
+    equal = 1;
+    try std.testing.expectEqual(
+        com.S_OK,
+        SurfaceTextRangeProvider.Compare(&lhs.base, &fake, &equal),
+    );
+    try std.testing.expectEqual(@as(com.BOOL, 0), equal);
+    try std.testing.expectEqual(
+        com.E_INVALIDARG,
+        SurfaceTextRangeProvider.CompareEndpoints(
+            &lhs.base,
+            com.TextPatternRangeEndpoint_Start,
+            &fake,
+            com.TextPatternRangeEndpoint_Start,
+            &comparison,
+        ),
+    );
+    try std.testing.expectEqual(
+        com.E_INVALIDARG,
+        SurfaceTextRangeProvider.MoveEndpointByRange(
+            &lhs.base,
+            com.TextPatternRangeEndpoint_Start,
+            &fake,
+            com.TextPatternRangeEndpoint_Start,
+        ),
     );
 }
 
