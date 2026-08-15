@@ -18,6 +18,13 @@ extern "user32" fn ClientToScreen(
     hwnd: com.HWND,
     point: *ScreenOrigin,
 ) callconv(.winapi) com.BOOL;
+extern "kernel32" fn CompareStringOrdinal(
+    first: [*]const u16,
+    first_length: i32,
+    second: [*]const u16,
+    second_length: i32,
+    ignore_case: com.BOOL,
+) callconv(.winapi) i32;
 pub const ScreenOriginQuery = *const fn (com.HWND) ?ScreenOrigin;
 
 pub const Range = struct {
@@ -1364,7 +1371,9 @@ const SurfaceTextRangeProvider = struct {
     }
 
     fn geometryMetrics(self: *SurfaceTextRangeProvider) Metrics {
-        return self.snapshot.metrics;
+        self.parent.state_lock.lockShared();
+        defer self.parent.state_lock.unlockShared();
+        return self.parent.snapshot.metrics;
     }
 
     fn lineBounds(self: *const SurfaceTextRangeProvider) Range {
@@ -1470,7 +1479,7 @@ const SurfaceTextRangeProvider = struct {
         value: *com.ITextRangeProvider,
         needle: ?[*]const u16,
         backward: com.BOOL,
-        _: com.BOOL,
+        ignore_case: com.BOOL,
         out: *?*com.ITextRangeProvider,
     ) callconv(.winapi) com.HRESULT {
         const self = fromBase(value);
@@ -1481,18 +1490,79 @@ const SurfaceTextRangeProvider = struct {
         const needle_ptr = needle orelse return com.E_INVALIDARG;
         var length: usize = 0;
         while (needle_ptr[length] != 0) : (length += 1) {}
-        const needle_utf8 = std.unicode.utf16LeToUtf8Alloc(self.alloc, needle_ptr[0..length]) catch
-            return com.E_INVALIDARG;
-        defer self.alloc.free(needle_utf8);
         const bytes = self.byteRange();
         const haystack = self.snapshot.text[bytes.start..bytes.end];
-        const found = if (backward != 0)
-            std.mem.lastIndexOf(u8, haystack, needle_utf8)
-        else
-            std.mem.indexOf(u8, haystack, needle_utf8);
-        const at = found orelse return com.S_OK;
-        const start_byte = bytes.start + at;
-        const end_byte = start_byte + needle_utf8.len;
+        var start_byte: usize = undefined;
+        var end_byte: usize = undefined;
+        if (ignore_case != 0) {
+            if (length == 0 or length > std.math.maxInt(i32)) return com.S_OK;
+            const haystack_utf16 = std.unicode.utf8ToUtf16LeAlloc(
+                self.alloc,
+                haystack,
+            ) catch return com.E_INVALIDARG;
+            defer self.alloc.free(haystack_utf16);
+            if (length > haystack_utf16.len) return com.S_OK;
+
+            const no_boundary = std.math.maxInt(usize);
+            const byte_for_utf16 = self.alloc.alloc(
+                usize,
+                haystack_utf16.len + 1,
+            ) catch return com.E_OUTOFMEMORY;
+            defer self.alloc.free(byte_for_utf16);
+            @memset(byte_for_utf16, no_boundary);
+            byte_for_utf16[0] = 0;
+            var byte_offset: usize = 0;
+            var utf16_offset: usize = 0;
+            while (byte_offset < haystack.len) {
+                const scalar_len = std.unicode.utf8ByteSequenceLength(
+                    haystack[byte_offset],
+                ) catch return com.E_INVALIDARG;
+                if (byte_offset + scalar_len > haystack.len) return com.E_INVALIDARG;
+                const codepoint = std.unicode.utf8Decode(
+                    haystack[byte_offset .. byte_offset + scalar_len],
+                ) catch return com.E_INVALIDARG;
+                byte_offset += scalar_len;
+                utf16_offset += if (codepoint <= 0xffff) 1 else 2;
+                byte_for_utf16[utf16_offset] = byte_offset;
+            }
+
+            const first_start: usize = 0;
+            const first_end = haystack_utf16.len;
+            if (first_end < first_start + length) return com.S_OK;
+            const last_start = first_end - length;
+            var match_start: ?usize = null;
+            var start = first_start;
+            while (start <= last_start) : (start += 1) {
+                const end = start + length;
+                if (byte_for_utf16[start] == no_boundary or
+                    byte_for_utf16[end] == no_boundary) continue;
+                if (CompareStringOrdinal(
+                    haystack_utf16.ptr + start,
+                    @intCast(length),
+                    needle_ptr,
+                    @intCast(length),
+                    1,
+                ) != 2) continue;
+                match_start = start;
+                if (backward == 0) break;
+            }
+            const matched_start = match_start orelse return com.S_OK;
+            start_byte = bytes.start + byte_for_utf16[matched_start];
+            end_byte = bytes.start + byte_for_utf16[matched_start + length];
+        } else {
+            const needle_utf8 = std.unicode.utf16LeToUtf8Alloc(
+                self.alloc,
+                needle_ptr[0..length],
+            ) catch return com.E_INVALIDARG;
+            defer self.alloc.free(needle_utf8);
+            const found = if (backward != 0)
+                std.mem.lastIndexOf(u8, haystack, needle_utf8)
+            else
+                std.mem.indexOf(u8, haystack, needle_utf8);
+            const at = found orelse return com.S_OK;
+            start_byte = bytes.start + at;
+            end_byte = start_byte + needle_utf8.len;
+        }
         var snapshot = snapshotClone(self.alloc, &self.snapshot) catch
             return com.E_OUTOFMEMORY;
         const range = SurfaceTextRangeProvider.createWithSnapshot(
@@ -2108,6 +2178,69 @@ test "clones and FindText retain the source snapshot" {
     );
 }
 
+test "FindText ignoreCase is Unicode-aware, bounded, and directional" {
+    var provider = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(1), .{
+        .text = "one Äpfel two äPFEL three",
+    });
+    defer _ = SurfaceProvider.Release(&provider.base);
+
+    var document: ?*com.ITextRangeProvider = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        provider.textGetDocumentRange(&document),
+    );
+    defer _ = SurfaceTextRangeProvider.Release(document.?);
+
+    const needle = try std.unicode.utf8ToUtf16LeAllocZ(
+        std.testing.allocator,
+        "ÄPFEL",
+    );
+    defer std.testing.allocator.free(needle);
+
+    var forward: ?*com.ITextRangeProvider = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        document.?.vtbl.FindText(document.?, needle.ptr, 0, 1, &forward),
+    );
+    defer _ = SurfaceTextRangeProvider.Release(forward.?);
+    const first_byte = std.mem.indexOf(u8, provider.snapshot.text, "Äpfel").?;
+    const first_start = provider.snapshot.utf16_for_byte[first_byte];
+    try std.testing.expectEqual(
+        Range{ .start = first_start, .end = first_start + needle.len },
+        SurfaceTextRangeProvider.fromBase(forward.?).range,
+    );
+
+    var backward: ?*com.ITextRangeProvider = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        document.?.vtbl.FindText(document.?, needle.ptr, 1, 1, &backward),
+    );
+    defer _ = SurfaceTextRangeProvider.Release(backward.?);
+    const second_byte = std.mem.indexOf(u8, provider.snapshot.text, "äPFEL").?;
+    const second_start = provider.snapshot.utf16_for_byte[second_byte];
+    try std.testing.expectEqual(
+        Range{ .start = second_start, .end = second_start + needle.len },
+        SurfaceTextRangeProvider.fromBase(backward.?).range,
+    );
+
+    var bounded = try SurfaceTextRangeProvider.create(
+        std.testing.allocator,
+        provider,
+        .{ .start = 0, .end = first_start + needle.len },
+    );
+    defer _ = SurfaceTextRangeProvider.Release(&bounded.base);
+    var bounded_found: ?*com.ITextRangeProvider = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        bounded.base.vtbl.FindText(&bounded.base, needle.ptr, 1, 1, &bounded_found),
+    );
+    defer _ = SurfaceTextRangeProvider.Release(bounded_found.?);
+    try std.testing.expectEqual(
+        Range{ .start = first_start, .end = first_start + needle.len },
+        SurfaceTextRangeProvider.fromBase(bounded_found.?).range,
+    );
+}
+
 test "provider creation cleans up name exactly once on allocation failure" {
     for (1..4) |fail_index| {
         var failing = std.testing.FailingAllocator.init(
@@ -2180,6 +2313,81 @@ test "bounding rectangles use document rows and empty degenerate ranges" {
         com.SafeArrayGetUBound(empty.?, 0, &upper),
     );
     _ = com.SafeArrayDestroy(empty);
+}
+
+test "retained ranges follow current geometry without replacing their snapshot" {
+    var provider = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(1), .{
+        .text = "AB",
+        .metrics = .{
+            .cell_width = 10,
+            .cell_height = 20,
+            .origin_x = 100,
+            .origin_y = 200,
+        },
+    });
+    defer _ = SurfaceProvider.Release(&provider.base);
+
+    var range = try SurfaceTextRangeProvider.create(
+        std.testing.allocator,
+        provider,
+        .{ .start = 0, .end = 2 },
+    );
+    defer _ = SurfaceTextRangeProvider.Release(&range.base);
+
+    provider.updateMetrics(.{
+        .cell_width = 15,
+        .cell_height = 30,
+        .origin_x = 400,
+        .origin_y = 500,
+    });
+
+    var text: ?[*:0]u16 = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        SurfaceTextRangeProvider.GetText(&range.base, -1, &text),
+    );
+    defer com.SysFreeString(text);
+    const utf8 = try std.unicode.utf16LeToUtf8Alloc(
+        std.testing.allocator,
+        std.mem.span(text.?),
+    );
+    defer std.testing.allocator.free(utf8);
+    try std.testing.expectEqualStrings("AB", utf8);
+
+    var rectangles: ?*com.SAFEARRAY = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        SurfaceTextRangeProvider.GetBoundingRectangles(&range.base, &rectangles),
+    );
+    var left: f64 = 0;
+    var top: f64 = 0;
+    var width: f64 = 0;
+    var height: f64 = 0;
+    var left_index: i32 = 0;
+    var top_index: i32 = 1;
+    var width_index: i32 = 2;
+    var height_index: i32 = 3;
+    try std.testing.expectEqual(
+        com.S_OK,
+        com.SafeArrayGetElement(rectangles.?, &left_index, &left),
+    );
+    try std.testing.expectEqual(
+        com.S_OK,
+        com.SafeArrayGetElement(rectangles.?, &top_index, &top),
+    );
+    try std.testing.expectEqual(
+        com.S_OK,
+        com.SafeArrayGetElement(rectangles.?, &width_index, &width),
+    );
+    try std.testing.expectEqual(
+        com.S_OK,
+        com.SafeArrayGetElement(rectangles.?, &height_index, &height),
+    );
+    try std.testing.expectEqual(@as(f64, 400), left);
+    try std.testing.expectEqual(@as(f64, 500), top);
+    try std.testing.expectEqual(@as(f64, 30), width);
+    try std.testing.expectEqual(@as(f64, 30), height);
+    _ = com.SafeArrayDestroy(rectangles);
 }
 
 test "bounding rectangles use the selected column and exact line widths" {

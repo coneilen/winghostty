@@ -184,19 +184,32 @@ pub fn fragmentToPlainText(
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(alloc);
     var index: usize = 0;
+    var no_future_tag_end = false;
+    var no_future_entity_end = false;
+    var entity_end: ?usize = null;
     while (index < fragment.len) {
         if (std.mem.startsWith(u8, fragment[index..], "<!--")) {
-            const end = std.mem.indexOfPos(u8, fragment, index + 4, "-->") orelse
-                fragment.len - 3;
-            index = @min(end + 3, fragment.len);
+            const end = std.mem.indexOfPos(u8, fragment, index + 4, "-->") orelse {
+                index = fragment.len;
+                continue;
+            };
+            index = end + 3;
             continue;
         }
         if (fragment[index] == '<') {
-            const end = std.mem.indexOfScalarPos(u8, fragment, index + 1, '>') orelse {
+            if (no_future_tag_end) {
                 try output.append(alloc, fragment[index]);
                 index += 1;
                 continue;
-            };
+            }
+            var end = index + 1;
+            while (end < fragment.len and fragment[end] != '>') : (end += 1) {}
+            if (end == fragment.len) {
+                no_future_tag_end = true;
+                try output.append(alloc, fragment[index]);
+                index += 1;
+                continue;
+            }
             const tag = tagName(fragment[index + 1 .. end]);
             const closing = std.mem.startsWith(u8, fragment[index + 1 .. end], "/");
             if (std.ascii.eqlIgnoreCase(tag, "br") or
@@ -210,13 +223,26 @@ pub fn fragmentToPlainText(
             continue;
         }
         if (fragment[index] == '&') {
-            if (std.mem.indexOfScalarPos(u8, fragment, index + 1, ';')) |end| {
+            if (entity_end) |known_end| {
+                if (known_end <= index) entity_end = null;
+            }
+            if (entity_end == null and !no_future_entity_end) {
+                var end = index + 1;
+                while (end < fragment.len and fragment[end] != ';') : (end += 1) {}
+                if (end == fragment.len) {
+                    no_future_entity_end = true;
+                } else {
+                    entity_end = end;
+                }
+            }
+            if (entity_end) |end| {
                 if (try appendEntity(
                     &output,
                     alloc,
                     fragment[index + 1 .. end],
                 )) {
                     index = end + 1;
+                    entity_end = null;
                     continue;
                 }
             }
@@ -385,4 +411,21 @@ test "fragmentToPlainText removes markup and decodes entities" {
     );
     defer alloc.free(plain);
     try std.testing.expectEqualStrings("Hello & world\n🚀", plain);
+}
+
+test "fragmentToPlainText bounds malformed delimiter scanning" {
+    const alloc = std.testing.allocator;
+    const repeated = 32 * 1024;
+    const malformed = try alloc.alloc(u8, repeated * 2);
+    defer alloc.free(malformed);
+    @memset(malformed[0..repeated], '<');
+    @memset(malformed[repeated..], '&');
+
+    const started = std.time.nanoTimestamp();
+    const plain = try fragmentToPlainText(alloc, malformed);
+    defer alloc.free(plain);
+    const elapsed = std.time.nanoTimestamp() - started;
+
+    try std.testing.expectEqualSlices(u8, malformed, plain);
+    try std.testing.expect(elapsed < 100 * std.time.ns_per_ms);
 }
