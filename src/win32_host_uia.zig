@@ -1591,6 +1591,7 @@ const SurfaceTextRangeProvider = struct {
         const self = fromBase(value);
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
+        self.parent.refreshScreenOrigin();
         self.range_lock.lock();
         defer self.range_lock.unlock();
         const metrics = self.geometryMetrics();
@@ -1992,6 +1993,15 @@ fn testScreenOriginQuery(_: com.HWND) ?ScreenOrigin {
     return .{ .x = 300, .y = 400 };
 }
 
+var movingTestScreenOriginX = std.atomic.Value(i32).init(300);
+
+fn movingTestScreenOriginQuery(_: com.HWND) ?ScreenOrigin {
+    return .{
+        .x = movingTestScreenOriginX.load(.acquire),
+        .y = 400,
+    };
+}
+
 test "geometry queries refresh screen-space origin" {
     var provider = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(1), .{
         .text = "AB",
@@ -2008,6 +2018,44 @@ test "geometry queries refresh screen-space origin" {
     const value = SurfaceTextRangeProvider.fromBase(range.?);
     try std.testing.expectEqual(Range{ .start = 1, .end = 1 }, value.range);
     _ = SurfaceTextRangeProvider.Release(range.?);
+}
+
+test "retained bounding rectangles refresh a moved parent origin" {
+    movingTestScreenOriginX.store(300, .release);
+    defer movingTestScreenOriginX.store(300, .release);
+    var provider = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(1), .{
+        .text = "AB",
+        .metrics = .{
+            .cell_width = 10,
+            .cell_height = 20,
+            .origin_x = 300,
+            .origin_y = 400,
+        },
+        .screen_origin_query = movingTestScreenOriginQuery,
+    });
+    defer _ = SurfaceProvider.Release(&provider.base);
+
+    var range = try SurfaceTextRangeProvider.create(
+        std.testing.allocator,
+        provider,
+        .{ .start = 0, .end = 2 },
+    );
+    defer _ = SurfaceTextRangeProvider.Release(&range.base);
+
+    movingTestScreenOriginX.store(900, .release);
+    var rectangles: ?*com.SAFEARRAY = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        SurfaceTextRangeProvider.GetBoundingRectangles(&range.base, &rectangles),
+    );
+    var left: f64 = 0;
+    var left_index: i32 = 0;
+    try std.testing.expectEqual(
+        com.S_OK,
+        com.SafeArrayGetElement(rectangles.?, &left_index, &left),
+    );
+    try std.testing.expectEqual(@as(f64, 900), left);
+    _ = com.SafeArrayDestroy(rectangles);
 }
 
 test "role mapping exposes control type and localized control type" {

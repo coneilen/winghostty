@@ -203,7 +203,16 @@ pub fn fragmentToPlainText(
                 continue;
             }
             var end = index + 1;
-            while (end < fragment.len and fragment[end] != '>') : (end += 1) {}
+            var quote: u8 = 0;
+            while (end < fragment.len) : (end += 1) {
+                if (quote != 0) {
+                    if (fragment[end] == quote) quote = 0;
+                } else if (fragment[end] == '"' or fragment[end] == '\'') {
+                    quote = fragment[end];
+                } else if (fragment[end] == '>') {
+                    break;
+                }
+            }
             if (end == fragment.len) {
                 no_future_tag_end = true;
                 try output.append(alloc, fragment[index]);
@@ -411,6 +420,16 @@ test "fragmentToPlainText removes markup and decodes entities" {
     );
     defer alloc.free(plain);
     try std.testing.expectEqualStrings("Hello & world\n🚀", plain);
+}
+
+test "fragmentToPlainText ignores tag delimiters inside quoted attributes" {
+    const alloc = std.testing.allocator;
+    const plain = try fragmentToPlainText(
+        alloc,
+        "<span title=\"1 > 0\">hello</span>",
+    );
+    defer alloc.free(plain);
+    try std.testing.expectEqualStrings("hello", plain);
 }
 
 test "fragmentToPlainText bounds malformed delimiter scanning" {
