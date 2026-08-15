@@ -260,8 +260,11 @@ while destruction is in progress, and verifies stale handles cannot affect
 replacement objects after allocator address reuse. It also has a parent
 `WM_PARENTNOTIFY` handler that calls host deinitialization during child
 destruction and verifies deferred teardown completes without a deadlock. A
-1024-cycle numeric-handle run measures process-heap busy blocks/bytes to catch
-registry and retired-token growth beyond USER/GDI accounting. Persistent
+1024-cycle parent-reentrant teardown run measures process-heap busy
+blocks/bytes to catch retained `SurfaceState` and copied options beyond
+USER/GDI accounting. A 1024-cycle numeric-handle run measures process-heap
+busy blocks/bytes to catch registry and retired-token growth beyond USER/GDI
+accounting. Persistent
 context coverage switches render-thread ownership from surface A to B, clears
 B, destroys A on the UI thread, and switches B again.
 

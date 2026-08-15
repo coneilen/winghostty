@@ -1260,6 +1260,68 @@ static int run_reentrant_parent_deinitialize_contract(test_state *state) {
     return 0;
 }
 
+static int run_reentrant_parent_deinitialize_heap_contract(
+    test_state *state
+) {
+    winghostty_surface_options options;
+    winghostty_surface_options_init(&options);
+    options.visible = 0;
+    options.bounds.width = 80;
+    options.bounds.height = 40;
+
+    process_heap_usage before;
+    process_heap_usage after;
+    if (!read_process_heap_usage(&before)) {
+        return fail("parent reentrant heap measurement failed before");
+    }
+
+    for (int cycle = 0; cycle < 1024; ++cycle) {
+        winghostty_host *host = NULL;
+        winghostty_surface *surface = NULL;
+        if (winghostty_host_initialize(&host) != WINGHOSTTY_OK ||
+            winghostty_host_create_surface(
+                host,
+                state->parent,
+                &options,
+                &surface
+            ) != WINGHOSTTY_OK ||
+            surface == NULL) {
+            if (host != NULL) winghostty_host_deinitialize(host);
+            return fail("parent reentrant heap setup failed");
+        }
+
+        state->host = host;
+        state->surface = surface;
+        state->deinit_on_child_destroy = 1;
+        state->parent_destroy_notifications = 0;
+        state->parent_deinit_result = WINGHOSTTY_INVALID_ARGUMENT;
+        HWND child = winghostty_surface_get_hwnd(surface);
+        if (winghostty_surface_destroy(surface) != WINGHOSTTY_OK ||
+            state->parent_destroy_notifications == 0 ||
+            state->parent_deinit_result != WINGHOSTTY_OK ||
+            IsWindow(child) ||
+            check_stale_surface(surface) != 0 ||
+            check_stale_host(host, state->parent) != 0) {
+            state->deinit_on_child_destroy = 0;
+            state->host = NULL;
+            state->surface = NULL;
+            return fail("parent reentrant heap teardown failed");
+        }
+        state->deinit_on_child_destroy = 0;
+        state->host = NULL;
+        state->surface = NULL;
+    }
+
+    if (!read_process_heap_usage(&after)) {
+        return fail("parent reentrant heap measurement failed after");
+    }
+    if (after.busy_blocks > before.busy_blocks + 64 ||
+        after.busy_bytes > before.busy_bytes + (2 * 1024 * 1024)) {
+        return fail("parent reentrant surfaces remained retained");
+    }
+    return 0;
+}
+
 static int run_numeric_handle_heap_contract(HWND parent) {
     winghostty_surface_options options;
     winghostty_surface_options_init(&options);
@@ -1445,6 +1507,10 @@ int main(void) {
         return 1;
     }
     if (run_reentrant_parent_deinitialize_contract(&state) != 0) {
+        DestroyWindow(state.parent);
+        return 1;
+    }
+    if (run_reentrant_parent_deinitialize_heap_contract(&state) != 0) {
         DestroyWindow(state.parent);
         return 1;
     }

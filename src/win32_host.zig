@@ -752,6 +752,8 @@ const HostState = struct {
     surfaces: std.ArrayListUnmanaged(*SurfaceState) = .empty,
     admission: AdmissionState = .{},
     shutting_down: std.atomic.Value(bool) = .init(false),
+    deinitialized: std.atomic.Value(bool) = .init(false),
+    storage_retained: bool = false,
     retired_surfaces: ?*SurfaceState = null,
     deinitialize_requested: std.atomic.Value(bool) = .init(false),
     creation_depth: usize = 0,
@@ -884,6 +886,7 @@ fn unavailableHostResult(handle: ?*Host) Result {
     defer admission_registry_mutex.unlock();
     const state = hostStateFromId(@intFromPtr(pointer)) orelse
         return result_invalid_argument;
+    if (state.deinitialized.load(.acquire)) return result_invalid_argument;
     state.admission.mutex.lock();
     const accepting = state.admission.accepting;
     state.admission.mutex.unlock();
@@ -1437,6 +1440,26 @@ fn postHostDeferredFinalize(state: *HostState) void {
 }
 
 fn maybeFinishHostDeinitialize(state: *HostState) void {
+    if (state.deinitialized.load(.acquire)) {
+        if (!state.storage_retained or
+            GetCurrentThreadId() != state.thread_id)
+        {
+            return;
+        }
+        state.admission.mutex.lock();
+        const admitted = state.admission.admitted;
+        state.admission.mutex.unlock();
+        if (admitted != 0 or state.retired_surfaces != null) return;
+        state.storage_retained = false;
+        unregisterHost(state);
+        state.deinit_mutex.lock();
+        const marshal_hwnd = state.marshal_hwnd;
+        state.marshal_hwnd = null;
+        state.deinit_mutex.unlock();
+        if (marshal_hwnd) |hwnd| _ = DestroyWindow(hwnd);
+        allocator.destroy(state);
+        return;
+    }
     if (GetCurrentThreadId() != state.thread_id) {
         postHostDeferredFinalize(state);
         return;
@@ -1453,7 +1476,7 @@ fn maybeFinishHostDeinitialize(state: *HostState) void {
         if (admitted != 0) return;
         state.deinitialize_requested.store(false, .release);
         deinitializeHost(state, 0);
-        allocator.destroy(state);
+        if (!state.storage_retained) allocator.destroy(state);
     }
 }
 
@@ -1500,6 +1523,10 @@ fn maybeFinalizeRetiredSurface(surface: *SurfaceState) void {
     }
     if (GetCurrentThreadId() != surface.host.thread_id) {
         postSurfaceDeferredFinalize(surface);
+        return;
+    }
+    if (surface.host.deinitialized.load(.acquire)) {
+        finalizeRetiredSurface(surface);
         return;
     }
     postSurfaceDeferredFinalize(surface);
@@ -1597,7 +1624,9 @@ fn hostDispatcherProc(
             surface.finalize_mutex.lock();
             surface.finalize_posted = false;
             surface.finalize_mutex.unlock();
+            const host = surface.host;
             finalizeRetiredSurface(surface);
+            maybeFinishHostDeinitialize(host);
             return 0;
         },
         WM_NCDESTROY => {
@@ -2517,7 +2546,7 @@ fn finishUnregisteredSurfaceCreation(
         state.deinitialize_requested.store(false, .release);
         deinitializeHost(state, 1);
         releaseHostAdmission(host_admission);
-        allocator.destroy(state);
+        if (!state.storage_retained) allocator.destroy(state);
     }
     return if (deinitialize_requested) result_shutting_down else result;
 }
@@ -2527,6 +2556,7 @@ fn deinitializeHost(
     remaining_host_admissions: usize,
 ) void {
     std.debug.assert(GetCurrentThreadId() == state.thread_id);
+    std.debug.assert(!state.deinitialized.load(.acquire));
     closeHostAdmission(state);
     waitHostAdmissions(state, remaining_host_admissions);
     while (state.surfaces.items.len > 0) {
@@ -2535,14 +2565,17 @@ fn deinitializeHost(
         destroySurfaceNow(surface, 0);
     }
     state.surfaces.deinit(allocator);
-    unregisterHost(state);
     var retired = state.retired_surfaces;
     while (retired) |surface| {
         retired = surface.retired_next;
-        unregisterSurface(surface);
-        deinitSurfaceResources(surface);
-        allocator.destroy(surface);
+        finalizeRetiredSurface(surface);
     }
+    state.deinitialized.store(true, .release);
+    if (state.retired_surfaces != null) {
+        state.storage_retained = true;
+        return;
+    }
+    unregisterHost(state);
     state.deinit_mutex.lock();
     const marshal_hwnd = state.marshal_hwnd;
     state.marshal_hwnd = null;
@@ -2746,7 +2779,7 @@ pub export fn winghostty_host_deinitialize(host: ?*Host) Result {
     }
     deinitializeHost(state, 1);
     releaseHostAdmission(&admission);
-    allocator.destroy(state);
+    if (!state.storage_retained) allocator.destroy(state);
     return result_ok;
 }
 
@@ -2959,7 +2992,7 @@ fn createSurface(
             state.deinitialize_requested.store(false, .release);
             deinitializeHost(state, 1);
             releaseHostAdmission(host_admission);
-            allocator.destroy(state);
+            if (!state.storage_retained) allocator.destroy(state);
         }
         return if (was_invalidated and !was_shutting_down)
             result_surface_invalidated
@@ -3038,15 +3071,16 @@ pub export fn winghostty_surface_destroy(surface: ?*Surface) Result {
     destroySurfaceNow(state, 1);
     host.destroy_surface_depth -= 1;
     const host_deinitialized = finishDeferredHostDeinitialize(host, 1);
+    const host_retained = host.storage_retained;
+    const surface_retained = state.storage_retained;
+    const surface_active_dispatches = state.active_dispatches;
+    admission.defer_finalize = false;
     releaseSurfaceAdmission(&admission);
-    if (!host_deinitialized and
-        !state.storage_retained and
-        state.active_dispatches == 0)
-    {
+    if (!surface_retained and surface_active_dispatches == 0) {
         deinitSurfaceResources(state);
         allocator.destroy(state);
     }
-    if (host_deinitialized) allocator.destroy(host);
+    if (host_deinitialized and !host_retained) allocator.destroy(host);
     return result_ok;
 }
 
