@@ -1370,24 +1370,15 @@ static int run_reentrant_parent_deinitialize_heap_contract(
 }
 
 static int run_numeric_handle_heap_contract(HWND parent) {
-    winghostty_surface_options options;
-    winghostty_surface_options_init(&options);
-    options.visible = 0;
-    options.bounds.width = 32;
-    options.bounds.height = 24;
-
+    (void)parent;
+    /*
+     * Keep this registry contract host-only. Surface cycles also exercise
+     * WGL driver allocation, whose process-heap cache is intentionally
+     * covered by the bounded 100-cycle renderer contract above.
+     */
     for (int i = 0; i < 16; ++i) {
         winghostty_host *host = NULL;
-        winghostty_surface *surface = NULL;
         if (winghostty_host_initialize(&host) != WINGHOSTTY_OK ||
-            winghostty_host_create_surface(
-                host,
-                parent,
-                &options,
-                &surface
-            ) != WINGHOSTTY_OK ||
-            surface == NULL ||
-            winghostty_surface_destroy(surface) != WINGHOSTTY_OK ||
             winghostty_host_deinitialize(host) != WINGHOSTTY_OK) {
             if (host != NULL) winghostty_host_deinitialize(host);
             return fail("numeric-handle heap warmup failed");
@@ -1402,16 +1393,7 @@ static int run_numeric_handle_heap_contract(HWND parent) {
 
     for (int i = 0; i < 1024; ++i) {
         winghostty_host *host = NULL;
-        winghostty_surface *surface = NULL;
         if (winghostty_host_initialize(&host) != WINGHOSTTY_OK ||
-            winghostty_host_create_surface(
-                host,
-                parent,
-                &options,
-                &surface
-            ) != WINGHOSTTY_OK ||
-            surface == NULL ||
-            winghostty_surface_destroy(surface) != WINGHOSTTY_OK ||
             winghostty_host_deinitialize(host) != WINGHOSTTY_OK) {
             if (host != NULL) winghostty_host_deinitialize(host);
             return fail("numeric-handle high-cycle teardown failed");

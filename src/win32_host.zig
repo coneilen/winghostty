@@ -777,6 +777,10 @@ var surface_registry: std.AutoHashMapUnmanaged(usize, *SurfaceState) = .empty;
 var next_handle_id: std.atomic.Value(usize) = .init(1);
 var next_handle_generation: std.atomic.Value(u64) = .init(1);
 
+// Keep the registry bucket allocations for the host process lifetime. Handles
+// remain monotonic and stale entries are removed, so retaining empty capacity
+// avoids allocator churn during repeated surface recreation.
+
 fn duplicate(value: ?[*:0]const u8) !?[:0]u8 {
     const source = value orelse return null;
     return try allocator.dupeZ(u8, std.mem.span(source));
@@ -935,20 +939,12 @@ fn unregisterHost(state: *HostState) void {
     admission_registry_mutex.lock();
     defer admission_registry_mutex.unlock();
     _ = host_registry.remove(state.handle.id);
-    if (host_registry.count() == 0) {
-        host_registry.deinit(allocator);
-        host_registry = .empty;
-    }
 }
 
 fn unregisterSurface(state: *SurfaceState) void {
     admission_registry_mutex.lock();
     defer admission_registry_mutex.unlock();
     _ = surface_registry.remove(state.handle.id);
-    if (surface_registry.count() == 0) {
-        surface_registry.deinit(allocator);
-        surface_registry = .empty;
-    }
 }
 
 fn admitHost(handle: ?*Host) ?HostAdmission {
