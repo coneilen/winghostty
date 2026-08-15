@@ -1997,8 +1997,8 @@ fn emitMouseMessage(
         .modifiers = mouseModifiers(wparam),
         .x = x,
         .y = y,
-        .cell_x = cellCoordinate(x, surface.options.input.cell_width),
-        .cell_y = cellCoordinate(y, surface.options.input.cell_height),
+        .cell_x = cellCoordinate(x, surface.metrics.cell_width),
+        .cell_y = cellCoordinate(y, surface.metrics.cell_height),
         .wheel_delta = if (kind == mouse_wheel)
             @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(wparam)) >> 16))))
         else
@@ -2341,8 +2341,8 @@ fn surfaceWindowProc(
                         const y = signedWord(@as(usize, @bitCast(lparam)) >> 16);
                         value.selection_active = true;
                         value.selection_dragging = true;
-                        value.selection_anchor_x = cellCoordinate(x, value.options.input.cell_width);
-                        value.selection_anchor_y = cellCoordinate(y, value.options.input.cell_height);
+                        value.selection_anchor_x = cellCoordinate(x, value.metrics.cell_width);
+                        value.selection_anchor_y = cellCoordinate(y, value.metrics.cell_height);
                         value.selection_current_x = value.selection_anchor_x;
                         value.selection_current_y = value.selection_anchor_y;
                         emitSelection(value);
@@ -2355,8 +2355,8 @@ fn surfaceWindowProc(
                 } else if (message == WM_MOUSEMOVE and value.selection_dragging) {
                     const x = signedWord(@as(usize, @bitCast(lparam)));
                     const y = signedWord(@as(usize, @bitCast(lparam)) >> 16);
-                    value.selection_current_x = cellCoordinate(x, value.options.input.cell_width);
-                    value.selection_current_y = cellCoordinate(y, value.options.input.cell_height);
+                    value.selection_current_x = cellCoordinate(x, value.metrics.cell_width);
+                    value.selection_current_y = cellCoordinate(y, value.metrics.cell_height);
                     emitSelection(value);
                 } else if (message == WM_MOUSELEAVE) {
                     if (value.link_hovered) {
@@ -3403,7 +3403,8 @@ fn clipboardBytes(format: u32) ?[]u8 {
     const bytes = GlobalSize(value);
     if (bytes == 0) return null;
     if (using_html) {
-        return allocator.dupe(u8, @as([*]const u8, @ptrCast(raw))[0..bytes]) catch null;
+        const raw_bytes = @as([*]const u8, @ptrCast(raw))[0..bytes];
+        return win32_clipboard_html.extractFragment(allocator, raw_bytes) catch null;
     }
     const units = @as([*]const u16, @ptrCast(@alignCast(raw)));
     var count: usize = 0;
@@ -3533,7 +3534,10 @@ pub export fn winghostty_surface_write_clipboard(
         defer allocator.free(wrapped);
         const id = clipboardFormatId(format);
         if (!setClipboardGlobal(id, wrapped, false)) return result_win32_error;
-        if (!setClipboardGlobal(CF_UNICODETEXT, bytes, true)) return result_win32_error;
+        const plain = win32_clipboard_html.fragmentToPlainText(allocator, bytes) catch
+            return result_out_of_memory;
+        defer allocator.free(plain);
+        if (!setClipboardGlobal(CF_UNICODETEXT, plain, true)) return result_win32_error;
     } else {
         if (!setClipboardGlobal(CF_UNICODETEXT, bytes, true)) return result_win32_error;
     }

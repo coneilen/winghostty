@@ -80,6 +80,8 @@ layout name; text callbacks are UTF-8 and preserve surrogate pairs.
 Mouse input requests leave tracking whenever mouse/input callbacks are
 enabled, reports client-space wheel coordinates, and maps left, right,
 middle, and X-button double-click messages to `click_count == 2`.
+Mouse and selection cell coordinates use the surface's current scaled cell
+metrics after DPI, font-scale, or base-metric changes.
 The URL passed to `on_link` remains valid for the full synchronous callback,
 including if the callback replaces or clears the link or deinitializes the
 host.
@@ -103,14 +105,19 @@ rectangles and refreshes it after moves, DPI changes, and bounds updates.
 Text geometry uses Unicode display-cell columns (including combining and
 wide characters), not UTF-8 byte offsets; production widths come from
 Ghostty's generated `uucode` data.
+Each retained text range owns the exact immutable accessibility snapshot that
+produced its offsets, including cloned and found ranges. Terminal surfaces do
+not advertise `ValuePattern`; edit-role providers are read-only, and
+unsupported text units return `UIA_E_NOTSUPPORTED`.
 Changing the role raises `ControlType` and `LocalizedControlType` property
 changes.
 
 `winghostty_surface_paste_text` validates UTF-8 and uses the host's paste
 protection classifier. Unsafe text requires `allow_unsafe` and bracketed paste
 is enabled by default. Clipboard read/write supports Unicode text and
-`CF_HTML` writes. A surface's input options and strings are copied during
-creation.
+`CF_HTML`; HTML reads return only the fragment, while the
+`CF_UNICODETEXT` fallback contains plain text without markup. A surface's
+input options and strings are copied during creation.
 
 Per-monitor DPI is reported through `winghostty_surface_get_dpi`; callers can
 set base cell metrics and receive scaled metric/DPI callbacks. Each surface

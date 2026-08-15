@@ -270,6 +270,20 @@ fn snapshotFromUtf8(
     };
 }
 
+fn snapshotClone(
+    alloc: std.mem.Allocator,
+    snapshot: *const Snapshot,
+) !Snapshot {
+    return snapshotFromUtf8(
+        alloc,
+        snapshot.text,
+        snapshot.visible,
+        snapshot.selection,
+        snapshot.caret,
+        snapshot.metrics,
+    );
+}
+
 pub const SurfaceProvider = struct {
     base: com.IRawElementProviderSimple,
     value_iface: com.IValueProvider,
@@ -658,6 +672,10 @@ pub const SurfaceProvider = struct {
         {
             out.* = @ptrCast(&self.base);
         } else if (iidEqual(iid, &com.IID_IValueProvider)) {
+            self.state_lock.lockShared();
+            const supported = self.role == .edit;
+            self.state_lock.unlockShared();
+            if (!supported) return com.E_NOINTERFACE;
             out.* = @ptrCast(&self.value_iface);
         } else if (iidEqual(iid, &com.IID_ITextProvider)) {
             out.* = @ptrCast(&self.text_iface);
@@ -724,8 +742,28 @@ pub const SurfaceProvider = struct {
             current;
     }
 
-    fn makeRange(self: *SurfaceProvider, range: Range) ?*SurfaceTextRangeProvider {
-        return SurfaceTextRangeProvider.create(self.alloc, self, range) catch null;
+    fn makeRangeFromSnapshot(
+        self: *SurfaceProvider,
+        snapshot: *const Snapshot,
+        range: Range,
+    ) ?*SurfaceTextRangeProvider {
+        var copy = snapshotClone(self.alloc, snapshot) catch return null;
+        return SurfaceTextRangeProvider.createWithSnapshot(
+            self.alloc,
+            self,
+            range,
+            copy,
+        ) catch {
+            copy.deinit(self.alloc);
+            return null;
+        };
+    }
+
+    fn selectedRangeFromSnapshot(snapshot: *const Snapshot) Range {
+        return if (snapshot.selection.start == snapshot.selection.end)
+            .{ .start = snapshot.caret, .end = snapshot.caret }
+        else
+            snapshot.selection;
     }
 
     pub fn setSelectedRange(self: *SurfaceProvider, range: Range) com.HRESULT {
@@ -864,7 +902,7 @@ pub const SurfaceProvider = struct {
                     return com.E_OUTOFMEMORY;
                 out.* = com.VARIANT.fromBstr(bstr);
             },
-            30046 => out.* = com.VARIANT.fromBool(self.role != .edit),
+            30046 => out.* = com.VARIANT.fromBool(true),
             else => {},
         }
         return com.S_OK;
@@ -936,7 +974,7 @@ pub const SurfaceProvider = struct {
         defer call.deinit();
         self.state_lock.lockShared();
         defer self.state_lock.unlockShared();
-        out.* = if (self.role == .edit) 0 else 1;
+        out.* = 1;
         return if (self.available()) com.S_OK else com.UIA_E_ELEMENTNOTAVAILABLE;
     }
 
@@ -968,13 +1006,14 @@ pub const SurfaceProvider = struct {
 
     fn makeSafeArrayRange(
         self: *SurfaceProvider,
+        snapshot: *const Snapshot,
         ranges: []const Range,
         out: *?*com.SAFEARRAY,
     ) com.HRESULT {
         out.* = com.SafeArrayCreateVector(com.VT_UNKNOWN, 0, @intCast(ranges.len));
         if (out.* == null) return com.E_OUTOFMEMORY;
         for (ranges, 0..) |range, index| {
-            const item = self.makeRange(range) orelse {
+            const item = self.makeRangeFromSnapshot(snapshot, range) orelse {
                 _ = com.SafeArrayDestroy(out.*);
                 out.* = null;
                 return com.E_OUTOFMEMORY;
@@ -999,10 +1038,13 @@ pub const SurfaceProvider = struct {
             return com.UIA_E_ELEMENTNOTAVAILABLE;
         };
         defer call.deinit();
-        self.state_lock.lockShared();
-        const range = self.selectedRange();
-        self.state_lock.unlockShared();
-        return self.makeSafeArrayRange(&.{range}, out);
+        var snapshot = self.snapshotCopy(self.alloc) catch {
+            out.* = null;
+            return com.E_OUTOFMEMORY;
+        };
+        defer snapshot.deinit(self.alloc);
+        const range = selectedRangeFromSnapshot(&snapshot);
+        return self.makeSafeArrayRange(&snapshot, &.{range}, out);
     }
     fn textGetVisibleRanges(
         self: *SurfaceProvider,
@@ -1013,10 +1055,13 @@ pub const SurfaceProvider = struct {
             return com.UIA_E_ELEMENTNOTAVAILABLE;
         };
         defer call.deinit();
-        self.state_lock.lockShared();
-        const visible = self.snapshot.visible;
-        self.state_lock.unlockShared();
-        return self.makeSafeArrayRange(&.{visible}, out);
+        var snapshot = self.snapshotCopy(self.alloc) catch {
+            out.* = null;
+            return com.E_OUTOFMEMORY;
+        };
+        defer snapshot.deinit(self.alloc);
+        const visible = snapshot.visible;
+        return self.makeSafeArrayRange(&snapshot, &.{visible}, out);
     }
     fn textRangeFromPoint(
         self: *SurfaceProvider,
@@ -1033,7 +1078,6 @@ pub const SurfaceProvider = struct {
         if (!std.math.isFinite(point.x) or !std.math.isFinite(point.y)) return com.S_OK;
         self.refreshScreenOrigin();
         var snapshot = self.snapshotCopy(self.alloc) catch return com.E_OUTOFMEMORY;
-        defer snapshot.deinit(self.alloc);
         const cell_height = @max(snapshot.metrics.cell_height, 1);
         const cell_width = @max(snapshot.metrics.cell_width, 1);
         const last_row = lineIndexAtByte(&snapshot, snapshot.text.len);
@@ -1073,8 +1117,15 @@ pub const SurfaceProvider = struct {
             snapshot.utf16_for_byte[index]
         else
             utf16_start;
-        const range = self.makeRange(.{ .start = offset, .end = offset }) orelse
+        const range = SurfaceTextRangeProvider.createWithSnapshot(
+            self.alloc,
+            self,
+            .{ .start = offset, .end = offset },
+            snapshot,
+        ) catch {
+            snapshot.deinit(self.alloc);
             return com.E_OUTOFMEMORY;
+        };
         out.* = &range.base;
         return com.S_OK;
     }
@@ -1089,11 +1140,16 @@ pub const SurfaceProvider = struct {
         defer call.deinit();
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        self.state_lock.lockShared();
-        const end = self.snapshot.utf16_len;
-        self.state_lock.unlockShared();
-        const range = self.makeRange(.{ .start = 0, .end = end }) orelse
+        var snapshot = self.snapshotCopy(self.alloc) catch return com.E_OUTOFMEMORY;
+        const range = SurfaceTextRangeProvider.createWithSnapshot(
+            self.alloc,
+            self,
+            .{ .start = 0, .end = snapshot.utf16_len },
+            snapshot,
+        ) catch {
+            snapshot.deinit(self.alloc);
             return com.E_OUTOFMEMORY;
+        };
         out.* = &range.base;
         return com.S_OK;
     }
@@ -1176,11 +1232,18 @@ pub const SurfaceProvider = struct {
         defer call.deinit();
         out.* = null;
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
-        self.state_lock.lockShared();
+        var snapshot = self.snapshotCopy(self.alloc) catch return com.E_OUTOFMEMORY;
         active.* = if (self.focused.load(.acquire)) 1 else 0;
-        const caret = self.snapshot.caret;
-        self.state_lock.unlockShared();
-        const range = self.makeRange(.{ .start = caret, .end = caret }) orelse return com.E_OUTOFMEMORY;
+        const caret = snapshot.caret;
+        const range = SurfaceTextRangeProvider.createWithSnapshot(
+            self.alloc,
+            self,
+            .{ .start = caret, .end = caret },
+            snapshot,
+        ) catch {
+            snapshot.deinit(self.alloc);
+            return com.E_OUTOFMEMORY;
+        };
         out.* = &range.base;
         return com.S_OK;
     }
@@ -1224,19 +1287,29 @@ const SurfaceTextRangeProvider = struct {
         parent: *SurfaceProvider,
         range: Range,
     ) !*SurfaceTextRangeProvider {
+        var copy = try parent.snapshotCopy(alloc);
+        errdefer copy.deinit(alloc);
+        return createWithSnapshot(alloc, parent, range, copy);
+    }
+
+    fn createWithSnapshot(
+        alloc: std.mem.Allocator,
+        parent: *SurfaceProvider,
+        range: Range,
+        snapshot: Snapshot,
+    ) !*SurfaceTextRangeProvider {
         const self = try alloc.create(SurfaceTextRangeProvider);
         errdefer alloc.destroy(self);
         _ = SurfaceProvider.AddRef(&parent.base);
         errdefer _ = SurfaceProvider.Release(&parent.base);
-        const copy = try parent.snapshotCopy(alloc);
         self.* = .{
             .base = .{ .vtbl = &vtbl },
             .refcount = std.atomic.Value(u32).init(1),
             .alloc = alloc,
             .parent = parent,
-            .snapshot = copy,
+            .snapshot = snapshot,
             .range_lock = .{},
-            .range = range.normalized(copy.utf16_len),
+            .range = range.normalized(snapshot.utf16_len),
         };
         return self;
     }
@@ -1270,7 +1343,16 @@ const SurfaceTextRangeProvider = struct {
         self.range_lock.lock();
         const current = self.range;
         self.range_lock.unlock();
-        return SurfaceTextRangeProvider.create(self.alloc, self.parent, current) catch null;
+        var snapshot = snapshotClone(self.alloc, &self.snapshot) catch return null;
+        return SurfaceTextRangeProvider.createWithSnapshot(
+            self.alloc,
+            self.parent,
+            current,
+            snapshot,
+        ) catch {
+            snapshot.deinit(self.alloc);
+            return null;
+        };
     }
     fn rangeCopy(self: *SurfaceTextRangeProvider) Range {
         self.range_lock.lock();
@@ -1282,10 +1364,7 @@ const SurfaceTextRangeProvider = struct {
     }
 
     fn geometryMetrics(self: *SurfaceTextRangeProvider) Metrics {
-        self.parent.refreshScreenOrigin();
-        self.parent.state_lock.lockShared();
-        defer self.parent.state_lock.unlockShared();
-        return self.parent.snapshot.metrics;
+        return self.snapshot.metrics;
     }
 
     fn lineBounds(self: *const SurfaceTextRangeProvider) Range {
@@ -1379,7 +1458,7 @@ const SurfaceTextRangeProvider = struct {
         switch (unit) {
             com.TextUnit_Document => self.range = .{ .start = 0, .end = self.snapshot.utf16_len },
             com.TextUnit_Line, com.TextUnit_Paragraph => self.range = self.lineBounds(),
-            else => {},
+            else => return com.UIA_E_NOTSUPPORTED,
         }
         return com.S_OK;
     }
@@ -1414,14 +1493,20 @@ const SurfaceTextRangeProvider = struct {
         const at = found orelse return com.S_OK;
         const start_byte = bytes.start + at;
         const end_byte = start_byte + needle_utf8.len;
-        const range = SurfaceTextRangeProvider.create(
+        var snapshot = snapshotClone(self.alloc, &self.snapshot) catch
+            return com.E_OUTOFMEMORY;
+        const range = SurfaceTextRangeProvider.createWithSnapshot(
             self.alloc,
             self.parent,
             .{
                 .start = self.snapshot.utf16_for_byte[start_byte],
                 .end = self.snapshot.utf16_for_byte[end_byte],
             },
-        ) catch return com.E_OUTOFMEMORY;
+            snapshot,
+        ) catch {
+            snapshot.deinit(self.alloc);
+            return com.E_OUTOFMEMORY;
+        };
         out.* = &range.base;
         return com.S_OK;
     }
@@ -1542,7 +1627,7 @@ const SurfaceTextRangeProvider = struct {
                 moved.* += direction;
             }
             _ = original;
-        }
+        } else return com.UIA_E_NOTSUPPORTED;
         return com.S_OK;
     }
     fn MoveEndpointByUnit(
@@ -1571,7 +1656,7 @@ const SurfaceTextRangeProvider = struct {
             self.moveEndpoint(endpoint, target);
             const target_signed = std.math.cast(i64, target) orelse return com.E_INVALIDARG;
             moved.* = @intCast(target_signed - current_signed);
-        }
+        } else return com.UIA_E_NOTSUPPORTED;
         return com.S_OK;
     }
     fn MoveEndpointByRange(
@@ -1873,6 +1958,154 @@ test "role mapping exposes control type and localized control type" {
         SurfaceProvider.localizedControlType(.terminal),
     );
     try std.testing.expectEqualStrings("edit", SurfaceProvider.localizedControlType(.edit));
+}
+
+test "terminal value pattern is not advertised and edit values are read-only" {
+    var provider = try SurfaceProvider.create(
+        std.testing.allocator,
+        @ptrFromInt(1),
+        .{ .text = "terminal" },
+    );
+    defer _ = SurfaceProvider.Release(&provider.base);
+
+    var pattern: ?*com.IUnknown = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        provider.base.vtbl.GetPatternProvider(&provider.base, 10002, &pattern),
+    );
+    try std.testing.expect(pattern == null);
+    var queried: ?*anyopaque = null;
+    try std.testing.expectEqual(
+        com.E_NOINTERFACE,
+        provider.base.vtbl.QueryInterface(
+            &provider.base,
+            &com.IID_IValueProvider,
+            &queried,
+        ),
+    );
+
+    provider.updateRole(.edit);
+    try std.testing.expectEqual(
+        com.S_OK,
+        provider.base.vtbl.GetPatternProvider(&provider.base, 10002, &pattern),
+    );
+    const value: *com.IValueProvider = @ptrCast(pattern.?);
+    var read_only: com.BOOL = 0;
+    try std.testing.expectEqual(
+        com.S_OK,
+        value.vtbl.get_IsReadOnly(value, &read_only),
+    );
+    try std.testing.expectEqual(@as(com.BOOL, 1), read_only);
+    const empty: [1:0]u16 = .{0};
+    try std.testing.expectEqual(
+        com.UIA_E_INVALIDOPERATION,
+        value.vtbl.SetValue(value, &empty),
+    );
+    _ = value.vtbl.Release(value);
+}
+
+test "unsupported text units return an explicit UIA error" {
+    var provider = try SurfaceProvider.create(
+        std.testing.allocator,
+        @ptrFromInt(1),
+        .{ .text = "one two" },
+    );
+    defer _ = SurfaceProvider.Release(&provider.base);
+    var range: ?*com.ITextRangeProvider = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        provider.textGetDocumentRange(&range),
+    );
+    const value = range.?;
+    defer _ = SurfaceTextRangeProvider.Release(value);
+    var moved: i32 = -1;
+    try std.testing.expectEqual(
+        com.UIA_E_NOTSUPPORTED,
+        value.vtbl.Move(value, com.TextUnit_Character, 1, &moved),
+    );
+    try std.testing.expectEqual(@as(i32, 0), moved);
+    try std.testing.expectEqual(
+        com.UIA_E_NOTSUPPORTED,
+        value.vtbl.MoveEndpointByUnit(
+            value,
+            com.TextPatternRangeEndpoint_Start,
+            com.TextUnit_Word,
+            1,
+            &moved,
+        ),
+    );
+    try std.testing.expectEqual(
+        com.UIA_E_NOTSUPPORTED,
+        value.vtbl.ExpandToEnclosingUnit(value, com.TextUnit_Character),
+    );
+}
+
+test "clones and FindText retain the source snapshot" {
+    var provider = try SurfaceProvider.create(
+        std.testing.allocator,
+        @ptrFromInt(1),
+        .{ .text = "prefix target suffix" },
+    );
+    defer _ = SurfaceProvider.Release(&provider.base);
+
+    var document: ?*com.ITextRangeProvider = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        provider.textGetDocumentRange(&document),
+    );
+    const original = document.?;
+    defer _ = SurfaceTextRangeProvider.Release(original);
+    try provider.updateText(
+        "x",
+        .{ .start = 0, .end = 1 },
+        .{ .start = 0, .end = 0 },
+        0,
+    );
+
+    var clone: ?*com.ITextRangeProvider = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        original.vtbl.Clone(original, &clone),
+    );
+    defer _ = SurfaceTextRangeProvider.Release(clone.?);
+    var clone_text: ?[*:0]u16 = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        clone.?.vtbl.GetText(clone.?, -1, &clone_text),
+    );
+    defer com.SysFreeString(clone_text);
+    const clone_utf8 = try std.unicode.utf16LeToUtf8Alloc(
+        std.testing.allocator,
+        std.mem.span(clone_text.?),
+    );
+    defer std.testing.allocator.free(clone_utf8);
+    try std.testing.expectEqualStrings(
+        "prefix target suffix",
+        clone_utf8,
+    );
+
+    var needle: [7]u16 = .{ 't', 'a', 'r', 'g', 'e', 't', 0 };
+    var found: ?*com.ITextRangeProvider = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        original.vtbl.FindText(original, &needle, 0, 0, &found),
+    );
+    defer _ = SurfaceTextRangeProvider.Release(found.?);
+    var found_text: ?[*:0]u16 = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        found.?.vtbl.GetText(found.?, -1, &found_text),
+    );
+    defer com.SysFreeString(found_text);
+    const found_utf8 = try std.unicode.utf16LeToUtf8Alloc(
+        std.testing.allocator,
+        std.mem.span(found_text.?),
+    );
+    defer std.testing.allocator.free(found_utf8);
+    try std.testing.expectEqualStrings(
+        "target",
+        found_utf8,
+    );
 }
 
 test "provider creation cleans up name exactly once on allocation failure" {

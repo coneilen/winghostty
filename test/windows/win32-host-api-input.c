@@ -19,6 +19,7 @@
 #define WM_MOUSEWHEEL 0x020A
 #define WM_XBUTTONDBLCLK 0x020D
 #define WM_MOUSELEAVE 0x02A3
+#define WM_DPICHANGED 0x02E0
 
 typedef struct input_context {
     HWND parent;
@@ -54,6 +55,8 @@ typedef struct input_context {
     int saw_unicode;
     int saw_dead_composition;
     int saw_wheel;
+    int saw_scaled_hit;
+    int saw_scaled_selection;
     int wheel_x;
     int wheel_y;
     unsigned double_click_buttons;
@@ -253,6 +256,10 @@ static void on_mouse(
         context->wheel_x = event->x;
         context->wheel_y = event->y;
     }
+    if (event->x == 14 && event->y == 29 &&
+        event->cell_x == 0 && event->cell_y == 0) {
+        context->saw_scaled_hit = 1;
+    }
     if (event->click_count == 2 && event->button < 32) {
         context->double_click_buttons |= 1u << event->button;
     }
@@ -274,6 +281,10 @@ static void on_selection(
     record(context, user_data);
     InterlockedIncrement(&context->selection);
     if (event->dragging) context->saw_selection_drag = 1;
+    if (event->anchor_x == 0 && event->anchor_y == 0 &&
+        event->current_x == 0 && event->current_y == 0) {
+        context->saw_scaled_selection = 1;
+    }
 }
 
 static void on_link(
@@ -772,6 +783,21 @@ int main(void) {
     layout[0] = 'X';
     HWND first_hwnd = winghostty_surface_get_hwnd(first);
     if (!first_hwnd) return fail();
+    winghostty_cell_metrics changed_metrics = {
+        .font_width = 10,
+        .font_height = 20,
+        .cell_width = 10,
+        .cell_height = 20,
+        .baseline = 15,
+    };
+    if (winghostty_surface_set_cell_metrics(first, &changed_metrics) !=
+            WINGHOSTTY_OK) {
+        return fail();
+    }
+    SendMessageW(first_hwnd, WM_DPICHANGED, MAKELPARAM(144, 144), 0);
+    SendMessageW(first_hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(14, 29));
+    SendMessageW(first_hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(14, 29));
+    SendMessageW(first_hwnd, WM_LBUTTONUP, 0, MAKELPARAM(14, 29));
 
     SendMessageW(first_hwnd, WM_KEYDOWN, 'A', 1u << 16);
     LONG keys_after_keydown = context.keys;
@@ -852,6 +878,51 @@ int main(void) {
         );
         return fail();
     }
+    winghostty_result html_write = WINGHOSTTY_CLIPBOARD_UNAVAILABLE;
+    winghostty_result html_read = WINGHOSTTY_CLIPBOARD_UNAVAILABLE;
+    winghostty_result html_plain_read = WINGHOSTTY_CLIPBOARD_UNAVAILABLE;
+    if (clipboard_write == WINGHOSTTY_OK) {
+        const char html[] = "<p>Hello <b>world</b></p>";
+        html_write = winghostty_surface_write_clipboard(
+            first,
+            WINGHOSTTY_CLIPBOARD_HTML,
+            html,
+            (uint32_t)(sizeof(html) - 1)
+        );
+        memset(context.clipboard, 0, sizeof(context.clipboard));
+        html_read = winghostty_surface_read_clipboard(
+            first,
+            WINGHOSTTY_CLIPBOARD_HTML
+        );
+        if (html_read == WINGHOSTTY_OK &&
+            strcmp(context.clipboard, html) != 0) {
+            fprintf(
+                stderr,
+                "CF_HTML fragment mismatch: '%s'\n",
+                context.clipboard
+            );
+            return fail();
+        }
+        memset(context.clipboard, 0, sizeof(context.clipboard));
+        html_plain_read = winghostty_surface_read_clipboard(
+            first,
+            WINGHOSTTY_CLIPBOARD_TEXT
+        );
+        if (html_plain_read == WINGHOSTTY_OK &&
+            strcmp(context.clipboard, "Hello world") != 0) {
+            fprintf(
+                stderr,
+                "CF_HTML plain fallback mismatch: '%s'\n",
+                context.clipboard
+            );
+            return fail();
+        }
+        if (html_write != WINGHOSTTY_OK ||
+            html_read != WINGHOSTTY_OK ||
+            html_plain_read != WINGHOSTTY_OK) {
+            return fail();
+        }
+    }
 
     winghostty_surface_options_v2 second_options = options;
     second_options.focus = 0;
@@ -912,6 +983,8 @@ int main(void) {
         context.links < 1 ||
         !context.saw_link_click ||
         !context.saw_selection_drag ||
+        !context.saw_scaled_hit ||
+        !context.saw_scaled_selection ||
         !context.saw_wheel ||
         !context.saw_unicode ||
         !context.saw_dead_composition ||
@@ -924,9 +997,12 @@ int main(void) {
         !context.copied_layout ||
         context.pastes != 2 ||
         context.clipboard_reads !=
-            (clipboard_read == WINGHOSTTY_OK ? 1 : 0) ||
+            (clipboard_read == WINGHOSTTY_OK ? 1 : 0) +
+                (html_read == WINGHOSTTY_OK ? 1 : 0) +
+                (html_plain_read == WINGHOSTTY_OK ? 1 : 0) ||
         context.clipboard_writes !=
-            (clipboard_write == WINGHOSTTY_OK ? 1 : 0) ||
+            (clipboard_write == WINGHOSTTY_OK ? 1 : 0) +
+                (html_write == WINGHOSTTY_OK ? 1 : 0) ||
         context.wrong_thread != 0 ||
         context.wrong_user_data != 0) {
         return fail();

@@ -25,6 +25,7 @@ pub const E_INVALIDARG: HRESULT = @bitCast(@as(u32, 0x80070057));
 pub const DISP_E_BADINDEX: HRESULT = @bitCast(@as(u32, 0x8002000B));
 pub const UIA_E_ELEMENTNOTAVAILABLE: HRESULT = @bitCast(@as(u32, 0x80040201));
 pub const UIA_E_ELEMENTNOTENABLED: HRESULT = @bitCast(@as(u32, 0x80040200));
+pub const UIA_E_NOTSUPPORTED: HRESULT = @bitCast(@as(u32, 0x80040204));
 pub const UIA_E_INVALIDOPERATION: HRESULT = @bitCast(@as(u32, 0x80131509));
 pub const RPC_E_CANTCALLOUT_ININPUTSYNCCALL: HRESULT = @bitCast(@as(u32, 0x8001010D));
 
