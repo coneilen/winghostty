@@ -1828,16 +1828,20 @@ fn emitSelection(surface: *SurfaceState) void {
     }
 }
 
-fn emitLink(surface: *SurfaceState, hovered: bool, clicked: bool) void {
+fn emitLinkUrl(
+    surface: *SurfaceState,
+    url: []const u8,
+    hovered: bool,
+    clicked: bool,
+) void {
     if (surface.destroying.load(.acquire) or
         surface.host.shutting_down.load(.acquire))
     {
         return;
     }
-    const url = surface.link_url orelse return;
-    const owned_url = allocator.dupeZ(u8, url) catch return;
-    defer allocator.free(owned_url);
     if (surface.options.input_callbacks.on_link) |callback| {
+        const owned_url = allocator.dupeZ(u8, url) catch return;
+        defer allocator.free(owned_url);
         beginDispatch(surface);
         defer endDispatch(surface);
         callback(
@@ -1848,6 +1852,11 @@ fn emitLink(surface: *SurfaceState, hovered: bool, clicked: bool) void {
             if (clicked) 1 else 0,
         );
     }
+}
+
+fn emitLink(surface: *SurfaceState, hovered: bool, clicked: bool) void {
+    const url = surface.link_url orelse return;
+    emitLinkUrl(surface, url, hovered, clicked);
 }
 
 fn emitPaste(surface: *SurfaceState, text: []const u8, bracketed: bool) void {
@@ -3653,9 +3662,14 @@ pub export fn winghostty_surface_set_link(
     if (result != result_ok) return result;
     if (std.mem.span(value).len == 0) return result_invalid_argument;
     const owned = allocator.dupeZ(u8, std.mem.span(value)) catch return result_out_of_memory;
-    if (state.link_url) |old| allocator.free(old);
+    const old = state.link_url;
+    const was_hovered = state.link_hovered;
     state.link_url = owned;
     state.link_hovered = false;
+    if (old) |previous| {
+        if (was_hovered) emitLinkUrl(state, previous, false, false);
+        allocator.free(previous);
+    }
     return result_ok;
 }
 
@@ -3666,12 +3680,12 @@ pub export fn winghostty_surface_clear_link(surface: ?*Surface) Result {
     const state = admission.surface;
     const result = checkSurface(state);
     if (result != result_ok) return result;
-    if (state.link_url) |old| allocator.free(old);
+    const old = state.link_url orelse return result_ok;
+    const was_hovered = state.link_hovered;
     state.link_url = null;
-    if (state.link_hovered) {
-        state.link_hovered = false;
-        emitLink(state, false, false);
-    }
+    state.link_hovered = false;
+    if (was_hovered) emitLinkUrl(state, old, false, false);
+    allocator.free(old);
     return result_ok;
 }
 

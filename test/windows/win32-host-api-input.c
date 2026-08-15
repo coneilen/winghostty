@@ -37,6 +37,7 @@ typedef struct input_context {
     LONG clipboard_writes;
     LONG focus;
     LONG link_reentrant_callbacks;
+    LONG link_leave_callbacks;
     LONG wrong_thread;
     LONG wrong_user_data;
     LONG callbacks_after_destroy;
@@ -66,6 +67,7 @@ typedef struct input_context {
     int saw_mouse_leave;
     int saw_link_click;
     int saw_link_url_after_reentrant;
+    int saw_link_leave_url;
     int link_reentrant_action;
     int saw_selection_drag;
     char pasted[128];
@@ -315,6 +317,12 @@ static void on_link(
     if (hovered && strcmp(url, "https://example.com") == 0) {
         InterlockedIncrement(&context->links);
     }
+    if (!hovered) {
+        InterlockedIncrement(&context->link_leave_callbacks);
+        if (strcmp(url, "https://example.com") == 0) {
+            context->saw_link_leave_url = 1;
+        }
+    }
     if (clicked) context->saw_link_click = 1;
     if (context->link_reentrant_action != 0) {
         const int action = context->link_reentrant_action;
@@ -488,6 +496,8 @@ static int run_link_reentrant_case(
     options.input.links_enabled = 1;
     context->callback_host = NULL;
     context->link_reentrant_action = action;
+    context->link_leave_callbacks = 0;
+    context->saw_link_leave_url = 0;
     context->saw_link_url_after_reentrant = 0;
     if (winghostty_host_initialize(&host) != WINGHOSTTY_OK) return 1;
     context->callback_host = host;
@@ -509,6 +519,11 @@ static int run_link_reentrant_case(
         0,
         MAKELPARAM(8, 8)
     );
+    const LONG expected_leaves = action == 3 ? 0 : 1;
+    if (context->link_leave_callbacks != expected_leaves ||
+        (expected_leaves != 0 && !context->saw_link_leave_url)) {
+        return 1;
+    }
     if (action != 3) (void)winghostty_host_deinitialize(host);
     return context->link_reentrant_action == 0 &&
         context->saw_link_url_after_reentrant
