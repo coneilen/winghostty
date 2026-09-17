@@ -74,14 +74,25 @@ function Invoke-Seed {
     Write-Host "== $label =="
 
     if (-not (Test-Path $archive)) {
-        & bitsadmin /transfer "winghostty-$($Dep.File)" /download /priority foreground $Dep.Url $archive
-        if ($LASTEXITCODE -ne 0) {
-            if ($Dep.Optional) {
-                Write-Host "Skipping optional dependency archive: $($Dep.File)"
-                return
+        $partial = "$archive.$([guid]::NewGuid()).partial"
+        try {
+            & curl.exe --fail --location --silent --show-error `
+                --connect-timeout 15 --max-time 120 --output $partial --url $Dep.Url
+            if ($LASTEXITCODE -ne 0) {
+                if ($Dep.Optional) {
+                    Write-Warning "Skipping optional dependency archive: $($Dep.File) (curl exit $LASTEXITCODE)"
+                    return
+                }
+
+                throw "Dependency download failed for $($Dep.Url) (curl exit $LASTEXITCODE)"
             }
 
-            throw "bitsadmin failed for $($Dep.Url)"
+            Move-Item -LiteralPath $partial -Destination $archive
+        }
+        finally {
+            if (Test-Path -LiteralPath $partial) {
+                Remove-Item -LiteralPath $partial -Force
+            }
         }
     }
 
