@@ -48,6 +48,24 @@ guards are:
 .\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\test\windows\zig-cache-offline-build.ps1
 ```
 
+The seeder uses Windows `curl.exe` so GitHub archive responses need not provide
+Content-Length. Downloads follow redirects, fail on HTTP errors, and have a
+15-second connection timeout and a 120-second overall deadline. Only completed
+downloads are renamed from unique partial files into the archive cache; failed
+transfers remove their partial output before returning an error. Zig still
+imports each archive into the resolved global cache.
+
+The offline-consumption regression honors the same inherited cache settings as
+the seeder. In CI, setup-zig can select `.zig-cache` as the global cache even
+when the job originally declared `.zig-global-cache`; the consumer must not
+silently switch back. With no overrides, the shared cache resolver still
+provides the documented defaults and same-drive normalization.
+
+`test\windows\zig-dependency-download.ps1` exercises loopback responses without
+Content-Length, chunked bodies, redirects, HTTP errors, truncated transfers,
+optional failures, and existing-archive reuse. The Test workflow runs it and
+the real offline-cache consumer in both PowerShell 7 and Windows PowerShell 5.1.
+
 ## Win32 terminal `Surface` dependency map
 
 The extraction root is the Win32 runtime `Surface` in

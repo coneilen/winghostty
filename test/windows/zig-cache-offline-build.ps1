@@ -10,9 +10,8 @@ $libxevArchive = "libxev-34fa50878aec6e5fa8f532867001ab3c36fae23e.tar.gz"
 $libxevPackage = "libxev-0.0.0-86vtc4IcEwCqEYxEYoN_3KXmc6A9VLcm22aVImfvecYs"
 
 try {
-    $env:ZIG_LOCAL_CACHE_DIR = Join-Path $repoRoot ".zig-cache"
-    $env:ZIG_GLOBAL_CACHE_DIR = Join-Path $repoRoot ".zig-global-cache"
     $paths = Set-WinghosttyZigCacheEnvironment -RepoRoot $repoRoot
+    Write-Host "Offline cache consumption: local=$($paths.Local), global=$($paths.Global)"
 
     $archivePath = Join-Path $paths.Local "downloads\$libxevArchive"
     $packagePath = Join-Path $paths.Global "p\$libxevPackage"

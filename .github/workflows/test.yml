@@ -82,6 +82,14 @@ jobs:
           # Failed and cancelled jobs can save incomplete generated files.
           use-cache: false
 
+      - name: Dependency download regression tests (PowerShell 7)
+        shell: pwsh
+        run: ./test/windows/zig-dependency-download.ps1
+
+      - name: Dependency download regression tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./test/windows/zig-dependency-download.ps1
+
       - name: Seed Windows Zig dependencies
         shell: pwsh
         run: .\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\fetch-zig-deps.ps1
@@ -96,6 +104,10 @@ jobs:
 
       - name: Zig offline cache-consumption regression check
         shell: pwsh
+        run: ./test/windows/zig-cache-offline-build.ps1
+
+      - name: Zig offline cache-consumption regression check (Windows PowerShell 5.1)
+        shell: powershell
         run: ./test/windows/zig-cache-offline-build.ps1
 
       - name: Win32 host API external compile/layout contract
