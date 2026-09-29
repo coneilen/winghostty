@@ -1232,15 +1232,12 @@ pub const SurfaceProvider = struct {
     }
     fn Text2GetCaretRange(value: *com.ITextProvider2, active: *com.BOOL, out: *?*com.ITextRangeProvider) callconv(.winapi) com.HRESULT {
         const self = fromText2(value);
-        var call = self.beginCall() orelse {
-            out.* = null;
-            return com.UIA_E_ELEMENTNOTAVAILABLE;
-        };
-        defer call.deinit();
+        active.* = 0;
         out.* = null;
+        var call = self.beginCall() orelse return com.UIA_E_ELEMENTNOTAVAILABLE;
+        defer call.deinit();
         if (!self.available()) return com.UIA_E_ELEMENTNOTAVAILABLE;
         var snapshot = self.snapshotCopy(self.alloc) catch return com.E_OUTOFMEMORY;
-        active.* = if (self.focused.load(.acquire)) 1 else 0;
         const caret = snapshot.caret;
         const range = SurfaceTextRangeProvider.createWithSnapshot(
             self.alloc,
@@ -1251,6 +1248,7 @@ pub const SurfaceProvider = struct {
             snapshot.deinit(self.alloc);
             return com.E_OUTOFMEMORY;
         };
+        active.* = if (self.focused.load(.acquire)) 1 else 0;
         out.* = &range.base;
         return com.S_OK;
     }
@@ -3010,6 +3008,73 @@ test "caret ranges expose empty bounding rectangles" {
     try std.testing.expectEqual(@as(u32, 1), com.SafeArrayGetDim(rectangles.?));
     _ = com.SafeArrayDestroy(rectangles);
     _ = SurfaceTextRangeProvider.Release(caret_range.?);
+}
+
+test "Text2 caret initializes outputs after detach and retained range disconnects" {
+    var provider = try SurfaceProvider.create(std.testing.allocator, @ptrFromInt(1), .{
+        .text = "before",
+        .caret = 3,
+        .focused = true,
+    });
+    defer _ = SurfaceProvider.Release(&provider.base);
+
+    var active: com.BOOL = -1;
+    var caret_range: ?*com.ITextRangeProvider = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        provider.text2_iface.vtbl.GetCaretRange(&provider.text2_iface, &active, &caret_range),
+    );
+    try std.testing.expectEqual(@as(com.BOOL, 1), active);
+    const retained = caret_range.?;
+    defer _ = SurfaceTextRangeProvider.Release(retained);
+    var document: ?*com.ITextRangeProvider = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        provider.text2_iface.vtbl.get_DocumentRange(&provider.text2_iface, &document),
+    );
+    defer _ = SurfaceTextRangeProvider.Release(document.?);
+    try provider.updateText("after", .{ .start = 0, .end = 5 }, .{ .start = 0, .end = 0 }, 0);
+    var old_text: ?[*:0]u16 = null;
+    try std.testing.expectEqual(
+        com.S_OK,
+        document.?.vtbl.GetText(document.?, -1, &old_text),
+    );
+    defer com.SysFreeString(old_text);
+    try std.testing.expectEqualSlices(u16, &.{ 'b', 'e', 'f', 'o', 'r', 'e' }, std.mem.span(old_text.?));
+    try std.testing.expectEqual(Range{ .start = 3, .end = 3 }, SurfaceTextRangeProvider.fromBase(retained).range);
+
+    const original_alloc = provider.alloc;
+    for ([_]usize{ 0, 2 }) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        provider.alloc = failing.allocator();
+        active = -1;
+        caret_range = @ptrFromInt(8);
+        const hr = provider.text2_iface.vtbl.GetCaretRange(&provider.text2_iface, &active, &caret_range);
+        provider.alloc = original_alloc;
+        try std.testing.expectEqual(com.E_OUTOFMEMORY, hr);
+        try std.testing.expectEqual(@as(com.BOOL, 0), active);
+        try std.testing.expectEqual(@as(?*com.ITextRangeProvider, null), caret_range);
+    }
+
+    provider.detach();
+    active = -1;
+    caret_range = @ptrFromInt(8);
+    try std.testing.expectEqual(
+        com.UIA_E_ELEMENTNOTAVAILABLE,
+        provider.text2_iface.vtbl.GetCaretRange(&provider.text2_iface, &active, &caret_range),
+    );
+    try std.testing.expectEqual(@as(com.BOOL, 0), active);
+    try std.testing.expectEqual(@as(?*com.ITextRangeProvider, null), caret_range);
+
+    var text: ?[*:0]u16 = @ptrFromInt(2);
+    try std.testing.expectEqual(
+        com.UIA_E_ELEMENTNOTAVAILABLE,
+        retained.vtbl.GetText(retained, -1, &text),
+    );
+    try std.testing.expectEqual(@as(?[*:0]u16, null), text);
 }
 
 test "range creation cleans up allocation failure after provider allocation" {
