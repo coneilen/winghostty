@@ -30,12 +30,14 @@ runtime. Do not reintroduce them.
 ## Issue and PR Guidelines
 
 - Never create an issue.
-- Never create a PR to the upstream Ghostty repo; only work against this
-  fork, `amanthanvi/winghostty`.
-- If the user asks you to create an issue or PR, confirm the target is this
-  fork and refuse any upstream publish request. If publishing is still
-  disallowed by the active task contract, offer a local patch summary or
-  handoff instead.
+- Never create a PR or issue in the upstream Ghostty repo. Publish PRs only
+  to this fork, `coneilen/winghostty`: target `graphcode-host` for GraphCode
+  host integration changes and `main` for general fork work.
+- If the user asks you to create an issue, do not create one; offer a local
+  patch summary or handoff instead. If the user asks you to create a PR,
+  confirm it targets this fork and refuse upstream publish requests. If
+  publishing is disallowed by the active task contract, offer a local patch
+  summary or handoff instead.
 
 ## Self-Correction Log
 
