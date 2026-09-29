@@ -33,6 +33,14 @@ if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES%\Microsoft Visual Studio\2022\Buil
 if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES%\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES%\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat"
 if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES%\Microsoft Visual Studio\2022\Professional\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES%\Microsoft Visual Studio\2022\Professional\Common7\Tools\VsDevCmd.bat"
 if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES%\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES%\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat"
+if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES_X86%\Microsoft Visual Studio\2019\BuildTools\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES_X86%\Microsoft Visual Studio\2019\BuildTools\Common7\Tools\VsDevCmd.bat"
+if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES_X86%\Microsoft Visual Studio\2019\Community\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES_X86%\Microsoft Visual Studio\2019\Community\Common7\Tools\VsDevCmd.bat"
+if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES_X86%\Microsoft Visual Studio\2019\Professional\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES_X86%\Microsoft Visual Studio\2019\Professional\Common7\Tools\VsDevCmd.bat"
+if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES_X86%\Microsoft Visual Studio\2019\Enterprise\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES_X86%\Microsoft Visual Studio\2019\Enterprise\Common7\Tools\VsDevCmd.bat"
+if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES%\Microsoft Visual Studio\2019\BuildTools\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES%\Microsoft Visual Studio\2019\BuildTools\Common7\Tools\VsDevCmd.bat"
+if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES%\Microsoft Visual Studio\2019\Community\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES%\Microsoft Visual Studio\2019\Community\Common7\Tools\VsDevCmd.bat"
+if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES%\Microsoft Visual Studio\2019\Professional\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES%\Microsoft Visual Studio\2019\Professional\Common7\Tools\VsDevCmd.bat"
+if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES%\Microsoft Visual Studio\2019\Enterprise\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES%\Microsoft Visual Studio\2019\Enterprise\Common7\Tools\VsDevCmd.bat"
 if "%DEV_WINDOWS_ARCH%"=="" (
   if /i "%PROCESSOR_ARCHITECTURE%"=="ARM64" (
     set "DEV_WINDOWS_ARCH=arm64"
@@ -46,7 +54,7 @@ if /i not "%DEV_WINDOWS_ARCH%"=="x64" if /i not "%DEV_WINDOWS_ARCH%"=="arm64" (
 )
 
 if "%VSDEVCMD%"=="" (
-  echo Missing VS Dev shell bootstrap. Install Visual Studio 2022 Build Tools with the C++ workload.
+  echo Missing VS Dev shell bootstrap. Install Visual Studio 2019 or later with the C++ workload.
   exit /b 1
 )
 
@@ -61,7 +69,7 @@ if not exist "%GIT_USR_BIN%\sh.exe" (
 )
 
 if "%ZIG_HOME%"=="" (
-  echo Zig 0.15.2+ not found. Set ZIG_HOME or install Zig to "%_USER_HOME%\tools\zig" or "%_PROGRAM_FILES%\Zig".
+  echo Zig 0.15.2 not found. Set ZIG_HOME or install Zig to "%_USER_HOME%\tools\zig" or "%_PROGRAM_FILES%\Zig".
   exit /b 1
 )
 
@@ -84,8 +92,23 @@ set "TMP=%_TMP_DIR%"
 if not exist "%LOCALAPPDATA%" mkdir "%LOCALAPPDATA%" >nul 2>nul
 if not exist "%APPDATA%" mkdir "%APPDATA%" >nul 2>nul
 if not exist "%TEMP%" mkdir "%TEMP%" >nul 2>nul
-if "%ZIG_GLOBAL_CACHE_DIR%"=="" set "ZIG_GLOBAL_CACHE_DIR=%LOCALAPPDATA%\zig"
 if "%ZIG_LOCAL_CACHE_DIR%"=="" set "ZIG_LOCAL_CACHE_DIR=%CD%\.zig-cache"
+if "%ZIG_GLOBAL_CACHE_DIR%"=="" set "ZIG_GLOBAL_CACHE_DIR=%CD%\.zig-global-cache"
+for %%I in ("%ZIG_LOCAL_CACHE_DIR%") do (
+  set "ZIG_LOCAL_CACHE_DIR=%%~fI"
+  set "_LOCAL_CACHE_DRIVE=%%~dI"
+  set "_LOCAL_CACHE_PARENT=%%~dpI"
+)
+for %%I in ("%ZIG_GLOBAL_CACHE_DIR%") do (
+  set "ZIG_GLOBAL_CACHE_DIR=%%~fI"
+  set "_GLOBAL_CACHE_DRIVE=%%~dI"
+)
+if /i not "%_LOCAL_CACHE_DRIVE%"=="%_GLOBAL_CACHE_DRIVE%" set "ZIG_GLOBAL_CACHE_DIR=%_LOCAL_CACHE_PARENT%.zig-global-cache"
+if /i "%~1"=="--print-cache-paths" (
+  echo ZIG_LOCAL_CACHE_DIR=%ZIG_LOCAL_CACHE_DIR%
+  echo ZIG_GLOBAL_CACHE_DIR=%ZIG_GLOBAL_CACHE_DIR%
+  exit /b 0
+)
 set "PATH=%GIT_CMD%;%GIT_USR_BIN%;%ZIG_HOME%;%PATH%"
 
 echo == Versions ==
@@ -98,8 +121,8 @@ git --version || exit /b 1
 zig version || exit /b 1
 cl 2>&1 | findstr /c:"Version" || exit /b 1
 for /f %%v in ('zig version') do set "ZIG_VERSION=%%v"
-echo %ZIG_VERSION% | findstr /b /c:"0.15." >nul || (
-  echo winghostty currently requires Zig 0.15.x. Resolved: %ZIG_VERSION%
+if /i not "%ZIG_VERSION%"=="0.15.2" (
+  echo winghostty baseline requires Zig 0.15.2. Resolved: %ZIG_VERSION%
   exit /b 1
 )
 

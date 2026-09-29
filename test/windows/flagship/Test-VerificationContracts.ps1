@@ -6710,9 +6710,9 @@ $releasePreflightStepSha256 =
 $readinessPreflightStepSha256 =
     '021214f70c1b21adcc770f9e96f66daf1ada2f9eae4180daf3958236941b05c9'
 $releaseWorkflowSha256 =
-    '2aba54c3128eae8ab191751f2c746785347ae8a7dd166e12f69db2bd5ed36b4f'
+    '13db031b8ee25fd3579ef1bd65354a14cec844e10f0b55817d1efe82b9dfe91a'
 $readinessWorkflowSha256 =
-    '2659a58baeffaa9861c33bd4cdcd7adc8838dd6f9e91d51dcffc338af906f303'
+    'be9d472e2d2e2d8a57803810409634c8acc503093b0c7403050d9f80cc09c808'
 # Full-file pins deliberately make every workflow edit a semantic-review event,
 # including triggers, permissions, inherited job metadata, and unprotected steps.
 $commonWorkflowBoundaryMutations = @(
@@ -6733,7 +6733,7 @@ $commonWorkflowBoundaryMutations = @(
     },
     @{
         Label = 'runner redirect'
-        Target = '    runs-on: windows-latest'
+        Target = '    runs-on: windows-2022'
         Replacement = '    runs-on: [self-hosted, forged-release]'
     },
     @{
@@ -8085,14 +8085,23 @@ Assert-TextContract `
     -Pattern '(?m)^\s*timeout-minutes:\s+60\s*$' `
     -Description 'full interactive validation has enough job budget for the accessibility soak' `
     -Context "$testWorkflow :: windows-interactive"
+$interactiveJobText = Get-YamlJobText `
+    -Content $testWorkflowText `
+    -Name 'windows-interactive' `
+    -Source $testWorkflow
 $interactiveRunStep = Get-YamlStepBlock `
-    -Content (Get-YamlJobText -Content $testWorkflowText -Name 'windows-interactive' -Source $testWorkflow) `
+    -Content $interactiveJobText `
     -Name 'Run interactive Win11 composite' `
     -Source "$testWorkflow :: windows-interactive"
 Assert-TextContract `
+    -Content $interactiveJobText `
+    -Pattern '(?ms)^    env:\s+ZIG_GLOBAL_CACHE_DIR: \$\{\{ github\.workspace \}\}\\\.zig-global-cache\s+ZIG_LOCAL_CACHE_DIR: \$\{\{ github\.workspace \}\}\\\.zig-cache' `
+    -Description 'interactive builds use the job-level workspace Zig caches' `
+    -Context "$testWorkflow :: windows-interactive"
+Assert-TextContract `
     -Content $interactiveRunStep `
-    -Pattern '(?ms)env:\s+ZIG_GLOBAL_CACHE_DIR: \$\{\{ runner\.temp \}\}\\zig-global-cache\s+ZIG_LOCAL_CACHE_DIR: \$\{\{ runner\.temp \}\}\\zig-local-cache' `
-    -Description 'interactive builds use clean per-job Zig caches' `
+    -Pattern '(?ms)^        run:\s+\|' `
+    -Description 'interactive cache paths are inherited by the run step' `
     -Context "$testWorkflow :: windows-interactive :: Run interactive Win11 composite"
 $interactiveRunScript = Get-YamlLiteralRunScript `
     -Content $interactiveRunStep `
@@ -8141,12 +8150,60 @@ Assert-TextContract `
     -Context "$testWorkflow :: Verify default source-build shader mode"
 Assert-WorkflowContract `
     -Path (Join-Path $repoRoot 'scripts\dev-windows.cmd') `
-    -Pattern '(?s)if "%ZIG_GLOBAL_CACHE_DIR%"=="" set "ZIG_GLOBAL_CACHE_DIR=.*?if "%ZIG_LOCAL_CACHE_DIR%"=="" set "ZIG_LOCAL_CACHE_DIR=' `
-    -Description 'Windows bootstrap preserves caller-provided Zig cache isolation'
+    -Pattern '(?s)if "%ZIG_LOCAL_CACHE_DIR%"=="" set "ZIG_LOCAL_CACHE_DIR=.*?if "%ZIG_GLOBAL_CACHE_DIR%"=="" set "ZIG_GLOBAL_CACHE_DIR=' `
+    -Description 'Windows bootstrap resolves local then global Zig caches'
+Assert-WorkflowContract `
+    -Path (Join-Path $repoRoot 'scripts\dev-windows.cmd') `
+    -Pattern '(?s)for %%I in \("%ZIG_LOCAL_CACHE_DIR%"\) do \(.*?set "_LOCAL_CACHE_DRIVE=%%~dI".*?set "_LOCAL_CACHE_PARENT=%%~dpI".*?if /i not "%_LOCAL_CACHE_DRIVE%"=="%_GLOBAL_CACHE_DRIVE%" set "ZIG_GLOBAL_CACHE_DIR=%_LOCAL_CACHE_PARENT%\.zig-global-cache"' `
+    -Description 'Windows bootstrap follows the resolved local cache volume for cross-drive global fallback'
+Assert-WorkflowContract `
+    -Path (Join-Path $repoRoot 'scripts\fetch-zig-deps.cmd') `
+    -Pattern '(?s)for %%I in \("%ZIG_LOCAL_CACHE_DIR%"\) do \(.*?set "_LOCAL_CACHE_DRIVE=%%~dI".*?set "_LOCAL_CACHE_PARENT=%%~dpI".*?if /i not "%_LOCAL_CACHE_DRIVE%"=="%_GLOBAL_CACHE_DRIVE%" set "ZIG_GLOBAL_CACHE_DIR=%_LOCAL_CACHE_PARENT%\.zig-global-cache"' `
+    -Description 'CMD dependency seeding follows the resolved local cache volume for cross-drive global fallback'
+Assert-WorkflowContract `
+    -Path $testWorkflow `
+    -Pattern '(?ms)- name: CMD Zig cache cross-drive regression check\s+shell: pwsh\s+run: ./test/windows/zig-cache-cmd-cross-drive\.ps1' `
+    -Description 'Windows CI executes the forced cross-drive CMD cache regression'
+Assert-WorkflowContract `
+    -Path $testWorkflow `
+    -Pattern '(?ms)- name: Win32 host API external compile/layout contract\s+shell: pwsh\s+run: ./test/windows/compile-win32-host-api\.ps1.*?- name: Win32 host API lifecycle smoke\s+shell: pwsh\s+run: ./test/windows/run-win32-host-api-smoke\.ps1' `
+    -Description 'Windows CI compiles, checks layout, and exercises the external Win32 host API boundary'
+Assert-WorkflowContract `
+    -Path (Join-Path $repoRoot 'src\win32_host.zig') `
+    -Pattern '(?s)pub export fn winghostty_host_initialize.*?pub export fn winghostty_host_deinitialize.*?pub export fn winghostty_host_create_surface.*?pub export fn winghostty_surface_destroy' `
+    -Description 'Win32 host API owns explicit initialize/create/destroy lifecycle exports'
+Assert-WorkflowContract `
+    -Path (Join-Path $repoRoot 'src\win32_host.zig') `
+    -Pattern '(?s)state\.creation_depth \+= 1;\s+surface\.creation_in_progress = true;\s+const hwnd = CreateWindowExW.*?if \(state\.shutting_down(?:\.load\(\.acquire\))?\)' `
+    -Description 'Win32 host API guards child creation before synchronous parent reentrancy'
+Assert-WorkflowContract `
+    -Path (Join-Path $repoRoot 'test\windows\win32-host-api-smoke.c') `
+    -Pattern '(?s)case WM_PARENTNOTIFY:.*?deinit_on_parent_notify.*?winghostty_host_deinitialize.*?WINGHOSTTY_SHUTTING_DOWN' `
+    -Description 'Win32 host API smoke covers parent-notify deinitialization during child creation'
+Assert-WorkflowContractAbsent `
+    -Path (Join-Path $repoRoot 'src\win32_host.zig') `
+    -Pattern '(?i)GraphCode|App\.zig|Surface\.zig|apprt\.win32' `
+    -Description 'Win32 host API boundary does not import GraphCode or product surface types'
+Assert-WorkflowContract `
+    -Path (Join-Path $repoRoot 'include\winghostty\win32_host.h') `
+    -Pattern '(?s)typedef int32_t winghostty_result;.*?typedef int32_t winghostty_theme;' `
+    -Description 'Win32 host API uses fixed-width ABI typedefs instead of C enums'
+Assert-WorkflowContractAbsent `
+    -Path (Join-Path $repoRoot 'include\winghostty\win32_host.h') `
+    -Pattern 'typedef\s+enum\s+winghostty_(result|theme)' `
+    -Description 'Win32 host API header has no ABI-facing C enums'
+Assert-WorkflowContract `
+    -Path (Join-Path $repoRoot 'test\windows\compile-win32-host-api.ps1') `
+    -Pattern '(?s)-fshort-enums.*?zig.*?c\+\+.*?-fshort-enums' `
+    -Description 'Win32 host API layout contract covers C and C++ short-enum modes'
 Assert-WorkflowContract `
     -Path (Join-Path $repoRoot 'scripts\dev-windows.ps1') `
-    -Pattern '(?s)IsNullOrWhiteSpace\(\$env:ZIG_GLOBAL_CACHE_DIR\).*?IsNullOrWhiteSpace\(\$env:ZIG_LOCAL_CACHE_DIR\)' `
-    -Description 'PowerShell Windows bootstrap preserves caller-provided Zig cache isolation'
+    -Pattern '(?s)\. \(Join-Path \$PSScriptRoot "zig-cache\.ps1"\).*?Set-WinghosttyZigCacheEnvironment' `
+    -Description 'PowerShell Windows bootstrap centralizes Zig cache isolation'
+Assert-WorkflowContract `
+    -Path (Join-Path $repoRoot 'scripts\zig-cache.ps1') `
+    -Pattern '(?s)\$local = \$env:ZIG_LOCAL_CACHE_DIR.*?\$global = \$env:ZIG_GLOBAL_CACHE_DIR' `
+    -Description 'shared Zig cache bootstrap resolves local before global paths'
 Assert-TextContract `
     -Content (Get-YamlStepBlock -Content $testWorkflowText -Name 'Upload interactive evidence' -Source $testWorkflow) `
     -Pattern '(?ms)include-hidden-files: true.*?github\.workspace.*?\.sandbox/win11/\*\*/logs/\*\*' `

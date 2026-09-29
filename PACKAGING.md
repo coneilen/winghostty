@@ -57,7 +57,7 @@ policy.
 Build the app first:
 
 ```powershell
-zig build -Demit-exe=true
+.\scripts\dev-windows.cmd zig build -Demit-exe=true
 ```
 
 x64 packaging also requires LLVM's `llvm-objdump` on `PATH` or in the
@@ -70,14 +70,14 @@ If Zig cannot hydrate its dependency cache automatically in your
 environment, seed the Windows build dependency cache first:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/fetch-zig-deps.ps1
-zig build -Demit-exe=true
+.\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\fetch-zig-deps.ps1
+.\scripts\dev-windows.cmd zig build -Demit-exe=true
 ```
 
 Then stage release assets:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Version 1.3.100
+.\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1 -Version 1.3.100
 ```
 
 In a native Windows ARM64 PowerShell process, the packaging script defaults
@@ -96,7 +96,7 @@ first:
 $env:WINDOWS_CODESIGN_PFX_PATH = "C:\secure\winghostty-signing.pfx"
 $env:WINDOWS_CODESIGN_PFX_PASSWORD = "<pfx-password>"
 $env:WINDOWS_CODESIGN_TRUST_SELF_SIGNED = "true" # only for internal/self-signed PFXs
-powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1 `
+.\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1 `
   -Version 1.3.100 `
   -RequireInstaller `
   -RequireSigning

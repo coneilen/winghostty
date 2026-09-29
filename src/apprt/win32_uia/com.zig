@@ -22,8 +22,10 @@ pub const E_POINTER: HRESULT = @bitCast(@as(u32, 0x80004003));
 pub const E_NOINTERFACE: HRESULT = @bitCast(@as(u32, 0x80004002));
 pub const E_OUTOFMEMORY: HRESULT = @bitCast(@as(u32, 0x8007000E));
 pub const E_INVALIDARG: HRESULT = @bitCast(@as(u32, 0x80070057));
+pub const DISP_E_BADINDEX: HRESULT = @bitCast(@as(u32, 0x8002000B));
 pub const UIA_E_ELEMENTNOTAVAILABLE: HRESULT = @bitCast(@as(u32, 0x80040201));
 pub const UIA_E_ELEMENTNOTENABLED: HRESULT = @bitCast(@as(u32, 0x80040200));
+pub const UIA_E_NOTSUPPORTED: HRESULT = @bitCast(@as(u32, 0x80040204));
 pub const UIA_E_INVALIDOPERATION: HRESULT = @bitCast(@as(u32, 0x80131509));
 pub const RPC_E_CANTCALLOUT_ININPUTSYNCCALL: HRESULT = @bitCast(@as(u32, 0x8001010D));
 
@@ -437,6 +439,7 @@ pub extern "oleaut32" fn SysFreeString(bstr: BSTR) callconv(.winapi) void;
 pub extern "oleaut32" fn SysStringLen(bstr: ?[*]const u16) callconv(.winapi) u32;
 pub extern "oleaut32" fn VariantClear(pvarg: *VARIANT) callconv(.winapi) HRESULT;
 pub extern "oleaut32" fn SafeArrayCreateVector(vt: u16, lLbound: i32, cElements: u32) callconv(.winapi) ?*SAFEARRAY;
+pub extern "oleaut32" fn SafeArrayGetDim(psa: *SAFEARRAY) callconv(.winapi) u32;
 pub extern "oleaut32" fn SafeArrayPutElement(psa: *SAFEARRAY, rgIndices: *i32, pv: ?*anyopaque) callconv(.winapi) HRESULT;
 pub extern "oleaut32" fn SafeArrayGetElement(psa: *SAFEARRAY, rgIndices: *i32, pv: *anyopaque) callconv(.winapi) HRESULT;
 pub extern "oleaut32" fn SafeArrayGetLBound(psa: *SAFEARRAY, nDim: u32, plLbound: *i32) callconv(.winapi) HRESULT;

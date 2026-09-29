@@ -19,16 +19,16 @@ $zigExe = if ($env:ZIG_HOME -and (Test-Path (Join-Path $env:ZIG_HOME "zig.exe"))
 } else {
     "zig.exe"
 }
-
-$globalCacheDir = if ($env:ZIG_GLOBAL_CACHE_DIR) {
-    $env:ZIG_GLOBAL_CACHE_DIR
-} else {
-    Join-Path $userHome "AppData\Local\zig"
+$zigVersion = (& $zigExe version).Trim()
+if ($zigVersion -ne "0.15.2") {
+    throw "Winghostty baseline requires Zig 0.15.2; resolved $zigVersion."
 }
 
-$downloadDir = Join-Path (Get-Location) ".zig-cache\downloads"
-New-Item -ItemType Directory -Force -Path $globalCacheDir | Out-Null
+. (Join-Path $PSScriptRoot "zig-cache.ps1")
+$zigCache = Set-WinghosttyZigCacheEnvironment -RepoRoot (Get-Location).Path
+$downloadDir = Join-Path $zigCache.Local "downloads"
 New-Item -ItemType Directory -Force -Path $downloadDir | Out-Null
+$globalCacheDir = $zigCache.Global
 
 $deps = @(
     @{ Url = "https://deps.files.ghostty.org/libxev-34fa50878aec6e5fa8f532867001ab3c36fae23e.tar.gz"; File = "libxev-34fa50878aec6e5fa8f532867001ab3c36fae23e.tar.gz" },
@@ -74,14 +74,25 @@ function Invoke-Seed {
     Write-Host "== $label =="
 
     if (-not (Test-Path $archive)) {
-        & bitsadmin /transfer "winghostty-$($Dep.File)" /download /priority foreground $Dep.Url $archive
-        if ($LASTEXITCODE -ne 0) {
-            if ($Dep.Optional) {
-                Write-Host "Skipping optional dependency archive: $($Dep.File)"
-                return
+        $partial = "$archive.$([guid]::NewGuid()).partial"
+        try {
+            & curl.exe --fail --location --silent --show-error `
+                --connect-timeout 15 --max-time 120 --output $partial --url $Dep.Url
+            if ($LASTEXITCODE -ne 0) {
+                if ($Dep.Optional) {
+                    Write-Warning "Skipping optional dependency archive: $($Dep.File) (curl exit $LASTEXITCODE)"
+                    return
+                }
+
+                throw "Dependency download failed for $($Dep.Url) (curl exit $LASTEXITCODE)"
             }
 
-            throw "bitsadmin failed for $($Dep.Url)"
+            Move-Item -LiteralPath $partial -Destination $archive
+        }
+        finally {
+            if (Test-Path -LiteralPath $partial) {
+                Remove-Item -LiteralPath $partial -Force
+            }
         }
     }
 

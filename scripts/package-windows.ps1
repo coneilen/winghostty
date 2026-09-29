@@ -100,15 +100,12 @@ $preferredSignToolPath = if ($env:WINDOWS_CODESIGN_SIGNTOOL_PATH) {
     $null
 }
 
-if (-not $env:ZIG_LOCAL_CACHE_DIR) {
-    $env:ZIG_LOCAL_CACHE_DIR = Join-Path $repoRoot ".zig-cache"
+. (Join-Path $PSScriptRoot "zig-cache.ps1")
+$null = Set-WinghosttyZigCacheEnvironment -RepoRoot $repoRoot
+$zigVersion = (& zig version).Trim()
+if ($zigVersion -ne "0.15.2") {
+    throw "Winghostty baseline requires Zig 0.15.2; resolved $zigVersion."
 }
-if (-not $env:ZIG_GLOBAL_CACHE_DIR) {
-    $env:ZIG_GLOBAL_CACHE_DIR = Join-Path $localAppData "zig"
-}
-
-New-Item -ItemType Directory -Path $env:ZIG_LOCAL_CACHE_DIR -Force | Out-Null
-New-Item -ItemType Directory -Path $env:ZIG_GLOBAL_CACHE_DIR -Force | Out-Null
 
 function Remove-TreeIfPresent {
     param([string]$PathToRemove)

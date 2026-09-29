@@ -16,40 +16,62 @@ Use the standard Zig workflow from the repository root:
 
 | Command                                | Description                                |
 | -------------------------------------- | ------------------------------------------ |
-| `zig build`                            | Build the Win32 app and bundled resources  |
-| `zig build -Demit-exe=true`            | Force-install `zig-out/bin/winghostty.exe` |
-| `zig build test -Dtest-filter=<name>`  | Run targeted tests (preferred)             |
-| `zig build test -Demit-test-exe=true`  | Run the full test suite (slow)             |
-| `zig build test -Dtest-filter=win32`   | Run Win32-focused tests                    |
-| `zig build test -Dtest-filter=scroll`  | Run scroll/input regression tests          |
-| `zig build test -Dtest-filter=keybind` | Run keybinding/default-behavior tests      |
-| `zig build -Demit-lib-vt`              | Build the retained `libghostty-vt` library |
+| `.\scripts\dev-windows.cmd zig build`                            | Build the Win32 app and bundled resources  |
+| `.\scripts\dev-windows.cmd zig build -Demit-exe=true`            | Force-install `zig-out/bin/winghostty.exe` |
+| `.\scripts\dev-windows.cmd zig build test -Dtest-filter=<name>`  | Run targeted tests (preferred)             |
+| `.\scripts\dev-windows.cmd zig build test -Demit-test-exe=true`  | Run the full test suite (slow)             |
+| `.\scripts\dev-windows.cmd zig build test -Dtest-filter=win32`   | Run Win32-focused tests                    |
+| `.\scripts\dev-windows.cmd zig build test -Dtest-filter=scroll`  | Run scroll/input regression tests          |
+| `.\scripts\dev-windows.cmd zig build test -Dtest-filter=keybind` | Run keybinding/default-behavior tests      |
+| `.\scripts\dev-windows.cmd zig build -Demit-lib-vt`              | Build the retained `libghostty-vt` library |
 
-Bare `zig build test` errors in this fork — pass `-Dtest-filter=<name>` or
-`-Demit-test-exe=true` (enforced in `build.zig`). For normal development,
-prefer the narrowest verification that covers your change, then run
-`zig build` before you finish.
+Bare `zig build` is not the documented baseline command because a separate
+process must receive the same explicit cache paths as dependency seeding.
+The wrapper supplies those paths and the Visual Studio environment. Bare
+`zig build test` also errors in this fork — pass `-Dtest-filter=<name>` or
+`-Demit-test-exe=true` (enforced in `build.zig`).
+
+### Clean Windows baseline
+
+From the repository root, use the native shell wrapper for a clean build/test
+run:
+
+```powershell
+.\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\fetch-zig-deps.ps1
+.\scripts\dev-windows.cmd zig build test -Dtest-filter=win32
+.\scripts\dev-windows.cmd zig build -Demit-exe=true
+```
+
+Seeding and every build run through the wrapper, so separate processes share
+the same repo-local `ZIG_GLOBAL_CACHE_DIR` and `ZIG_LOCAL_CACHE_DIR`. The
+offline-consumption regression is:
+
+```powershell
+.\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\test\windows\zig-cache-offline-build.ps1
+```
+
+Zig 0.15.2's Windows build runner can panic when a generated child path and
+its dependency cwd are on different volumes. The focused guard is
+`test/windows/zig-cache-same-drive.ps1`.
 
 ## Toolchain
 
-This fork requires a **Zig 0.15.x release with patch ≥ 2**. The check is
-enforced at compile time in `src/build/zig.zig::requireZig`: any 0.14.x,
-0.16.x, or 0.15.0 / 0.15.1 toolchain fails with a `@compileError` before
-user code runs; 0.15.2 and any later 0.15 patch compile. CI uses 0.15.2
-exactly. If you have multiple Zig versions installed locally, check which
-one is on your `PATH` before debugging build issues.
+This baseline uses **Zig 0.15.2 exactly**. The wrapper and CI enforce that
+version. The source guard in `src/build/zig.zig::requireZig` also permits
+later 0.15 patches, but those are outside this compatibility tuple.
 
 If Zig fails before compilation because the dependency cache is empty or
-cannot be hydrated automatically for Windows builds, seed it first from the
-repo root:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/fetch-zig-deps.ps1
-```
-
-The repo also ships `scripts/dev-windows.ps1` and `scripts/dev-windows.cmd`
+cannot be hydrated automatically for Windows builds, run the seed command in
+the clean baseline section from the repository root. The repo also ships
+`scripts/dev-windows.ps1` and `scripts/dev-windows.cmd`
 to open a Windows-native shell with the expected Visual Studio and Zig cache
-environment already configured.
+environment already configured. Do not seed with a bare PowerShell process
+and then build with a bare `zig` process; the latter will not inherit the
+repo-local cache paths.
+
+The pinned fork/base and validated Windows toolchain tuple, plus the Win32
+terminal `Surface` dependency map, are recorded in
+[docs/winghostty-baseline.md](docs/winghostty-baseline.md).
 
 ## Manual Validation
 

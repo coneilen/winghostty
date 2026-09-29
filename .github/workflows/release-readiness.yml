@@ -20,7 +20,7 @@ permissions:
 jobs:
   release-preflight:
     name: Release Preflight
-    runs-on: windows-latest
+    runs-on: windows-2022
     environment: release
     env:
       WINGET_PACKAGE_IDENTIFIER: ${{ vars.WINGET_PACKAGE_IDENTIFIER }}

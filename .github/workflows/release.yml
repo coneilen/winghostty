@@ -27,7 +27,7 @@ concurrency:
 jobs:
   windows-release:
     name: Windows Release
-    runs-on: windows-latest
+    runs-on: windows-2022
     environment: release
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -40,6 +40,8 @@ jobs:
       WINDOWS_CODESIGN_TIMESTAMP_URL: ${{ vars.WINDOWS_CODESIGN_TIMESTAMP_URL }}
       WINDOWS_CODESIGN_TRUST_SELF_SIGNED: ${{ vars.WINDOWS_CODESIGN_TRUST_SELF_SIGNED }}
       WINDOWS_CODESIGN_MIN_VALIDITY_DAYS: ${{ vars.WINDOWS_CODESIGN_MIN_VALIDITY_DAYS }}
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}\.zig-global-cache
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}\.zig-cache
 
     steps:
       - name: Checkout code
@@ -234,6 +236,10 @@ jobs:
         with:
           version: 0.15.2
           use-cache: false
+
+      - name: Seed Windows Zig dependencies
+        shell: pwsh
+        run: .\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\fetch-zig-deps.ps1
 
       - name: Install Inno Setup
         shell: pwsh

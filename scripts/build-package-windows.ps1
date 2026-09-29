@@ -19,6 +19,10 @@ $ErrorActionPreference = "Stop"
 
 $archInfo = Get-WindowsPackageArchitecture -Architecture $(if ($Architecture) { $Architecture } else { Get-DefaultWindowsPackageArchitecture })
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
+$zigVersion = (& zig version).Trim()
+if ($zigVersion -ne "0.15.2") {
+    throw "Winghostty baseline requires Zig 0.15.2; resolved $zigVersion."
+}
 $zigOutBin = Join-Path $repoRoot "zig-out/bin"
 $buildCapabilitiesPath = Join-Path $zigOutBin "winghostty-build-capabilities.json"
 $runtimeFiles = @(

@@ -19,8 +19,9 @@ Run with:
 powershell.exe -ExecutionPolicy Bypass -File .\interactive-win11-validate.ps1 -ResetState
 ```
 
-Pass `-Rebuild` to force one upfront `zig build -Demit-exe=true` before
-the suite starts. The suite also does that upfront build automatically
+From the repository root, pass `-Rebuild` to force one upfront
+`.\scripts\dev-windows.cmd zig build -Demit-exe=true` before the suite starts.
+The suite also does that upfront build automatically
 when tracked inputs are newer than `zig-out\bin\winghostty.exe`, so child
 harnesses reuse one fresh binary instead of rebuilding in parallel.
 
@@ -220,11 +221,13 @@ runtime is properly initialized.
 
 ### Build
 
-First build ghostty.dll, then compile the test:
+From the repository root, first build ghostty.dll, then compile the test:
 
 ```powershell
-zig build -Dapp-runtime=none -Demit-exe=false
-zig cc test_dll_init.c -o test_dll_init.exe -target native-native-msvc
+.\scripts\dev-windows.cmd zig build -Dapp-runtime=none -Demit-exe=false
+Push-Location .\test\windows
+..\..\scripts\dev-windows.cmd zig cc test_dll_init.c -o test_dll_init.exe -target native-native-msvc
+Pop-Location
 ```
 
 ### Run
@@ -244,3 +247,27 @@ ghostty_info: <version string>
 The ghostty_info call verifies the DLL loads and the CRT is initialized.
 Before the fix, loading the DLL would crash with "access violation writing
 0x0000000000000024".
+
+## run-win32-host-renderer.ps1
+
+External host contract for the embeddable renderer. It validates caller-owned
+parenting, child HWND/HDC/HGLRC ownership, UI/render thread affinity,
+visibility/bounds/theme/font-scale updates, synchronous WGL presentation and
+teardown, renderer-entry races against surface/host destruction, and 100
+create/destroy cycles with USER/GDI handle counts. The teardown stress also
+enters the public host, mutation, notification, renderer, and getter APIs
+while destruction is in progress, and verifies stale handles cannot affect
+replacement objects after allocator address reuse. It also has a parent
+`WM_PARENTNOTIFY` handler that calls host deinitialization during child
+destruction and verifies deferred teardown completes without a deadlock. A
+1024-cycle parent-reentrant teardown run measures process-heap busy
+blocks/bytes to catch retained `SurfaceState` and copied options beyond
+USER/GDI accounting. A 1024-cycle numeric-handle run measures process-heap
+busy blocks/bytes to catch registry and retired-token growth beyond USER/GDI
+accounting. Persistent
+context coverage switches render-thread ownership from surface A to B, clears
+B, destroys A on the UI thread, and switches B again.
+
+```powershell
+.\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\test\windows\run-win32-host-renderer.ps1
+```

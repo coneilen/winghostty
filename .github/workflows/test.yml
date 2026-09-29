@@ -20,7 +20,10 @@ concurrency:
 jobs:
   windows:
     name: Windows Build And Tests
-    runs-on: windows-latest
+    runs-on: windows-2022
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}\.zig-global-cache
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}\.zig-cache
 
     steps:
       - name: Checkout code
@@ -79,6 +82,50 @@ jobs:
           # Failed and cancelled jobs can save incomplete generated files.
           use-cache: false
 
+      - name: Dependency download regression tests (PowerShell 7)
+        shell: pwsh
+        run: ./test/windows/zig-dependency-download.ps1
+
+      - name: Dependency download regression tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./test/windows/zig-dependency-download.ps1
+
+      - name: Seed Windows Zig dependencies
+        shell: pwsh
+        run: .\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\fetch-zig-deps.ps1
+
+      - name: Zig cache volume regression check
+        shell: pwsh
+        run: ./test/windows/zig-cache-same-drive.ps1
+
+      - name: CMD Zig cache cross-drive regression check
+        shell: pwsh
+        run: ./test/windows/zig-cache-cmd-cross-drive.ps1
+
+      - name: Zig offline cache-consumption regression check
+        shell: pwsh
+        run: ./test/windows/zig-cache-offline-build.ps1
+
+      - name: Zig offline cache-consumption regression check (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./test/windows/zig-cache-offline-build.ps1
+
+      - name: Win32 host API external compile/layout contract
+        shell: pwsh
+        run: ./test/windows/compile-win32-host-api.ps1
+
+      - name: Win32 host API lifecycle smoke
+        shell: pwsh
+        run: ./test/windows/run-win32-host-api-smoke.ps1
+
+      - name: Win32 host API input caller-loop smoke
+        shell: pwsh
+        run: ./test/windows/run-win32-host-api-input.ps1
+
+      - name: Win32 host renderer contract
+        shell: pwsh
+        run: ./test/windows/run-win32-host-renderer.ps1
+
       - name: Zig version
         run: zig version
 
@@ -98,6 +145,12 @@ jobs:
 
       - name: Native Win32 compositor tests
         run: zig test src/apprt/win32_compositor_native.zig -lc -luser32 -lkernel32
+
+      - name: Win32 glyph raster tests
+        run: zig test src/renderer/win32_glyph.zig -lc -lgdi32 -lkernel32 -luser32
+
+      - name: Win32 host snapshot ABI tests
+        run: zig test src/win32_host.zig -lc -luser32 -lkernel32 -lgdi32 -lopengl32 -lole32 -loleaut32
 
       - name: Build executable
         # This traverses the default build graph too; a preceding plain
@@ -125,8 +178,11 @@ jobs:
 
   windows-portable-smoke:
     name: Windows x64 Portable Package Smoke
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 45
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}\.zig-global-cache
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}\.zig-cache
 
     steps:
       - name: Checkout code
@@ -139,6 +195,10 @@ jobs:
         with:
           version: 0.15.2
           use-cache: false
+
+      - name: Zig cache volume regression check
+        shell: pwsh
+        run: ./test/windows/zig-cache-same-drive.ps1
 
       - name: Run portable package CLI smoke
         shell: pwsh
@@ -164,6 +224,9 @@ jobs:
       (github.event_name == 'workflow_dispatch' && inputs.run_interactive_win11)
     runs-on: [self-hosted, Windows, X64, winghostty-interactive]
     timeout-minutes: 60
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}\.zig-global-cache
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}\.zig-cache
 
     steps:
       - name: Checkout code
@@ -187,9 +250,6 @@ jobs:
 
       - name: Run interactive Win11 composite
         shell: pwsh
-        env:
-          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}\zig-global-cache
-          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}\zig-local-cache
         run: |
           $ErrorActionPreference = 'Stop'
           $quick = '${{ github.event_name }}' -eq 'pull_request'

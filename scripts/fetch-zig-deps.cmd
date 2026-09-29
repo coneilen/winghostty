@@ -12,8 +12,24 @@ if "%_USER_HOME%"=="" set "_USER_HOME=%_SYSTEM_DRIVE%\Users\%USERNAME%"
 
 set "ZIG_EXE=zig.exe"
 if not "%ZIG_HOME%"=="" if exist "%ZIG_HOME%\zig.exe" set "ZIG_EXE=%ZIG_HOME%\zig.exe"
-if "%ZIG_GLOBAL_CACHE_DIR%"=="" set "ZIG_GLOBAL_CACHE_DIR=%_USER_HOME%\AppData\Local\zig"
-set "DOWNLOAD_DIR=%CD%\.zig-cache\downloads"
+if "%ZIG_LOCAL_CACHE_DIR%"=="" set "ZIG_LOCAL_CACHE_DIR=%CD%\.zig-cache"
+if "%ZIG_GLOBAL_CACHE_DIR%"=="" set "ZIG_GLOBAL_CACHE_DIR=%CD%\.zig-global-cache"
+for %%I in ("%ZIG_LOCAL_CACHE_DIR%") do (
+  set "ZIG_LOCAL_CACHE_DIR=%%~fI"
+  set "_LOCAL_CACHE_DRIVE=%%~dI"
+  set "_LOCAL_CACHE_PARENT=%%~dpI"
+)
+for %%I in ("%ZIG_GLOBAL_CACHE_DIR%") do (
+  set "ZIG_GLOBAL_CACHE_DIR=%%~fI"
+  set "_GLOBAL_CACHE_DRIVE=%%~dI"
+)
+if /i not "%_LOCAL_CACHE_DRIVE%"=="%_GLOBAL_CACHE_DRIVE%" set "ZIG_GLOBAL_CACHE_DIR=%_LOCAL_CACHE_PARENT%.zig-global-cache"
+if /i "%~1"=="--print-cache-paths" (
+  echo ZIG_LOCAL_CACHE_DIR=%ZIG_LOCAL_CACHE_DIR%
+  echo ZIG_GLOBAL_CACHE_DIR=%ZIG_GLOBAL_CACHE_DIR%
+  exit /b 0
+)
+set "DOWNLOAD_DIR=%ZIG_LOCAL_CACHE_DIR%\downloads"
 
 where bitsadmin >nul 2>nul || (
   echo Missing bitsadmin.exe
@@ -23,6 +39,11 @@ where bitsadmin >nul 2>nul || (
 where "%ZIG_EXE%" >nul 2>nul
 if errorlevel 1 if not exist "%ZIG_EXE%" (
   echo Missing zig executable. Run this via scripts\dev-windows.cmd or set ZIG_HOME.
+  exit /b 1
+)
+for /f %%v in ('"%ZIG_EXE%" version') do set "ZIG_VERSION=%%v"
+if /i not "%ZIG_VERSION%"=="0.15.2" (
+  echo Winghostty baseline requires Zig 0.15.2. Resolved: %ZIG_VERSION%
   exit /b 1
 )
 
