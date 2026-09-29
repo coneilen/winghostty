@@ -5,6 +5,7 @@ const win32_types = @import("apprt/win32_types.zig");
 const host_metrics = @import("win32_host_metrics.zig");
 const host_uia = @import("win32_host_uia.zig");
 const win32_context = @import("renderer/win32_context.zig");
+const win32_glyph = @import("renderer/win32_glyph.zig");
 const win32_presentation = @import("renderer/win32_presentation.zig");
 const paste_protection = @import("apprt/win32_paste_protection.zig");
 const win32_clipboard_html = @import("apprt/win32_clipboard_html.zig");
@@ -274,6 +275,7 @@ const mouse_leave: u32 = 4;
 const clipboard_text: u32 = 0;
 const clipboard_html: u32 = 1;
 const terminal_snapshot_version: u32 = 1;
+const terminal_snapshot_version_2: u32 = 2;
 
 pub const Rect = extern struct {
     x: i32,
@@ -289,6 +291,27 @@ pub const TerminalSnapshot = extern struct {
     rows: u32,
     cells: ?[*]const win32_context.TerminalCell,
     cell_count: u64,
+    generation: u64,
+};
+
+/// Versioned v2 render-state view. This is a separate ABI from
+/// `TerminalSnapshot`; the v1 struct and its entry points are unchanged.
+///
+/// `glyphs` has one span per cell describing that cell's grapheme cluster
+/// inside `text`, plus the column width the grapheme occupies. Everything is
+/// caller-owned: the host validates first and only then copies cells, spans,
+/// and text together, so a rejected snapshot leaves the previous one intact.
+pub const TerminalSnapshotV2 = extern struct {
+    size: u32,
+    version: u32,
+    columns: u32,
+    rows: u32,
+    cells: ?[*]const win32_context.TerminalCell,
+    cell_count: u64,
+    glyphs: ?[*]const win32_context.TerminalGlyph,
+    glyph_count: u64,
+    text: ?[*]const u8,
+    text_length: u64,
     generation: u64,
 };
 
@@ -715,6 +738,9 @@ const SurfaceState = struct {
     options_mutex: std.Thread.Mutex = .{},
     terminal_mutex: std.Thread.Mutex = .{},
     terminal_cells: []win32_context.TerminalCell = &.{},
+    terminal_glyphs: []win32_context.TerminalGlyph = &.{},
+    terminal_text: []u8 = &.{},
+    terminal_generation: u64 = 0,
     terminal_columns: u32 = 0,
     terminal_rows: u32 = 0,
     renderer: ?*win32_context.Context = null,
@@ -2576,6 +2602,10 @@ fn deinitSurfaceResources(surface: *SurfaceState) void {
     surface.terminal_mutex.lock();
     if (surface.terminal_cells.len != 0) allocator.free(surface.terminal_cells);
     surface.terminal_cells = &.{};
+    if (surface.terminal_glyphs.len != 0) allocator.free(surface.terminal_glyphs);
+    surface.terminal_glyphs = &.{};
+    if (surface.terminal_text.len != 0) allocator.free(surface.terminal_text);
+    surface.terminal_text = &.{};
     surface.terminal_columns = 0;
     surface.terminal_rows = 0;
     surface.terminal_mutex.unlock();
@@ -3427,8 +3457,87 @@ fn setTerminalCells(
     defer state.terminal_mutex.unlock();
     if (state.terminal_cells.len != 0) allocator.free(state.terminal_cells);
     state.terminal_cells = next;
+    // A v1 snapshot carries no grapheme text, so any previously installed v2
+    // spans must go with it; otherwise the renderer would pair fresh cells
+    // with stale spans.
+    if (state.terminal_glyphs.len != 0) allocator.free(state.terminal_glyphs);
+    state.terminal_glyphs = &.{};
+    if (state.terminal_text.len != 0) allocator.free(state.terminal_text);
+    state.terminal_text = &.{};
     state.terminal_columns = columns;
     state.terminal_rows = rows;
+    state.terminal_generation = 0;
+    return result_ok;
+}
+
+/// v2 install path. Everything is validated against the caller's memory
+/// before a single byte is allocated, and cells, spans, and text are swapped
+/// in together under `terminal_mutex`, so a rejected snapshot is a complete
+/// no-op.
+fn setTerminalSnapshotV2(
+    state: *SurfaceState,
+    source: *const TerminalSnapshotV2,
+) Result {
+    const cell_count = std.math.cast(usize, source.cell_count) orelse
+        return result_invalid_argument;
+    const glyph_count = std.math.cast(usize, source.glyph_count) orelse
+        return result_invalid_argument;
+    const text_length = std.math.cast(usize, source.text_length) orelse
+        return result_invalid_argument;
+    if (cell_count != 0 and source.cells == null) return result_invalid_argument;
+    if (glyph_count != 0 and source.glyphs == null) return result_invalid_argument;
+    if (text_length != 0 and source.text == null) return result_invalid_argument;
+
+    const cells: []const win32_context.TerminalCell =
+        if (cell_count == 0) &.{} else source.cells.?[0..cell_count];
+    const glyphs: []const win32_context.TerminalGlyph =
+        if (glyph_count == 0) &.{} else source.glyphs.?[0..glyph_count];
+    const text: []const u8 =
+        if (text_length == 0) &.{} else source.text.?[0..text_length];
+
+    win32_glyph.validate(.{
+        .columns = source.columns,
+        .rows = source.rows,
+        .cells = cells,
+        .glyphs = glyphs,
+        .text = text,
+    }) catch return result_invalid_argument;
+
+    var next_cells: []win32_context.TerminalCell = &.{};
+    var next_glyphs: []win32_context.TerminalGlyph = &.{};
+    var next_text: []u8 = &.{};
+    errdefer {
+        if (next_cells.len != 0) allocator.free(next_cells);
+        if (next_glyphs.len != 0) allocator.free(next_glyphs);
+        if (next_text.len != 0) allocator.free(next_text);
+    }
+    if (cell_count != 0) {
+        next_cells = allocator.alloc(win32_context.TerminalCell, cell_count) catch
+            return result_out_of_memory;
+        @memcpy(next_cells, cells);
+    }
+    if (glyph_count != 0) {
+        next_glyphs = allocator.alloc(win32_context.TerminalGlyph, glyph_count) catch
+            return result_out_of_memory;
+        @memcpy(next_glyphs, glyphs);
+    }
+    if (text_length != 0) {
+        next_text = allocator.alloc(u8, text_length) catch
+            return result_out_of_memory;
+        @memcpy(next_text, text);
+    }
+
+    state.terminal_mutex.lock();
+    defer state.terminal_mutex.unlock();
+    if (state.terminal_cells.len != 0) allocator.free(state.terminal_cells);
+    if (state.terminal_glyphs.len != 0) allocator.free(state.terminal_glyphs);
+    if (state.terminal_text.len != 0) allocator.free(state.terminal_text);
+    state.terminal_cells = next_cells;
+    state.terminal_glyphs = next_glyphs;
+    state.terminal_text = next_text;
+    state.terminal_columns = source.columns;
+    state.terminal_rows = source.rows;
+    state.terminal_generation = source.generation;
     return result_ok;
 }
 
@@ -3486,6 +3595,42 @@ pub export fn winghostty_surface_set_terminal_snapshot(
     );
 }
 
+pub export fn winghostty_terminal_snapshot_v2_init(snapshot: ?*TerminalSnapshotV2) void {
+    const output = snapshot orelse return;
+    output.* = .{
+        .size = @intCast(@sizeOf(TerminalSnapshotV2)),
+        .version = terminal_snapshot_version_2,
+        .columns = 0,
+        .rows = 0,
+        .cells = null,
+        .cell_count = 0,
+        .glyphs = null,
+        .glyph_count = 0,
+        .text = null,
+        .text_length = 0,
+        .generation = 0,
+    };
+}
+
+pub export fn winghostty_surface_set_terminal_snapshot_v2(
+    surface: ?*Surface,
+    snapshot: ?*const TerminalSnapshotV2,
+) Result {
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    const source = snapshot orelse return result_invalid_argument;
+    if (source.size < @as(u32, @intCast(@sizeOf(TerminalSnapshotV2))) or
+        source.version != terminal_snapshot_version_2)
+    {
+        return result_invalid_argument;
+    }
+    return setTerminalSnapshotV2(state, source);
+}
+
 pub export fn winghostty_surface_render(surface: ?*Surface) Result {
     var admission = admitSurface(surface) orelse
         return unavailableSurfaceResult(surface);
@@ -3515,6 +3660,8 @@ pub export fn winghostty_surface_render(surface: ?*Surface) Result {
         .terminal_columns = state.terminal_columns,
         .terminal_rows = state.terminal_rows,
         .terminal_cells = state.terminal_cells,
+        .terminal_glyphs = state.terminal_glyphs,
+        .terminal_text = state.terminal_text,
     };
     state.options_mutex.unlock();
 
@@ -4399,4 +4546,179 @@ test "provider-owned selection dispatch survives teardown before invoke" {
     gate.allow.store(true, .release);
     selection_thread.join();
     _ = host_uia.SurfaceProvider.Release(&provider.base);
+}
+
+fn initTerminalTestSurface(state: *SurfaceState) void {
+    state.terminal_mutex = .{};
+    state.terminal_cells = &.{};
+    state.terminal_glyphs = &.{};
+    state.terminal_text = &.{};
+    state.terminal_columns = 0;
+    state.terminal_rows = 0;
+    state.terminal_generation = 0;
+}
+
+fn deinitTerminalTestSurface(state: *SurfaceState) void {
+    if (state.terminal_cells.len != 0) allocator.free(state.terminal_cells);
+    if (state.terminal_glyphs.len != 0) allocator.free(state.terminal_glyphs);
+    if (state.terminal_text.len != 0) allocator.free(state.terminal_text);
+    initTerminalTestSurface(state);
+}
+
+fn terminalTestCell(codepoint: u32) win32_context.TerminalCell {
+    return .{
+        .codepoint = codepoint,
+        .foreground = 0xFFFFFF,
+        .background = 0,
+        .flags = 0,
+    };
+}
+
+test "v2 snapshot installs cells, spans, and text together" {
+    var state: SurfaceState = undefined;
+    initTerminalTestSurface(&state);
+    defer deinitTerminalTestSurface(&state);
+
+    // "e" + U+0301 in cell 0, U+4E2D spanning cells 1 and 2.
+    const text = "e\u{0301}\u{4E2D}";
+    const cells = [_]win32_context.TerminalCell{
+        terminalTestCell('e'),
+        terminalTestCell(0x4E2D),
+        terminalTestCell(0),
+    };
+    const glyphs = [_]win32_context.TerminalGlyph{
+        .{ .offset = 0, .length = 3, .width = win32_glyph.width_narrow, .reserved = 0 },
+        .{ .offset = 3, .length = 3, .width = win32_glyph.width_wide, .reserved = 0 },
+        .{ .offset = 0, .length = 0, .width = win32_glyph.width_continuation, .reserved = 0 },
+    };
+
+    var snapshot: TerminalSnapshotV2 = undefined;
+    winghostty_terminal_snapshot_v2_init(&snapshot);
+    snapshot.columns = 3;
+    snapshot.rows = 1;
+    snapshot.cells = &cells;
+    snapshot.cell_count = cells.len;
+    snapshot.glyphs = &glyphs;
+    snapshot.glyph_count = glyphs.len;
+    snapshot.text = text.ptr;
+    snapshot.text_length = text.len;
+    snapshot.generation = 7;
+
+    try std.testing.expectEqual(result_ok, setTerminalSnapshotV2(&state, &snapshot));
+    try std.testing.expectEqual(@as(u32, 3), state.terminal_columns);
+    try std.testing.expectEqual(@as(u64, 7), state.terminal_generation);
+    try std.testing.expectEqual(@as(usize, 3), state.terminal_cells.len);
+    try std.testing.expectEqual(@as(usize, 3), state.terminal_glyphs.len);
+    try std.testing.expectEqualStrings(text, state.terminal_text);
+    // The copy must be independent of caller memory.
+    try std.testing.expect(state.terminal_text.ptr != text.ptr);
+}
+
+test "rejected v2 snapshot leaves the installed snapshot intact" {
+    var state: SurfaceState = undefined;
+    initTerminalTestSurface(&state);
+    defer deinitTerminalTestSurface(&state);
+
+    const good_text = "a";
+    const good_cells = [_]win32_context.TerminalCell{terminalTestCell('a')};
+    const good_glyphs = [_]win32_context.TerminalGlyph{
+        .{ .offset = 0, .length = 1, .width = win32_glyph.width_narrow, .reserved = 0 },
+    };
+    var snapshot: TerminalSnapshotV2 = undefined;
+    winghostty_terminal_snapshot_v2_init(&snapshot);
+    snapshot.columns = 1;
+    snapshot.rows = 1;
+    snapshot.cells = &good_cells;
+    snapshot.cell_count = good_cells.len;
+    snapshot.glyphs = &good_glyphs;
+    snapshot.glyph_count = good_glyphs.len;
+    snapshot.text = good_text.ptr;
+    snapshot.text_length = good_text.len;
+    snapshot.generation = 1;
+    try std.testing.expectEqual(result_ok, setTerminalSnapshotV2(&state, &snapshot));
+    const installed_cells = state.terminal_cells.ptr;
+    const installed_text = state.terminal_text.ptr;
+
+    // Span runs past the end of the text blob.
+    const bad_glyphs = [_]win32_context.TerminalGlyph{
+        .{ .offset = 0, .length = 4, .width = win32_glyph.width_narrow, .reserved = 0 },
+    };
+    var bad = snapshot;
+    bad.glyphs = &bad_glyphs;
+    bad.generation = 2;
+    try std.testing.expectEqual(result_invalid_argument, setTerminalSnapshotV2(&state, &bad));
+
+    // Invalid UTF-8 in the blob.
+    const invalid_text = [_]u8{0xFF};
+    var bad_utf8 = snapshot;
+    bad_utf8.text = &invalid_text;
+    bad_utf8.text_length = invalid_text.len;
+    bad_utf8.generation = 3;
+    try std.testing.expectEqual(result_invalid_argument, setTerminalSnapshotV2(&state, &bad_utf8));
+
+    // Count disagrees with columns * rows.
+    var bad_count = snapshot;
+    bad_count.columns = 2;
+    bad_count.generation = 4;
+    try std.testing.expectEqual(result_invalid_argument, setTerminalSnapshotV2(&state, &bad_count));
+
+    try std.testing.expectEqual(@as(u64, 1), state.terminal_generation);
+    try std.testing.expectEqual(@as(u32, 1), state.terminal_columns);
+    try std.testing.expectEqual(installed_cells, state.terminal_cells.ptr);
+    try std.testing.expectEqual(installed_text, state.terminal_text.ptr);
+    try std.testing.expectEqualStrings("a", state.terminal_text);
+}
+
+test "v1 cell install clears stale v2 glyph state" {
+    var state: SurfaceState = undefined;
+    initTerminalTestSurface(&state);
+    defer deinitTerminalTestSurface(&state);
+
+    const text = "a";
+    const cells = [_]win32_context.TerminalCell{terminalTestCell('a')};
+    const glyphs = [_]win32_context.TerminalGlyph{
+        .{ .offset = 0, .length = 1, .width = win32_glyph.width_narrow, .reserved = 0 },
+    };
+    var snapshot: TerminalSnapshotV2 = undefined;
+    winghostty_terminal_snapshot_v2_init(&snapshot);
+    snapshot.columns = 1;
+    snapshot.rows = 1;
+    snapshot.cells = &cells;
+    snapshot.cell_count = cells.len;
+    snapshot.glyphs = &glyphs;
+    snapshot.glyph_count = glyphs.len;
+    snapshot.text = text.ptr;
+    snapshot.text_length = text.len;
+    snapshot.generation = 5;
+    try std.testing.expectEqual(result_ok, setTerminalSnapshotV2(&state, &snapshot));
+
+    const v1_cells = [_]win32_context.TerminalCell{
+        terminalTestCell('x'),
+        terminalTestCell('y'),
+    };
+    try std.testing.expectEqual(
+        result_ok,
+        setTerminalCells(&state, 2, 1, &v1_cells, v1_cells.len),
+    );
+    try std.testing.expectEqual(@as(usize, 2), state.terminal_cells.len);
+    try std.testing.expectEqual(@as(usize, 0), state.terminal_glyphs.len);
+    try std.testing.expectEqual(@as(usize, 0), state.terminal_text.len);
+    try std.testing.expectEqual(@as(u64, 0), state.terminal_generation);
+}
+
+test "v2 snapshot ABI layout is stable and v1 is unchanged" {
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(win32_context.TerminalCell));
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(win32_context.TerminalGlyph));
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(TerminalSnapshot));
+    try std.testing.expectEqual(@as(usize, 72), @sizeOf(TerminalSnapshotV2));
+
+    var v1: TerminalSnapshot = undefined;
+    winghostty_terminal_snapshot_init(&v1);
+    try std.testing.expectEqual(terminal_snapshot_version, v1.version);
+    try std.testing.expectEqual(@as(u32, @sizeOf(TerminalSnapshot)), v1.size);
+
+    var v2: TerminalSnapshotV2 = undefined;
+    winghostty_terminal_snapshot_v2_init(&v2);
+    try std.testing.expectEqual(terminal_snapshot_version_2, v2.version);
+    try std.testing.expectEqual(@as(u32, @sizeOf(TerminalSnapshotV2)), v2.size);
 }

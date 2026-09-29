@@ -1554,6 +1554,382 @@ static int run_vt_render_state_contract(HWND parent) {
     return 0;
 }
 
+#define GLYPH_FB_WIDTH 64
+#define GLYPH_FB_HEIGHT 32
+#define GLYPH_COLUMNS 4
+#define GLYPH_CELL_WIDTH (GLYPH_FB_WIDTH / GLYPH_COLUMNS)
+
+typedef struct {
+    winghostty_surface *surface;
+    HANDLE frame_ready;
+    HANDLE next_frame;
+    winghostty_result make_current_result;
+    winghostty_result clear_current_result;
+    winghostty_result render_result[2];
+    winghostty_result present_result[2];
+    unsigned char frames[2][GLYPH_FB_WIDTH * GLYPH_FB_HEIGHT * 4];
+} glyph_render_session;
+
+/*
+ * The host binds a single render thread for the process lifetime, so both
+ * frames are produced here and the main thread only swaps snapshots between
+ * them.
+ */
+static DWORD WINAPI glyph_render_thread(void *parameter) {
+    glyph_render_session *session = (glyph_render_session *)parameter;
+    session->make_current_result =
+        winghostty_surface_make_current(session->surface);
+    if (session->make_current_result != WINGHOSTTY_OK) {
+        SetEvent(session->frame_ready);
+        SetEvent(session->frame_ready);
+        return 0;
+    }
+    for (int frame = 0; frame < 2; ++frame) {
+        if (frame > 0) {
+            WaitForSingleObject(session->next_frame, INFINITE);
+        }
+        session->render_result[frame] =
+            winghostty_surface_render(session->surface);
+        glReadBuffer(0x0404);
+        glReadPixels(
+            0,
+            0,
+            GLYPH_FB_WIDTH,
+            GLYPH_FB_HEIGHT,
+            0x1908,
+            0x1401,
+            session->frames[frame]
+        );
+        session->present_result[frame] =
+            winghostty_surface_present(session->surface);
+        SetEvent(session->frame_ready);
+    }
+    session->clear_current_result =
+        winghostty_surface_clear_current(session->surface);
+    return 0;
+}
+
+/*
+ * Count pixels inside a cell column that differ from that cell's background.
+ * This is the ink measurement: real glyph coverage produces ink, an empty or
+ * skipped cell produces none.
+ */
+static unsigned glyph_cell_ink(
+    const unsigned char *pixels,
+    int column,
+    unsigned char r,
+    unsigned char g,
+    unsigned char b
+) {
+    unsigned ink = 0;
+    for (int y = 0; y < GLYPH_FB_HEIGHT; ++y) {
+        for (int x = column * GLYPH_CELL_WIDTH;
+             x < (column + 1) * GLYPH_CELL_WIDTH;
+             ++x) {
+            const unsigned char *p = pixels + ((size_t)y * GLYPH_FB_WIDTH + x) * 4;
+            const int dr = (int)p[0] - (int)r;
+            const int dg = (int)p[1] - (int)g;
+            const int db = (int)p[2] - (int)b;
+            if (dr > 8 || dr < -8 || dg > 8 || dg < -8 || db > 8 || db < -8) {
+                ++ink;
+            }
+        }
+    }
+    return ink;
+}
+
+/* Count pixels that differ between the same cell column of two renders. */
+static unsigned glyph_cell_diff(
+    const unsigned char *a,
+    const unsigned char *b,
+    int column
+) {
+    unsigned changed = 0;
+    for (int y = 0; y < GLYPH_FB_HEIGHT; ++y) {
+        for (int x = column * GLYPH_CELL_WIDTH;
+             x < (column + 1) * GLYPH_CELL_WIDTH;
+             ++x) {
+            const size_t offset = ((size_t)y * GLYPH_FB_WIDTH + x) * 4;
+            if (a[offset] != b[offset] ||
+                a[offset + 1] != b[offset + 1] ||
+                a[offset + 2] != b[offset + 2]) {
+                ++changed;
+            }
+        }
+    }
+    return changed;
+}
+
+static int glyph_session_ok(const glyph_render_session *session, int frame) {
+    return session->make_current_result == WINGHOSTTY_OK &&
+        session->render_result[frame] == WINGHOSTTY_OK &&
+        session->present_result[frame] == WINGHOSTTY_OK;
+}
+
+
+/*
+ * End-to-end proof that the v2 snapshot reaches real rasterized glyph pixels
+ * through the existing WGL context: combining marks change the rendered cell,
+ * a wide grapheme puts ink in the column it reserves, per-cell backgrounds are
+ * painted, and the untouched v1 path still renders.
+ */
+static int run_glyph_render_contract(HWND parent) {
+    winghostty_host *host = NULL;
+    winghostty_surface *surface = NULL;
+    winghostty_surface_options options;
+    winghostty_surface_options_init(&options);
+    options.visible = 0;
+    options.bounds.width = GLYPH_FB_WIDTH;
+    options.bounds.height = GLYPH_FB_HEIGHT;
+    options.theme = WINGHOSTTY_THEME_DARK;
+    options.font_scale = 1.0f;
+
+    if (winghostty_host_initialize(&host) != WINGHOSTTY_OK ||
+        winghostty_host_create_surface(host, parent, &options, &surface) !=
+            WINGHOSTTY_OK ||
+        surface == NULL) {
+        if (host != NULL) winghostty_host_deinitialize(host);
+        return fail("glyph render surface setup failed");
+    }
+
+    /*
+     * Column 0: "e"
+     * Column 1: "e" + U+0301 (same base codepoint, different grapheme)
+     * Column 2: U+4E2D, a wide grapheme
+     * Column 3: the continuation cell U+4E2D reserves
+     */
+    static const uint8_t text[] = {
+        'e',
+        'e', 0xCC, 0x81,
+        0xE4, 0xB8, 0xAD,
+    };
+    const winghostty_terminal_cell cells[GLYPH_COLUMNS] = {
+        {
+            .codepoint = 'e',
+            .foreground = 0xFFFFFF,
+            .background = 0xCC2211,
+            .flags = WINGHOSTTY_TERMINAL_CELL_FOREGROUND_SET |
+                WINGHOSTTY_TERMINAL_CELL_BACKGROUND_SET,
+        },
+        {
+            .codepoint = 'e',
+            .foreground = 0xFFFFFF,
+            .background = 0xCC2211,
+            .flags = WINGHOSTTY_TERMINAL_CELL_FOREGROUND_SET |
+                WINGHOSTTY_TERMINAL_CELL_BACKGROUND_SET,
+        },
+        {
+            .codepoint = 0x4E2D,
+            .foreground = 0xFFFFFF,
+            .background = 0x113355,
+            .flags = WINGHOSTTY_TERMINAL_CELL_FOREGROUND_SET |
+                WINGHOSTTY_TERMINAL_CELL_BACKGROUND_SET,
+        },
+        {
+            .codepoint = 0,
+            .foreground = 0xFFFFFF,
+            .background = 0x113355,
+            .flags = WINGHOSTTY_TERMINAL_CELL_FOREGROUND_SET |
+                WINGHOSTTY_TERMINAL_CELL_BACKGROUND_SET,
+        },
+    };
+    const winghostty_terminal_glyph glyphs[GLYPH_COLUMNS] = {
+        {.offset = 0, .length = 1, .width = WINGHOSTTY_GLYPH_WIDTH_NARROW, .reserved = 0},
+        {.offset = 1, .length = 3, .width = WINGHOSTTY_GLYPH_WIDTH_NARROW, .reserved = 0},
+        {.offset = 4, .length = 3, .width = WINGHOSTTY_GLYPH_WIDTH_WIDE, .reserved = 0},
+        {.offset = 0, .length = 0, .width = WINGHOSTTY_GLYPH_WIDTH_CONTINUATION, .reserved = 0},
+    };
+
+    winghostty_terminal_snapshot_v2 snapshot;
+    winghostty_terminal_snapshot_v2_init(&snapshot);
+    snapshot.columns = GLYPH_COLUMNS;
+    snapshot.rows = 1;
+    snapshot.cells = cells;
+    snapshot.cell_count = GLYPH_COLUMNS;
+    snapshot.glyphs = glyphs;
+    snapshot.glyph_count = GLYPH_COLUMNS;
+    snapshot.text = text;
+    snapshot.text_length = sizeof(text);
+    snapshot.generation = 1;
+
+    if (winghostty_surface_set_terminal_snapshot_v2(surface, &snapshot) !=
+        WINGHOSTTY_OK) {
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return fail("v2 snapshot install failed");
+    }
+
+    /* A rejected snapshot must not disturb the installed one. */
+    winghostty_terminal_glyph broken[GLYPH_COLUMNS];
+    memcpy(broken, glyphs, sizeof(glyphs));
+    broken[0].length = (uint16_t)(sizeof(text) + 4);
+    winghostty_terminal_snapshot_v2 rejected = snapshot;
+    rejected.glyphs = broken;
+    rejected.generation = 2;
+    if (winghostty_surface_set_terminal_snapshot_v2(surface, &rejected) !=
+        WINGHOSTTY_INVALID_ARGUMENT) {
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return fail("out-of-range v2 span was accepted");
+    }
+
+    static glyph_render_session session;
+    memset(&session, 0, sizeof(session));
+    session.surface = surface;
+    session.make_current_result = WINGHOSTTY_INVALID_ARGUMENT;
+    session.clear_current_result = WINGHOSTTY_INVALID_ARGUMENT;
+    session.render_result[0] = WINGHOSTTY_INVALID_ARGUMENT;
+    session.render_result[1] = WINGHOSTTY_INVALID_ARGUMENT;
+    session.present_result[0] = WINGHOSTTY_INVALID_ARGUMENT;
+    session.present_result[1] = WINGHOSTTY_INVALID_ARGUMENT;
+    session.frame_ready = CreateEventW(NULL, FALSE, FALSE, NULL);
+    session.next_frame = CreateEventW(NULL, FALSE, FALSE, NULL);
+    HANDLE render_thread_handle = NULL;
+    if (session.frame_ready == NULL || session.next_frame == NULL ||
+        (render_thread_handle =
+             CreateThread(NULL, 0, glyph_render_thread, &session, 0, NULL)) ==
+            NULL) {
+        if (session.frame_ready != NULL) CloseHandle(session.frame_ready);
+        if (session.next_frame != NULL) CloseHandle(session.next_frame);
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return fail("glyph render thread creation failed");
+    }
+    WaitForSingleObject(session.frame_ready, INFINITE);
+    if (!glyph_session_ok(&session, 0)) {
+        SetEvent(session.next_frame);
+        WaitForSingleObject(render_thread_handle, INFINITE);
+        CloseHandle(render_thread_handle);
+        CloseHandle(session.frame_ready);
+        CloseHandle(session.next_frame);
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return fail("v2 glyph render failed");
+    }
+
+    const unsigned char *v2_pixels = session.frames[0];
+    const unsigned base_ink = glyph_cell_ink(v2_pixels, 0, 0xCC, 0x22, 0x11);
+    const unsigned combined_ink =
+        glyph_cell_ink(v2_pixels, 1, 0xCC, 0x22, 0x11);
+    const unsigned wide_lead_ink =
+        glyph_cell_ink(v2_pixels, 2, 0x11, 0x33, 0x55);
+    const unsigned continuation_ink =
+        glyph_cell_ink(v2_pixels, 3, 0x11, 0x33, 0x55);
+
+    fprintf(
+        stderr,
+        "glyph v2 ink: base=%u combined=%u wide_lead=%u continuation=%u\n",
+        base_ink,
+        combined_ink,
+        wide_lead_ink,
+        continuation_ink
+    );
+
+    /* Per-cell backgrounds, including the reserved continuation cell. */
+    const unsigned char *corner0 =
+        v2_pixels + ((size_t)0 * GLYPH_FB_WIDTH + 0) * 4;
+    const unsigned char *corner3 =
+        v2_pixels + ((size_t)0 * GLYPH_FB_WIDTH + (GLYPH_FB_WIDTH - 1)) * 4;
+    int failed = 0;
+    if (check(base_ink > 0, "narrow glyph produced no ink")) failed = 1;
+    if (check(
+            combined_ink != base_ink,
+            "combining mark did not change the rendered cell"
+        )) {
+        failed = 1;
+    }
+    if (check(wide_lead_ink > 0, "wide glyph lead cell produced no ink")) failed = 1;
+    if (check(
+            continuation_ink > 0,
+            "wide glyph did not extend into the column it reserves"
+        )) {
+        failed = 1;
+    }
+    if (check(
+            corner0[0] == 0xCC && corner0[1] == 0x22 && corner0[2] == 0x11,
+            "per-cell background was not painted for the first cell"
+        )) {
+        failed = 1;
+    }
+    if (check(
+            corner3[0] == 0x11 && corner3[1] == 0x33 && corner3[2] == 0x55,
+            "continuation cell background was not painted"
+        )) {
+        failed = 1;
+    }
+
+    /* v1 regression: the legacy path still renders after a v2 snapshot. */
+    winghostty_terminal_snapshot v1;
+    winghostty_terminal_snapshot_init(&v1);
+    v1.columns = GLYPH_COLUMNS;
+    v1.rows = 1;
+    v1.cells = cells;
+    v1.cell_count = GLYPH_COLUMNS;
+    v1.generation = 3;
+    if (!failed &&
+        winghostty_surface_set_terminal_snapshot(surface, &v1) != WINGHOSTTY_OK) {
+        fail("v1 snapshot install after v2 failed");
+        failed = 1;
+    }
+
+    SetEvent(session.next_frame);
+    WaitForSingleObject(session.frame_ready, INFINITE);
+    WaitForSingleObject(render_thread_handle, INFINITE);
+    CloseHandle(render_thread_handle);
+    CloseHandle(session.frame_ready);
+    CloseHandle(session.next_frame);
+
+    if (!failed) {
+        if (check(
+                glyph_session_ok(&session, 1) &&
+                    session.clear_current_result == WINGHOSTTY_OK,
+                "v1 glyph render failed"
+            )) {
+            failed = 1;
+        }
+    }
+
+    if (!failed) {
+        const unsigned char *v1_pixels = session.frames[1];
+        const unsigned v1_base_ink =
+            glyph_cell_ink(v1_pixels, 0, 0xCC, 0x22, 0x11);
+        const unsigned v1_continuation_ink =
+            glyph_cell_ink(v1_pixels, 3, 0x11, 0x33, 0x55);
+        fprintf(
+            stderr,
+            "glyph v1 ink: base=%u continuation=%u\n",
+            v1_base_ink,
+            v1_continuation_ink
+        );
+        if (check(
+                v1_base_ink > 0,
+                "v1 path stopped rendering cell ink after a v2 snapshot"
+            ) ||
+            check(
+                v1_continuation_ink == 0,
+                "v1 path rendered ink for an empty cell"
+            ) ||
+            check(
+                glyph_cell_diff(v2_pixels, v1_pixels, 0) > 0,
+                "v2 glyph raster was indistinguishable from the v1 fallback"
+            )) {
+            failed = 1;
+        }
+    }
+
+    if (failed) {
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return 1;
+    }
+
+    if (winghostty_surface_destroy(surface) != WINGHOSTTY_OK ||
+        winghostty_host_deinitialize(host) != WINGHOSTTY_OK) {
+        return fail("glyph render teardown failed");
+    }
+    return 0;
+}
+
 static int run_persistent_teardown_contract(HWND parent) {
     winghostty_host *host = NULL;
     if (winghostty_host_initialize(&host) != WINGHOSTTY_OK) {
@@ -2022,6 +2398,10 @@ int main(void) {
         return 1;
     }
     if (run_vt_render_state_contract(state.parent) != 0) {
+        DestroyWindow(state.parent);
+        return 1;
+    }
+    if (run_glyph_render_contract(state.parent) != 0) {
         DestroyWindow(state.parent);
         return 1;
     }
