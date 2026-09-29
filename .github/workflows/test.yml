@@ -146,6 +146,12 @@ jobs:
       - name: Native Win32 compositor tests
         run: zig test src/apprt/win32_compositor_native.zig -lc -luser32 -lkernel32
 
+      - name: Win32 glyph raster tests
+        run: zig test src/renderer/win32_glyph.zig -lc -lgdi32 -lkernel32 -luser32
+
+      - name: Win32 host snapshot ABI tests
+        run: zig test src/win32_host.zig -lc -luser32 -lkernel32 -lgdi32 -lopengl32 -lole32 -loleaut32
+
       - name: Build executable
         # This traverses the default build graph too; a preceding plain
         # `zig build` duplicated the same Windows compile/link work.

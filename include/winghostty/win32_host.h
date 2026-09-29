@@ -73,6 +73,56 @@ typedef struct {
     uint64_t generation;
 } winghostty_terminal_snapshot;
 
+#define WINGHOSTTY_TERMINAL_SNAPSHOT_VERSION_2 2u
+
+/* Column width classes for winghostty_terminal_glyph::width. */
+#define WINGHOSTTY_GLYPH_WIDTH_CONTINUATION 0u
+#define WINGHOSTTY_GLYPH_WIDTH_NARROW 1u
+#define WINGHOSTTY_GLYPH_WIDTH_WIDE 2u
+
+/*
+ * Per-cell grapheme cluster span into the snapshot's UTF-8 text blob.
+ *
+ * `offset` and `length` address bytes of winghostty_terminal_snapshot_v2::text
+ * and must land on UTF-8 boundaries. `width` is the number of columns the
+ * grapheme occupies: WINGHOSTTY_GLYPH_WIDTH_NARROW for a single column,
+ * WINGHOSTTY_GLYPH_WIDTH_WIDE for the lead cell of a two-column grapheme, and
+ * WINGHOSTTY_GLYPH_WIDTH_CONTINUATION for the reserved second cell, which must
+ * carry an empty span and must follow its lead in the same row.
+ */
+typedef struct {
+    uint32_t offset;
+    uint16_t length;
+    uint8_t width;
+    uint8_t reserved;
+} winghostty_terminal_glyph;
+
+/*
+ * Version 2 render-state view. This is a separate ABI from
+ * winghostty_terminal_snapshot; version 1 structs and entry points are
+ * unchanged and remain supported.
+ *
+ * `glyph_count` must equal `cell_count`, which must equal columns * rows. The
+ * host validates the whole description - dimensions, counts, UTF-8 validity,
+ * span bounds and boundaries, base codepoint agreement with the matching cell,
+ * and width classes - before copying anything. A rejected snapshot leaves the
+ * previously installed snapshot untouched. All memory is caller-owned; the
+ * host copies cells, glyphs, and text together before returning.
+ */
+typedef struct {
+    uint32_t size;
+    uint32_t version;
+    uint32_t columns;
+    uint32_t rows;
+    const winghostty_terminal_cell *cells;
+    uint64_t cell_count;
+    const winghostty_terminal_glyph *glyphs;
+    uint64_t glyph_count;
+    const uint8_t *text;
+    uint64_t text_length;
+    uint64_t generation;
+} winghostty_terminal_snapshot_v2;
+
 typedef struct winghostty_cell_metrics {
     uint32_t font_width;
     uint32_t font_height;
@@ -485,6 +535,12 @@ void winghostty_terminal_snapshot_init(winghostty_terminal_snapshot *snapshot);
 winghostty_result winghostty_surface_set_terminal_snapshot(
     winghostty_surface *surface,
     const winghostty_terminal_snapshot *snapshot
+);
+
+void winghostty_terminal_snapshot_v2_init(winghostty_terminal_snapshot_v2 *snapshot);
+winghostty_result winghostty_surface_set_terminal_snapshot_v2(
+    winghostty_surface *surface,
+    const winghostty_terminal_snapshot_v2 *snapshot
 );
 
 HDC winghostty_surface_get_hdc(const winghostty_surface *surface);

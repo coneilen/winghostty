@@ -79,6 +79,31 @@ WINGHOSTTY_LAYOUT_ASSERT(
 WINGHOSTTY_LAYOUT_ASSERT(sizeof(winghostty_key_event) == 48, "key event ABI changed");
 WINGHOSTTY_LAYOUT_ASSERT(sizeof(winghostty_mouse_event) == 36, "mouse event ABI changed");
 WINGHOSTTY_LAYOUT_ASSERT(sizeof(winghostty_selection_event) == 20, "selection event ABI changed");
+WINGHOSTTY_LAYOUT_ASSERT(sizeof(winghostty_terminal_cell) == 16, "terminal cell ABI changed");
+WINGHOSTTY_LAYOUT_ASSERT(
+    sizeof(winghostty_terminal_snapshot) == 40,
+    "terminal snapshot v1 ABI changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    sizeof(winghostty_terminal_glyph) == 8,
+    "terminal glyph span ABI changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    offsetof(winghostty_terminal_glyph, width) == 6,
+    "terminal glyph width offset changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    sizeof(winghostty_terminal_snapshot_v2) == 72,
+    "terminal snapshot v2 ABI changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    offsetof(winghostty_terminal_snapshot_v2, glyphs) == 32,
+    "terminal snapshot v2 glyph pointer offset changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    offsetof(winghostty_terminal_snapshot_v2, text) == 48,
+    "terminal snapshot v2 text pointer offset changed"
+);
 
 static void on_exit(void *user_data, winghostty_surface *surface, int32_t status) {
     (void)user_data;

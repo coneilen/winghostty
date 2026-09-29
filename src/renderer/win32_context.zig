@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const win32_types = @import("../apprt/win32_types.zig");
+const glyph = @import("win32_glyph.zig");
 
 const HWND = win32_types.HWND;
 const HDC = win32_types.HDC;
@@ -23,6 +24,23 @@ const PFD_TYPE_RGBA: BYTE = 0;
 const PFD_MAIN_PLANE: BYTE = 0;
 const GL_COLOR_BUFFER_BIT: u32 = 0x00004000;
 const GL_QUADS: u32 = 0x0007;
+const GL_TEXTURE_2D: u32 = 0x0DE1;
+const GL_BLEND: u32 = 0x0BE2;
+const GL_SRC_ALPHA: u32 = 0x0302;
+const GL_ONE_MINUS_SRC_ALPHA: u32 = 0x0303;
+const GL_UNPACK_ALIGNMENT: u32 = 0x0CF5;
+const GL_LUMINANCE_ALPHA: i32 = 0x190A;
+const GL_UNSIGNED_BYTE: u32 = 0x1401;
+const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
+const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
+const GL_TEXTURE_WRAP_S: u32 = 0x2802;
+const GL_TEXTURE_WRAP_T: u32 = 0x2803;
+const GL_NEAREST: i32 = 0x2600;
+const GL_CLAMP_TO_EDGE: i32 = 0x812F;
+const GL_CLAMP: i32 = 0x2900;
+const GL_TEXTURE_ENV: u32 = 0x2300;
+const GL_TEXTURE_ENV_MODE: u32 = 0x2200;
+const GL_MODULATE: i32 = 0x2100;
 
 const PIXELFORMATDESCRIPTOR = extern struct {
     nSize: WORD,
@@ -89,6 +107,35 @@ extern "opengl32" fn glBegin(mode: u32) callconv(.winapi) void;
 extern "opengl32" fn glColor3f(red: f32, green: f32, blue: f32) callconv(.winapi) void;
 extern "opengl32" fn glVertex2f(x: f32, y: f32) callconv(.winapi) void;
 extern "opengl32" fn glEnd() callconv(.winapi) void;
+// Texture entry points are deliberately limited to the OpenGL 1.1 set. The
+// embeddable host links only `opengl32` and its pixel tests can run against
+// the Microsoft software implementation, so shaders, VBOs, and non-power-of-
+// two textures are all unavailable here.
+extern "opengl32" fn glEnable(cap: u32) callconv(.winapi) void;
+extern "opengl32" fn glDisable(cap: u32) callconv(.winapi) void;
+extern "opengl32" fn glBlendFunc(source: u32, destination: u32) callconv(.winapi) void;
+extern "opengl32" fn glGenTextures(count: i32, textures: [*]u32) callconv(.winapi) void;
+extern "opengl32" fn glDeleteTextures(count: i32, textures: [*]const u32) callconv(.winapi) void;
+extern "opengl32" fn glBindTexture(target: u32, texture: u32) callconv(.winapi) void;
+extern "opengl32" fn glTexImage2D(
+    target: u32,
+    level: i32,
+    internal_format: i32,
+    width: i32,
+    height: i32,
+    border: i32,
+    format: u32,
+    kind: u32,
+    pixels: ?*const anyopaque,
+) callconv(.winapi) void;
+extern "opengl32" fn glTexParameteri(
+    target: u32,
+    name: u32,
+    value: i32,
+) callconv(.winapi) void;
+extern "opengl32" fn glTexEnvi(target: u32, name: u32, value: i32) callconv(.winapi) void;
+extern "opengl32" fn glPixelStorei(name: u32, value: i32) callconv(.winapi) void;
+extern "opengl32" fn glTexCoord2f(s: f32, t: f32) callconv(.winapi) void;
 
 pub const Error = error{
     GetDCFailed,
@@ -108,12 +155,8 @@ pub const Theme = enum(i32) {
     dark = 2,
 };
 
-pub const TerminalCell = extern struct {
-    codepoint: u32,
-    foreground: u32,
-    background: u32,
-    flags: u32,
-};
+pub const TerminalCell = glyph.Cell;
+pub const TerminalGlyph = glyph.GlyphSpan;
 
 pub const terminal_cell_foreground_set: u32 = 1 << 0;
 pub const terminal_cell_background_set: u32 = 1 << 1;
@@ -128,6 +171,17 @@ pub const RenderState = struct {
     terminal_columns: u32 = 0,
     terminal_rows: u32 = 0,
     terminal_cells: []const TerminalCell = &.{},
+    /// v2 render state. When `terminal_glyphs` is populated it is the same
+    /// length as `terminal_cells` and describes each cell's grapheme run
+    /// inside `terminal_text`. Empty means the caller supplied a v1
+    /// snapshot, which still renders through the legacy path.
+    terminal_glyphs: []const TerminalGlyph = &.{},
+    terminal_text: []const u8 = &.{},
+
+    fn hasGlyphs(self: RenderState) bool {
+        return self.terminal_glyphs.len != 0 and
+            self.terminal_glyphs.len == self.terminal_cells.len;
+    }
 };
 
 const CurrentBinding = struct {
@@ -143,6 +197,154 @@ const CurrentBinding = struct {
     }
 };
 
+/// GPU-side cache of rasterized graphemes.
+///
+/// Entries are keyed by the full grapheme bytes plus face, pixel metrics,
+/// DPI, and width class, so "e" and "e" + U+0301 never share a texture and a
+/// metrics change cannot resurrect a stale raster. Textures live in the
+/// owning WGL context; deleting the context reclaims anything still cached.
+const GlyphCache = struct {
+    const capacity = 256;
+
+    const Entry = struct {
+        key: glyph.CacheKey,
+        texture: u32,
+        texture_width: u32,
+        texture_height: u32,
+        glyph_width: u32,
+        glyph_height: u32,
+        used: u64,
+    };
+
+    entries: [capacity]Entry = undefined,
+    /// Staging buffer for the padded power-of-two upload. It lives with the
+    /// cache (which the host heap-allocates) rather than on the render
+    /// thread's stack.
+    staging: [max_glyph_texels * 2]u8 = undefined,
+    count: usize = 0,
+    clock: u64 = 0,
+    cell_width: u32 = 0,
+    cell_height: u32 = 0,
+
+    /// Drop every cached texture. Called when cell metrics change so a new
+    /// raster size cannot be served from an old one.
+    fn flush(self: *GlyphCache) void {
+        for (self.entries[0..self.count]) |entry| {
+            const texture = [_]u32{entry.texture};
+            glDeleteTextures(1, &texture);
+        }
+        self.count = 0;
+    }
+
+    /// Forget every entry without issuing GL calls. Used on teardown, where
+    /// the context may no longer be current and destroying it reclaims the
+    /// textures anyway.
+    fn forget(self: *GlyphCache) void {
+        self.count = 0;
+    }
+
+    fn syncMetrics(self: *GlyphCache, cell_width: u32, cell_height: u32) void {
+        if (self.cell_width == cell_width and self.cell_height == cell_height) {
+            return;
+        }
+        self.flush();
+        self.cell_width = cell_width;
+        self.cell_height = cell_height;
+    }
+
+    fn find(self: *GlyphCache, key: glyph.CacheKey) ?*Entry {
+        for (self.entries[0..self.count]) |*entry| {
+            if (entry.key.eql(key)) {
+                self.clock += 1;
+                entry.used = self.clock;
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    fn reserve(self: *GlyphCache) *Entry {
+        if (self.count < capacity) {
+            const entry = &self.entries[self.count];
+            self.count += 1;
+            return entry;
+        }
+        var victim: *Entry = &self.entries[0];
+        for (self.entries[0..self.count]) |*entry| {
+            if (entry.used < victim.used) victim = entry;
+        }
+        const texture = [_]u32{victim.texture};
+        glDeleteTextures(1, &texture);
+        return victim;
+    }
+
+    fn upload(
+        self: *GlyphCache,
+        key: glyph.CacheKey,
+        coverage: glyph.Coverage,
+    ) ?*Entry {
+        // OpenGL 1.1 has no non-power-of-two texture support, so the
+        // coverage is padded and addressed with partial texture coordinates.
+        const texture_width = glyph.nextPowerOfTwo(coverage.width);
+        const texture_height = glyph.nextPowerOfTwo(coverage.height);
+        const texel_count = @as(usize, texture_width) *
+            @as(usize, texture_height);
+        if (texel_count > max_glyph_texels) return null;
+
+        var texels: []u8 = self.staging[0 .. texel_count * 2];
+        @memset(texels, 0);
+        var y: u32 = 0;
+        while (y < coverage.height) : (y += 1) {
+            var x: u32 = 0;
+            while (x < coverage.width) : (x += 1) {
+                const destination = (@as(usize, y) * texture_width + x) * 2;
+                // Luminance is fixed at full so GL_MODULATE keeps the
+                // caller's foreground color; alpha carries coverage.
+                texels[destination] = 0xFF;
+                texels[destination + 1] = coverage.pixels[y * coverage.width + x];
+            }
+        }
+
+        var handle: [1]u32 = .{0};
+        glGenTextures(1, &handle);
+        if (handle[0] == 0) return null;
+        glBindTexture(GL_TEXTURE_2D, handle[0]);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+        glTexImage2D(
+            GL_TEXTURE_2D,
+            0,
+            GL_LUMINANCE_ALPHA,
+            @intCast(texture_width),
+            @intCast(texture_height),
+            0,
+            @intCast(GL_LUMINANCE_ALPHA),
+            GL_UNSIGNED_BYTE,
+            texels.ptr,
+        );
+
+        const entry = self.reserve();
+        self.clock += 1;
+        entry.* = .{
+            .key = key,
+            .texture = handle[0],
+            .texture_width = texture_width,
+            .texture_height = texture_height,
+            .glyph_width = coverage.width,
+            .glyph_height = coverage.height,
+            .used = self.clock,
+        };
+        return entry;
+    }
+};
+
+/// Upper bound on a single glyph texture, which bounds the stack staging
+/// buffer used for the padded upload.
+const max_glyph_texels: usize = 256 * 256;
+
 /// A WGL device/context pair. `render` is scoped: it claims the render
 /// thread, binds as needed, presents, and restores the prior binding before
 /// returning. The explicit current/clear methods are available for callers
@@ -157,6 +359,7 @@ pub const Context = struct {
     active_operations: usize = 0,
     destroying: bool = false,
     persistent_current: bool = false,
+    glyph_cache: GlyphCache = .{},
 
     const PersistentTransfer = struct {
         context: *Context,
@@ -227,6 +430,9 @@ pub const Context = struct {
             _ = wglDeleteContext(hglrc);
             self.hglrc = null;
         }
+        // Deleting the context reclaims its textures, so the cache only has
+        // to drop its bookkeeping here.
+        self.glyph_cache.forget();
         if (self.hdc) |hdc| {
             if (self.hwnd) |hwnd| _ = ReleaseDC(hwnd, hdc);
             self.hdc = null;
@@ -349,7 +555,7 @@ pub const Context = struct {
         glClearColor(background[0], background[1], background[2], 1.0);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        renderTerminalCells(state);
+        renderTerminalCells(self, state);
 
         var operation_error: ?Error = null;
         if (SwapBuffers(self.hdc) == 0) operation_error = error.SwapBuffersFailed;
@@ -361,7 +567,7 @@ pub const Context = struct {
         if (operation_error) |err| return err;
     }
 
-    fn renderTerminalCells(state: RenderState) void {
+    fn renderTerminalCells(self: *Context, state: RenderState) void {
         if (state.terminal_columns == 0 or
             state.terminal_rows == 0 or
             state.terminal_cells.len == 0)
@@ -384,36 +590,154 @@ pub const Context = struct {
 
         const cell_width = 2.0 / @as(f32, @floatFromInt(columns));
         const cell_height = 2.0 / @as(f32, @floatFromInt(rows));
-        const scale = std.math.clamp(state.font_scale, 0.25, 4.0);
-        const glyph_width = @min(cell_width * 0.72 * scale, cell_width * 0.86);
-        const glyph_height = @min(cell_height * 0.72 * scale, cell_height * 0.86);
         const default_background = backgroundColor(state.theme);
-        const default_foreground = .{ 0.90, 0.90, 0.92 };
 
+        // Background pass. Every cell paints its own background, including
+        // the continuation cell a wide grapheme reserves.
         for (0..@intCast(rows)) |row| {
             for (0..@intCast(columns)) |column| {
                 const cell = state.terminal_cells[row * @as(usize, @intCast(columns)) + column];
                 const left = -1.0 + @as(f32, @floatFromInt(column)) * cell_width;
                 const top = 1.0 - @as(f32, @floatFromInt(row)) * cell_height;
-
-                const legacy_colors = cell.flags == 0;
-                const background_set =
-                    (cell.flags & terminal_cell_background_set) != 0 or
-                    (legacy_colors and cell.background != 0);
-                const foreground_set =
-                    (cell.flags & terminal_cell_foreground_set) != 0 or
-                    (legacy_colors and cell.foreground != 0);
-                const background = if (background_set)
+                const background = if (backgroundIsSet(cell))
                     rgb(cell.background)
                 else
                     default_background;
                 drawRect(left, top, cell_width, -cell_height, background);
+            }
+        }
+
+        const pixel_cell_width = state.width / columns;
+        const pixel_cell_height = state.height / rows;
+        if (state.hasGlyphs() and
+            pixel_cell_width > 0 and
+            pixel_cell_height > 0)
+        {
+            self.renderGlyphInk(
+                state,
+                columns,
+                rows,
+                cell_width,
+                cell_height,
+                pixel_cell_width,
+                pixel_cell_height,
+            );
+            return;
+        }
+
+        renderLegacyInk(state, columns, rows, cell_width, cell_height);
+    }
+
+    /// v2 ink pass: real glyph coverage rasterized by GDI and uploaded as a
+    /// luminance/alpha texture, tinted with the cell foreground. There is no
+    /// pseudo-hash fallback here; a cell either draws its grapheme or draws
+    /// nothing.
+    fn renderGlyphInk(
+        self: *Context,
+        state: RenderState,
+        columns: u32,
+        rows: u32,
+        cell_width: f32,
+        cell_height: f32,
+        pixel_cell_width: u32,
+        pixel_cell_height: u32,
+    ) void {
+        self.glyph_cache.syncMetrics(pixel_cell_width, pixel_cell_height);
+
+        glEnable(GL_TEXTURE_2D);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+        defer {
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glDisable(GL_BLEND);
+            glDisable(GL_TEXTURE_2D);
+        }
+
+        for (0..@intCast(rows)) |row| {
+            for (0..@intCast(columns)) |column| {
+                const index = row * @as(usize, @intCast(columns)) + column;
+                const span = state.terminal_glyphs[index];
+                // Continuation cells never carry ink of their own; the wide
+                // lead's raster already covers both columns.
+                if (span.width == glyph.width_continuation) continue;
+                if (span.length == 0) continue;
+
+                const cell = state.terminal_cells[index];
                 if (cell.codepoint == 0 or cell.codepoint == ' ') continue;
 
-                const foreground = if (!foreground_set)
-                    default_foreground
-                else
-                    rgb(cell.foreground);
+                const start: usize = span.offset;
+                const end = start + @as(usize, span.length);
+                if (end > state.terminal_text.len) continue;
+                const run = state.terminal_text[start..end];
+
+                const cells_wide: u32 = if (span.width == glyph.width_wide) 2 else 1;
+                if (column + cells_wide > columns) continue;
+
+                const options = glyph.RasterOptions{
+                    .cell_width = pixel_cell_width,
+                    .cell_height = pixel_cell_height,
+                    .clip_to_cell = false,
+                };
+                const key = glyph.cacheKey(run, span.width, options);
+                const entry = self.glyph_cache.find(key) orelse cached: {
+                    var coverage = glyph.rasterize(
+                        raster_allocator,
+                        run,
+                        span.width,
+                        options,
+                    ) catch continue;
+                    defer coverage.deinit(raster_allocator);
+                    break :cached self.glyph_cache.upload(key, coverage) orelse
+                        continue;
+                };
+
+                const left = -1.0 + @as(f32, @floatFromInt(column)) * cell_width;
+                const top = 1.0 - @as(f32, @floatFromInt(row)) * cell_height;
+                const quad_width = cell_width * @as(f32, @floatFromInt(cells_wide));
+                const max_s = @as(f32, @floatFromInt(entry.glyph_width)) /
+                    @as(f32, @floatFromInt(entry.texture_width));
+                const max_t = @as(f32, @floatFromInt(entry.glyph_height)) /
+                    @as(f32, @floatFromInt(entry.texture_height));
+                const foreground = foregroundColor(cell);
+
+                glBindTexture(GL_TEXTURE_2D, entry.texture);
+                glBegin(GL_QUADS);
+                glColor3f(foreground[0], foreground[1], foreground[2]);
+                glTexCoord2f(0.0, 0.0);
+                glVertex2f(left, top);
+                glTexCoord2f(max_s, 0.0);
+                glVertex2f(left + quad_width, top);
+                glTexCoord2f(max_s, max_t);
+                glVertex2f(left + quad_width, top - cell_height);
+                glTexCoord2f(0.0, max_t);
+                glVertex2f(left, top - cell_height);
+                glEnd();
+            }
+        }
+    }
+
+    /// v1 ink pass, retained byte-for-byte in behavior for callers that only
+    /// supply the 16-byte cell snapshot and therefore have no grapheme text.
+    fn renderLegacyInk(
+        state: RenderState,
+        columns: u32,
+        rows: u32,
+        cell_width: f32,
+        cell_height: f32,
+    ) void {
+        const scale = std.math.clamp(state.font_scale, 0.25, 4.0);
+        const glyph_width = @min(cell_width * 0.72 * scale, cell_width * 0.86);
+        const glyph_height = @min(cell_height * 0.72 * scale, cell_height * 0.86);
+
+        for (0..@intCast(rows)) |row| {
+            for (0..@intCast(columns)) |column| {
+                const cell = state.terminal_cells[row * @as(usize, @intCast(columns)) + column];
+                if (cell.codepoint == 0 or cell.codepoint == ' ') continue;
+                const left = -1.0 + @as(f32, @floatFromInt(column)) * cell_width;
+                const top = 1.0 - @as(f32, @floatFromInt(row)) * cell_height;
+
+                const foreground = foregroundColor(cell);
                 const seed = cell.codepoint *% 0x9E3779B1;
                 const glyph_left = left + (cell_width - glyph_width) * 0.5;
                 const glyph_top = top - (cell_height - glyph_height) * 0.5;
@@ -434,6 +758,21 @@ pub const Context = struct {
                 }
             }
         }
+    }
+
+    fn backgroundIsSet(cell: TerminalCell) bool {
+        const legacy_colors = cell.flags == 0;
+        return (cell.flags & terminal_cell_background_set) != 0 or
+            (legacy_colors and cell.background != 0);
+    }
+
+    fn foregroundColor(cell: TerminalCell) [3]f32 {
+        const legacy_colors = cell.flags == 0;
+        const foreground_set =
+            (cell.flags & terminal_cell_foreground_set) != 0 or
+            (legacy_colors and cell.foreground != 0);
+        if (!foreground_set) return .{ 0.90, 0.90, 0.92 };
+        return rgb(cell.foreground);
     }
 
     fn drawRect(
@@ -542,3 +881,7 @@ pub const Context = struct {
 // WGL current bindings are thread-local, so this tracks the last successful
 // API-owned persistent binding that must be transferred before a switch.
 threadlocal var persistent_context: ?*Context = null;
+
+/// Transient allocator for glyph rasterization. Coverage buffers live only
+/// between the GDI raster and the texture upload on a cache miss.
+const raster_allocator = std.heap.page_allocator;
