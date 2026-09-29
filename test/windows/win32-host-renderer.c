@@ -388,7 +388,25 @@ static DWORD WINAPI vt_render_thread(void *parameter) {
         winghostty_surface_make_current(call->surface);
     if (call->make_current_result != WINGHOSTTY_OK) return 0;
     call->render_result = winghostty_surface_render(call->surface);
-    glReadBuffer(0x0404);
+    /*
+     * Render the same frame twice, then read GL_BACK.
+     *
+     * winghostty_surface_render calls SwapBuffers internally, so which buffer
+     * holds the frame afterwards is ICD-dependent: hardware drivers swap by
+     * flipping, Microsoft's GDI Generic software rasterizer swaps by copying.
+     * Worse, under GDI Generic the front buffer of a never-shown window is the
+     * window itself, so it is fully clipped and reads back undefined or
+     * foreign pixels.
+     *
+     * Rendering twice makes both buffers hold this frame under flip
+     * semantics, while under copy semantics the back buffer always holds the
+     * latest frame. The back buffer is a real off-screen surface regardless of
+     * window visibility, so GL_BACK is the only portable choice here.
+     */
+    if (call->render_result == WINGHOSTTY_OK) {
+        call->render_result = winghostty_surface_render(call->surface);
+    }
+    glReadBuffer(0x0405);
     glReadPixels(
         (int)call->pixel_x,
         (int)call->pixel_y,
@@ -511,8 +529,18 @@ static DWORD WINAPI render_thread(void *parameter) {
         winghostty_surface_present(call->other_surface);
     call->current_after_other_present = current_matches(call->surface);
     call->render_result = winghostty_surface_render(call->surface);
+    /*
+     * Render twice and read GL_BACK. See the rationale in vt_render_thread:
+     * winghostty_surface_render swaps internally, so GL_FRONT is not a
+     * portable place to look for the frame we just drew, and under the GDI
+     * Generic software rasterizer the front buffer of a never-shown window is
+     * the clipped window itself.
+     */
+    if (call->render_result == WINGHOSTTY_OK) {
+        call->render_result = winghostty_surface_render(call->surface);
+    }
     call->current_after_render = current_matches(call->surface);
-    glReadBuffer(0x0404);
+    glReadBuffer(0x0405);
     glReadPixels(
         1,
         1,
@@ -524,10 +552,15 @@ static DWORD WINAPI render_thread(void *parameter) {
     );
     call->black_render_result =
         winghostty_surface_render(call->other_surface);
+    if (call->black_render_result == WINGHOSTTY_OK) {
+        call->black_render_result =
+            winghostty_surface_render(call->other_surface);
+    }
     call->black_make_current_result =
         winghostty_surface_make_current(call->other_surface);
     unsigned char pixels[320 * 240 * 4];
     memset(pixels, 0, sizeof(pixels));
+    glReadBuffer(0x0405);
     glReadPixels(0, 0, 320, 240, 0x1908, 0x1401, pixels);
     for (int y = 0; y < 240; ++y) {
         for (int x = 0; x < 320; ++x) {
@@ -1394,11 +1427,19 @@ static int run_renderer_contract(test_state *state) {
             "render thread identity was not retained"
         ) ||
         check(
-            winghostty_surface_get_present_count(state->surface) == 2,
+            /*
+             * 3, not 2: render_thread now renders each surface twice so the
+             * frame is readable from GL_BACK on every ICD. Each render
+             * presents once, so surface A is render + render + explicit
+             * present and surface B is explicit present + render + render.
+             * This tracks the added render; it does not relax the original
+             * "presentation count advances" expectation.
+             */
+            winghostty_surface_get_present_count(state->surface) == 3,
             "presentation count did not advance"
         ) ||
         check(
-            winghostty_surface_get_present_count(second) == 2,
+            winghostty_surface_get_present_count(second) == 3,
             "surface B presentation count did not advance"
         )) {
         return 1;
