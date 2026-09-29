@@ -1705,6 +1705,25 @@ static int run_vt_render_state_contract(HWND parent) {
             (unsigned char)((snapshot.blank_background >> 8) & 0xFF),
             (unsigned char)(snapshot.blank_background & 0xFF),
         };
+        /*
+         * Print the measured backgrounds, matching the glyph contracts'
+         * existing practice. A passing run already implies both cells were
+         * located and compared -- every failure path above is a hard failure
+         * -- but printing the values makes that directly readable in a hosted
+         * job log instead of something a reader has to infer.
+         */
+        fprintf(
+            stderr,
+            "vt cell backgrounds: visible=%02X%02X%02X blank=%02X%02X%02X "
+            "uniform=%d\n",
+            call.pixel[0],
+            call.pixel[1],
+            call.pixel[2],
+            call.blank_pixel[0],
+            call.blank_pixel[1],
+            call.blank_pixel[2],
+            call.blank_uniform
+        );
         if (
             !call.blank_uniform ||
             call.blank_pixel[0] != expected_blank[0] ||
