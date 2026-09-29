@@ -132,6 +132,10 @@ Each retained text range owns the exact immutable accessibility snapshot that
 produced its offsets, including cloned and found ranges. Terminal surfaces do
 not advertise `ValuePattern`; edit-role providers are read-only, and
 unsupported text units return `UIA_E_NOTSUPPORTED`.
+`ITextProvider2::GetCaretRange` clears its active flag and range output on
+failure (including provider detach and allocation failure). Retained ranges
+keep their source text across updates but return `UIA_E_ELEMENTNOTAVAILABLE`
+after detach.
 Changing the role raises `ControlType` and `LocalizedControlType` property
 changes.
 
