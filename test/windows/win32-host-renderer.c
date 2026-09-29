@@ -116,23 +116,45 @@ typedef struct process_heap_usage {
     SIZE_T busy_bytes;
 } process_heap_usage;
 
+#define VT_BLANK_MAX_DIMENSION 64
+
 typedef struct vt_snapshot {
     winghostty_terminal_cell *cells;
     uint32_t columns;
     uint32_t rows;
     uint32_t visible_column;
     uint32_t visible_row;
+    /*
+     * A cell carrying a background that this snapshot sets explicitly, and no
+     * ink at all. This is the second SGR in the distinctness check below.
+     *
+     * It is a space rather than "a spot the glyph happens not to reach": the
+     * renderer skips ink for codepoint 0 and for ' ', so the cell interior is
+     * background by construction and no font, metric, hinting or pseudo-hash
+     * change can push ink into it. Its expected colour comes from the
+     * snapshot, not from a renderer theme constant, so the assertion stays
+     * keyed to the data under test.
+     */
+    uint32_t blank_background;
+    uint32_t blank_column;
+    uint32_t blank_row;
 } vt_snapshot;
 
 typedef struct vt_render_call {
     winghostty_surface *surface;
     uint32_t pixel_x;
     uint32_t pixel_y;
+    uint32_t blank_x;
+    uint32_t blank_y;
+    uint32_t blank_width;
+    uint32_t blank_height;
     winghostty_result make_current_result;
     winghostty_result render_result;
     winghostty_result present_result;
     winghostty_result clear_current_result;
     unsigned char pixel[4];
+    unsigned char blank_pixel[4];
+    int blank_uniform;
 } vt_render_call;
 
 #define WM_UIA_SELECTION_TEST (0x8000 + 0x41)
@@ -355,7 +377,8 @@ static int vt_snapshot_from_output(
     }
     if (row != snapshot->rows) goto cleanup;
 
-    for (row = 0; row < snapshot->rows; ++row) {
+    int found_visible = 0;
+    for (row = 0; row < snapshot->rows && !found_visible; ++row) {
         for (uint32_t column = 0; column < snapshot->columns; ++column) {
             if (
                 snapshot->cells[row * snapshot->columns + column].codepoint ==
@@ -365,8 +388,33 @@ static int vt_snapshot_from_output(
             ) {
                 snapshot->visible_column = column;
                 snapshot->visible_row = row;
+                found_visible = 1;
+                break;
+            }
+        }
+    }
+    if (!found_visible) goto cleanup;
+
+    /*
+     * Locate an ink-free cell whose background this snapshot sets explicitly.
+     * The renderer skips ink for codepoint 0 and for ' ', so such a cell is
+     * background across its whole interior by construction.
+     */
+    for (row = 0; row < snapshot->rows && !success; ++row) {
+        for (uint32_t column = 0; column < snapshot->columns; ++column) {
+            const winghostty_terminal_cell *candidate =
+                &snapshot->cells[row * snapshot->columns + column];
+            if (
+                (candidate->codepoint == 0 || candidate->codepoint == ' ') &&
+                (candidate->flags &
+                    WINGHOSTTY_TERMINAL_CELL_BACKGROUND_SET) != 0 &&
+                candidate->background != 0xCC2211
+            ) {
+                snapshot->blank_background = candidate->background;
+                snapshot->blank_column = column;
+                snapshot->blank_row = row;
                 success = 1;
-                goto cleanup;
+                break;
             }
         }
     }
@@ -416,6 +464,48 @@ static DWORD WINAPI vt_render_thread(void *parameter) {
         0x1401,
         call->pixel
     );
+    /*
+     * Read the interior of the structurally empty cell. Every pixel of it must
+     * be the same colour: the cell has no grapheme, so there is nothing that
+     * could legitimately vary inside it, and no tolerance is needed or wanted.
+     * The interior is inset by one pixel so the sample never straddles a cell
+     * boundary.
+     */
+    call->blank_uniform = 0;
+    if (call->blank_width > 0 &&
+        call->blank_height > 0 &&
+        call->blank_width <= VT_BLANK_MAX_DIMENSION &&
+        call->blank_height <= VT_BLANK_MAX_DIMENSION) {
+        unsigned char blank[
+            VT_BLANK_MAX_DIMENSION * VT_BLANK_MAX_DIMENSION * 4
+        ];
+        memset(blank, 0, sizeof(blank));
+        glReadPixels(
+            (int)call->blank_x,
+            (int)call->blank_y,
+            (int)call->blank_width,
+            (int)call->blank_height,
+            0x1908,
+            0x1401,
+            blank
+        );
+        const uint32_t blank_count = call->blank_width * call->blank_height;
+        int uniform = 1;
+        for (uint32_t i = 0; i < blank_count; ++i) {
+            const unsigned char *sample = &blank[i * 4];
+            if (sample[0] != blank[0] ||
+                sample[1] != blank[1] ||
+                sample[2] != blank[2]) {
+                uniform = 0;
+                break;
+            }
+        }
+        call->blank_uniform = uniform;
+        call->blank_pixel[0] = blank[0];
+        call->blank_pixel[1] = blank[1];
+        call->blank_pixel[2] = blank[2];
+        call->blank_pixel[3] = blank[3];
+    }
     call->present_result = winghostty_surface_present(call->surface);
     call->clear_current_result =
         winghostty_surface_clear_current(call->surface);
@@ -1470,7 +1560,15 @@ static int run_renderer_contract(test_state *state) {
 static int run_vt_render_state_contract(HWND parent) {
     const char *output =
         "\033[2J\033[H$ echo visible\r\n"
-        "\033[48;2;204;34;17mvisible\033[0m\r\n";
+        "\033[48;2;204;34;17mvisible\033[0m\r\n"
+        /*
+         * A run of spaces under a second, different background SGR. Spaces
+         * are deliberate: the renderer draws no ink for them, so these cells
+         * are pure background and give the distinctness check below a second
+         * colour that is set by this snapshot rather than by a theme default.
+         * This is additive -- the CC2211 "visible" row above is untouched.
+         */
+        "\033[48;2;17;51;85m  \033[0m\r\n";
     vt_snapshot snapshot;
     if (
         check(
@@ -1532,6 +1630,10 @@ static int run_vt_render_state_contract(HWND parent) {
             .pixel_x = snapshot.visible_column * 8 + 1,
             .pixel_y =
                 (snapshot.rows - snapshot.visible_row - 1) * 48 + 1,
+            .blank_x = snapshot.blank_column * 8 + 1,
+            .blank_y = (snapshot.rows - snapshot.blank_row - 1) * 48 + 1,
+            .blank_width = 8 - 2,
+            .blank_height = 48 - 2,
             .make_current_result = WINGHOSTTY_INVALID_ARGUMENT,
             .render_result = WINGHOSTTY_INVALID_ARGUMENT,
             .present_result = WINGHOSTTY_INVALID_ARGUMENT,
@@ -1581,6 +1683,83 @@ static int run_vt_render_state_contract(HWND parent) {
             winghostty_host_deinitialize(host);
             vt_snapshot_free(&snapshot);
             return fail("VT render-state cell was not pixel-observable");
+        }
+        /*
+         * Multi-cell distinctness.
+         *
+         * A single-colour assertion cannot distinguish our own frame from a
+         * stale or foreign buffer that happens to be flat in the colour we
+         * expect -- which is exactly how this contract once passed against a
+         * surface it never rendered. Two cells carrying different SGRs, each
+         * showing its own expected background in the same frame, is a spatial
+         * relationship keyed to this snapshot's layout, and no unrelated
+         * buffer can satisfy it by coincidence.
+         *
+         * Only background is read. Glyph shape, ink counts and antialiasing
+         * values are deliberately not asserted, so this survives font, DPI,
+         * hinting and pseudo-hash changes, and survives a future move of this
+         * path onto the antialiased v2 raster.
+         */
+        const unsigned char expected_blank[3] = {
+            (unsigned char)((snapshot.blank_background >> 16) & 0xFF),
+            (unsigned char)((snapshot.blank_background >> 8) & 0xFF),
+            (unsigned char)(snapshot.blank_background & 0xFF),
+        };
+        /*
+         * Print the measured backgrounds, matching the glyph contracts'
+         * existing practice. A passing run already implies both cells were
+         * located and compared -- every failure path above is a hard failure
+         * -- but printing the values makes that directly readable in a hosted
+         * job log instead of something a reader has to infer.
+         */
+        fprintf(
+            stderr,
+            "vt cell backgrounds: visible=%02X%02X%02X blank=%02X%02X%02X "
+            "uniform=%d\n",
+            call.pixel[0],
+            call.pixel[1],
+            call.pixel[2],
+            call.blank_pixel[0],
+            call.blank_pixel[1],
+            call.blank_pixel[2],
+            call.blank_uniform
+        );
+        if (
+            !call.blank_uniform ||
+            call.blank_pixel[0] != expected_blank[0] ||
+            call.blank_pixel[1] != expected_blank[1] ||
+            call.blank_pixel[2] != expected_blank[2]
+        ) {
+            fprintf(
+                stderr,
+                "VT render-state blank cell uniform=%d pixel=%02X%02X%02X "
+                "expected=%02X%02X%02X\n",
+                call.blank_uniform,
+                call.blank_pixel[0],
+                call.blank_pixel[1],
+                call.blank_pixel[2],
+                expected_blank[0],
+                expected_blank[1],
+                expected_blank[2]
+            );
+            winghostty_surface_destroy(surface);
+            winghostty_host_deinitialize(host);
+            vt_snapshot_free(&snapshot);
+            return fail(
+                "VT render-state blank cell was not observable"
+            );
+        }
+        if (
+            call.pixel[0] == call.blank_pixel[0] &&
+            call.pixel[1] == call.blank_pixel[1] &&
+            call.pixel[2] == call.blank_pixel[2]
+        ) {
+            winghostty_surface_destroy(surface);
+            winghostty_host_deinitialize(host);
+            vt_snapshot_free(&snapshot);
+            return fail(
+                "VT render-state cells with different SGRs rendered alike"
+            );
         }
         if (
             winghostty_surface_destroy(surface) != WINGHOSTTY_OK ||
