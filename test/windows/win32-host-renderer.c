@@ -1590,7 +1590,22 @@ static DWORD WINAPI glyph_render_thread(void *parameter) {
         }
         session->render_result[frame] =
             winghostty_surface_render(session->surface);
-        glReadBuffer(0x0404);
+        /*
+         * winghostty_surface_render swaps internally, so which buffer holds
+         * this frame depends on whether the ICD swaps by flipping (hardware
+         * drivers) or by copying (Microsoft's GDI Generic software
+         * rasterizer). Rendering the same snapshot twice leaves the frame in
+         * the back buffer either way, and the back buffer is a real
+         * off-screen surface even for a window that is never shown. The front
+         * buffer is not: under GDI Generic it is the window itself, so it is
+         * entirely clipped away while the window is invisible and reads back
+         * unrelated pixels.
+         */
+        if (session->render_result[frame] == WINGHOSTTY_OK) {
+            session->render_result[frame] =
+                winghostty_surface_render(session->surface);
+        }
+        glReadBuffer(0x0405);
         glReadPixels(
             0,
             0,
