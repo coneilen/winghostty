@@ -115,6 +115,7 @@ const MK_MBUTTON: u32 = 0x0010;
 const MK_XBUTTON1: u32 = 0x0020;
 const MK_XBUTTON2: u32 = 0x0040;
 const max_input_text_bytes: u32 = 16 * 1024 * 1024;
+const ERROR_NOT_SUPPORTED: DWORD = 50;
 
 const TrackMouseEventArgs = extern struct {
     cbSize: u32,
@@ -1318,7 +1319,8 @@ fn claimRenderThread(host: *HostState) Result {
 }
 
 fn rendererResult(surface: *SurfaceState, err: win32_context.Error) Result {
-    surface.last_error.store(GetLastError(), .release);
+    // A deliberate capacity refusal has no failing Win32 call to query.
+    surface.last_error.store(if (err == error.GlyphDimensionsUnsupported) ERROR_NOT_SUPPORTED else GetLastError(), .release);
     return switch (err) {
         error.WrongThread => result_wrong_thread,
         error.Destroying => result_shutting_down,

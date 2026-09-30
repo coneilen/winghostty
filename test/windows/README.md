@@ -271,3 +271,29 @@ B, destroys A on the UI thread, and switches B again.
 ```powershell
 .\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\test\windows\run-win32-host-renderer.ps1
 ```
+
+The renderer executable also accepts `--glyph-capacity` to run only its
+11 capacity cases without showing or focusing its parent window. This
+exercises valid public v2 snapshots at normal, exact-capacity, and first
+oversized padded dimensions, narrow/wide differences, and oversized blanks.
+Unsupported cases must return `WINGHOSTTY_RENDERER_ERROR` with
+`ERROR_NOT_SUPPORTED`, preserve the prior frame at unchanged HWND bounds,
+leave the present count unchanged, restore the scoped WGL binding, and
+recover when supported data is reinstalled. Supported cases require real
+white foreground ink and the supplied background; no pseudo-glyph fallback
+or relaxed color expectation is used.
+
+For a retained, focused executable (use your own build/cache/output paths):
+
+```powershell
+.\scripts\dev-windows.cmd zig build -Demit-win32-host=true
+.\scripts\dev-windows.cmd zig build -Demit-lib-vt=true
+.\scripts\dev-windows.cmd zig cc -target x86_64-windows-msvc -I include test\windows\win32-host-renderer.c zig-out\lib\winghostty-win32-host.lib zig-out\lib\ghostty-vt.lib -luser32 -lgdi32 -lopengl32 -lkernel32 -limm32 -loleaut32 -lole32 -luiautomationcore -lws2_32 -lbcrypt -o zig-out\bin\win32-host-glyph-capacity.exe
+.\zig-out\bin\win32-host-glyph-capacity.exe --glyph-capacity
+.\scripts\dev-windows.cmd zig test src\renderer\win32_glyph.zig -lc -lgdi32 -lkernel32 -luser32
+```
+
+Pixel evidence is deterministic offscreen readback, not proof of actual
+on-screen rendering or cross-platform parity. The default full renderer
+contract still shows its test parent and runs three fresh processes; in a
+shared desktop it requires exclusive coordination.

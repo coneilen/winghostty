@@ -19,6 +19,9 @@ extern void WINAPI glReadPixels(
     void *pixels
 );
 extern void WINAPI glReadBuffer(unsigned int mode);
+extern void WINAPI glGetIntegerv(unsigned int name, int *value);
+extern const unsigned char *WINAPI glGetString(unsigned int name);
+extern unsigned int WINAPI glGetError(void);
 
 typedef struct test_state {
     HWND parent;
@@ -2165,6 +2168,222 @@ static int run_glyph_render_contract(HWND parent) {
     return 0;
 }
 
+static int run_glyph_capacity_case(
+    HWND parent,
+    unsigned cell_width,
+    unsigned cell_height,
+    int wide,
+    int supported
+) {
+    const unsigned width = cell_width * 3;
+    const size_t bytes = (size_t)width * cell_height * 4;
+    unsigned char *before = calloc(1, bytes);
+    unsigned char *after = calloc(1, bytes);
+    winghostty_host *host = NULL;
+    winghostty_surface *surface = NULL;
+    int failed = 0;
+    winghostty_surface_options options;
+    winghostty_surface_options_init(&options);
+    options.visible = 0;
+    options.focus = 0;
+    options.bounds.width = width;
+    options.bounds.height = cell_height;
+    if (before == NULL || after == NULL ||
+        winghostty_host_initialize(&host) != WINGHOSTTY_OK ||
+        winghostty_host_create_surface(host, parent, &options, &surface) !=
+            WINGHOSTTY_OK) {
+        failed = fail("glyph capacity setup failed");
+        goto cleanup;
+    }
+
+    /* Seed both buffers at the same HWND bounds with a supported dense grid. */
+    winghostty_terminal_cell seed_cells[12];
+    winghostty_terminal_glyph seed_glyphs[12];
+    const uint8_t seed_text[] = {'e'};
+    for (unsigned i = 0; i < 12; ++i) {
+        seed_cells[i] = (winghostty_terminal_cell){'e', 0xFFFFFF, 0x332211, 3};
+        seed_glyphs[i] = (winghostty_terminal_glyph){0, 1, 1, 0};
+    }
+    winghostty_terminal_snapshot_v2 snapshot;
+    winghostty_terminal_snapshot_v2_init(&snapshot);
+    snapshot.columns = 6;
+    snapshot.rows = 2;
+    snapshot.cells = seed_cells;
+    snapshot.cell_count = 12;
+    snapshot.glyphs = seed_glyphs;
+    snapshot.glyph_count = 12;
+    snapshot.text = seed_text;
+    snapshot.text_length = sizeof(seed_text);
+    if (winghostty_surface_set_terminal_snapshot_v2(surface, &snapshot) !=
+            WINGHOSTTY_OK ||
+        winghostty_surface_make_current(surface) != WINGHOSTTY_OK ||
+        winghostty_surface_render(surface) != WINGHOSTTY_OK ||
+        winghostty_surface_render(surface) != WINGHOSTTY_OK) {
+        failed = fail("glyph capacity seed failed");
+        goto cleanup;
+    }
+    int texture_limit = 0;
+    glGetIntegerv(0x0D33, &texture_limit);
+    fprintf(stderr, "capacity GL renderer=%s max_texture_size=%d\n",
+        glGetString(0x1F01), texture_limit);
+    glReadBuffer(0x0405);
+    glReadPixels(0, 0, width, cell_height, 0x1908, 0x1401, before);
+    const uint64_t presents = winghostty_surface_get_present_count(surface);
+    if (winghostty_surface_clear_current(surface) != WINGHOSTTY_OK) {
+        failed = fail("glyph capacity seed binding release failed");
+        goto cleanup;
+    }
+
+    const uint8_t text[] = {'e', 0xE4, 0xB8, 0xAD};
+    const winghostty_terminal_cell cells[3] = {
+        {wide < 0 ? ' ' : 'e', 0xFFFFFF, 0x113355, 3},
+        {wide < 0 ? ' ' : (wide ? 0x4E2D : 'e'), 0xFFFFFF, 0x113355, 3},
+        {wide < 0 ? ' ' : (wide ? 0 : 'e'), 0xFFFFFF, 0x113355, 3},
+    };
+    const winghostty_terminal_glyph glyphs[3] = {
+        {0, wide < 0 ? 0 : 1, 1, 0},
+        {wide > 0 ? 1 : 0, wide < 0 ? 0 : (wide ? 3 : 1), wide > 0 ? 2 : 1, 0},
+        {0, wide != 0 ? 0 : 1, wide > 0 ? 0 : 1, 0},
+    };
+    snapshot.columns = 3;
+    snapshot.rows = 1;
+    snapshot.cells = cells;
+    snapshot.cell_count = 3;
+    snapshot.glyphs = glyphs;
+    snapshot.glyph_count = 3;
+    snapshot.text = text;
+    snapshot.text_length = sizeof(text);
+    if (winghostty_surface_set_terminal_snapshot_v2(surface, &snapshot) !=
+        WINGHOSTTY_OK) {
+        failed = fail("legal capacity snapshot was rejected");
+        goto cleanup;
+    }
+    const winghostty_result result = winghostty_surface_render(surface);
+    const winghostty_result repeat = winghostty_surface_render(surface);
+    failed |= check(current_is_clear(), "capacity render leaked its scoped binding");
+    failed |= check(
+        result == (supported ? WINGHOSTTY_OK : WINGHOSTTY_RENDERER_ERROR) &&
+            repeat == result,
+        "capacity render did not explicitly refuse unsupported ink"
+    );
+    failed |= check(
+        winghostty_surface_get_present_count(surface) ==
+            presents + (supported ? 2 : 0),
+        "refused capacity render presented a frame"
+    );
+    if (!supported) {
+        failed |= check(winghostty_surface_get_last_error(surface) == ERROR_NOT_SUPPORTED,
+            "capacity refusal reported a stale Win32 last error");
+    }
+    if (winghostty_surface_make_current(surface) != WINGHOSTTY_OK) {
+        failed |= fail("glyph capacity readback binding failed");
+        goto cleanup;
+    }
+    glReadBuffer(0x0405);
+    glReadPixels(0, 0, width, cell_height, 0x1908, 0x1401, after);
+    unsigned narrow_ink = 0;
+    unsigned other_ink = 0;
+    unsigned white_ink = 0;
+    for (unsigned y = 0; y < cell_height; ++y) {
+        for (unsigned x = 0; x < width; ++x) {
+            const unsigned char *p = after + ((size_t)y * width + x) * 4;
+            if (abs((int)p[0] - 0x11) > 8 ||
+                abs((int)p[1] - 0x33) > 8 ||
+                abs((int)p[2] - 0x55) > 8) {
+                if (x < cell_width) ++narrow_ink;
+                else ++other_ink;
+            }
+            if (p[0] > 247 && p[1] > 247 && p[2] > 247) ++white_ink;
+        }
+    }
+    fprintf(stderr,
+        "capacity cell=%ux%u class=%s supported=%d result=%d/%d "
+        "narrow_ink=%u other_ink=%u white_ink=%u preserved=%d\n",
+        cell_width, cell_height, wide < 0 ? "blank" : (wide ? "wide" : "narrow"), supported,
+        result, repeat, narrow_ink, other_ink, white_ink,
+        memcmp(before, after, bytes) == 0);
+    if (supported && wide < 0) {
+        failed |= check(narrow_ink == 0 && other_ink == 0 && white_ink == 0,
+            "blank oversized cells generated glyph ink");
+    } else if (supported) {
+        failed |= check(narrow_ink > 0 && other_ink > 0 && white_ink > 0,
+            "supported capacity boundary lost real foreground ink");
+    } else {
+        failed |= check(memcmp(before, after, bytes) == 0,
+            "refused capacity render replaced authoritative pixels");
+        glReadBuffer(0x0404);
+        glReadPixels(0, 0, width, cell_height, 0x1908, 0x1401, after);
+        /* GL_FRONT is authoritative only on ICDs where hidden readback works. */
+        if (strcmp((const char *)glGetString(0x1F01), "GDI Generic") != 0) {
+            failed |= check(memcmp(before, after, bytes) == 0,
+                "refused capacity render changed the presented buffer");
+        }
+    }
+    if (supported) {
+        failed |= check(after[0] == 0x11 && after[1] == 0x33 && after[2] == 0x55,
+            "supported capacity boundary changed the supplied background");
+    }
+    failed |= check(glGetError() == 0, "capacity test encountered a GL error");
+
+    /* A refusal must leave the surface usable for the last supported data. */
+    snapshot.columns = 6;
+    snapshot.rows = 2;
+    snapshot.cells = seed_cells;
+    snapshot.cell_count = 12;
+    snapshot.glyphs = seed_glyphs;
+    snapshot.glyph_count = 12;
+    snapshot.text = seed_text;
+    snapshot.text_length = sizeof(seed_text);
+    failed |= check(
+        winghostty_surface_set_terminal_snapshot_v2(surface, &snapshot) ==
+            WINGHOSTTY_OK &&
+        winghostty_surface_render(surface) == WINGHOSTTY_OK &&
+        winghostty_surface_render(surface) == WINGHOSTTY_OK,
+        "supported recovery after capacity refusal failed"
+    );
+    glReadBuffer(0x0405);
+    glReadPixels(0, 0, width, cell_height, 0x1908, 0x1401, after);
+    failed |= check(memcmp(before, after, bytes) == 0,
+        "supported recovery did not restore the seed frame");
+cleanup:
+    if (surface != NULL) {
+        winghostty_surface_clear_current(surface);
+        failed |= check(winghostty_surface_destroy(surface) == WINGHOSTTY_OK,
+            "glyph capacity surface teardown failed");
+    }
+    if (host != NULL) {
+        failed |= check(winghostty_host_deinitialize(host) == WINGHOSTTY_OK,
+            "glyph capacity host teardown failed");
+    }
+    free(before);
+    free(after);
+    return failed != 0;
+}
+
+static int run_glyph_capacity_contract(HWND parent) {
+    const unsigned cases[][4] = {
+        {16, 32, 1, 1},
+        {128, 129, 1, 1},
+        {129, 128, 1, 1},
+        {129, 129, 1, 0},
+        {129, 129, 0, 1},
+        {256, 128, 1, 1},
+        {256, 129, 1, 0},
+        {257, 128, 1, 0},
+        {256, 256, 0, 1},
+        {257, 256, 0, 0},
+    };
+    unsigned failed = 0;
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        failed += run_glyph_capacity_case(parent, cases[i][0], cases[i][1],
+            cases[i][2], cases[i][3]) != 0;
+    }
+    failed += run_glyph_capacity_case(parent, 257, 256, -1, 1) != 0;
+    fprintf(stderr, "glyph capacity contract: executed=%zu failed=%u\n",
+        sizeof(cases) / sizeof(cases[0]) + 1, failed);
+    return failed != 0;
+}
+
 static int run_persistent_teardown_contract(HWND parent) {
     winghostty_host *host = NULL;
     if (winghostty_host_initialize(&host) != WINGHOSTTY_OK) {
@@ -2610,7 +2829,7 @@ static int run_teardown_admission_contract(HWND parent, int destroy_surface) {
     return check_stale_host(host, parent);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     if (FAILED(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED))) {
         return fail("COM initialization failed");
     }
@@ -2619,6 +2838,12 @@ int main(void) {
     };
     state.parent = create_parent();
     if (!state.parent) return fail("parent window creation failed");
+    if (argc == 2 && strcmp(argv[1], "--glyph-capacity") == 0) {
+        const int result = run_glyph_capacity_contract(state.parent);
+        DestroyWindow(state.parent);
+        CoUninitialize();
+        return result;
+    }
     SetWindowLongPtrW(
         state.parent,
         GWLP_USERDATA,
@@ -2637,6 +2862,10 @@ int main(void) {
         return 1;
     }
     if (run_glyph_render_contract(state.parent) != 0) {
+        DestroyWindow(state.parent);
+        return 1;
+    }
+    if (run_glyph_capacity_contract(state.parent) != 0) {
         DestroyWindow(state.parent);
         return 1;
     }

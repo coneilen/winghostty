@@ -115,6 +115,30 @@ through `ghostty_terminal_vt_write`, converts the resulting
 `visible` output. A reconnecting surface can replay the same caller-owned
 snapshot before its first render; no renderer state is inferred from
 `winghostty_surface_notify_terminal_text`.
+
+The v2 grapheme snapshot (`winghostty_surface_set_terminal_snapshot_v2`)
+uses native grayscale GDI coverage. Its renderer derives pixel cell sizes
+from the surface bounds divided by the snapshot columns/rows. Each cell
+dimension must be at most 4096 pixels; a wide lead's coverage spans two
+columns. OpenGL 1.1 uploads round each coverage dimension up to a power of
+two. An ink-bearing raster is supported only when those padded dimensions
+fit the current context's `GL_MAX_TEXTURE_SIZE` and their product is at most
+65,536 texels. This is an area limit, not a 256-pixel limit on each axis:
+512 x 128 is also supported when the context permits it.
+
+For example, a wide glyph at 128 x 129 cell pixels pads to 256 x 256 and
+fits; at 129 x 129 it pads to 512 x 256 and is refused, while a narrow glyph
+at those same metrics still fits. Unsupported dimensions return
+`WINGHOSTTY_RENDERER_ERROR` from `winghostty_surface_render`, set
+`winghostty_surface_get_last_error` to Win32 `ERROR_NOT_SUPPORTED`, and emit
+a dimension/limit diagnostic. This recoverable refusal happens before
+framebuffer clearing, cache flushing, raster allocation, or presentation;
+the prior frame and present count remain unchanged at unchanged window
+bounds. The installed snapshot is not discarded. Install a supported
+snapshot or adjust bounds/grid dimensions to recover. Blank cells do not
+require a glyph texture and are not refused for this reason. The v1 path
+and public layouts/results remain unchanged.
+
 Retained UIA providers synchronize concurrent queries, updates, selection
 callbacks, and teardown; provider options advertise COM-threaded access.
 UIA selection callbacks synchronously marshal through the surface window to the
