@@ -22,6 +22,7 @@ extern void WINAPI glReadBuffer(unsigned int mode);
 extern void WINAPI glGetIntegerv(unsigned int name, int *value);
 extern const unsigned char *WINAPI glGetString(unsigned int name);
 extern unsigned int WINAPI glGetError(void);
+extern void WINAPI glEnable(unsigned int capability);
 
 typedef struct test_state {
     HWND parent;
@@ -2168,6 +2169,120 @@ static int run_glyph_render_contract(HWND parent) {
     return 0;
 }
 
+static int run_glyph_caller_error_case(HWND parent, int prime_error) {
+    enum { width = 48, height = 32, cell_width = 16 };
+    unsigned char pixels[width * height * 4] = {0};
+    winghostty_host *host = NULL;
+    winghostty_surface *surface = NULL;
+    int failed = 0;
+    winghostty_surface_options options;
+    winghostty_surface_options_init(&options);
+    options.visible = 0;
+    options.focus = 0;
+    options.bounds.width = width;
+    options.bounds.height = height;
+    if (winghostty_host_initialize(&host) != WINGHOSTTY_OK ||
+        winghostty_host_create_surface(host, parent, &options, &surface) !=
+            WINGHOSTTY_OK) {
+        failed = fail("glyph caller-error setup failed");
+        goto cleanup;
+    }
+
+    const uint8_t text[] = {'e', 0xE4, 0xB8, 0xAD};
+    const winghostty_terminal_cell cells[3] = {
+        {'e', 0xFFFFFF, 0x113355, 3},
+        {0x4E2D, 0xFFFFFF, 0x113355, 3},
+        {0, 0xFFFFFF, 0x113355, 3},
+    };
+    const winghostty_terminal_glyph glyphs[3] = {
+        {0, 1, 1, 0}, {1, 3, 2, 0}, {0, 0, 0, 0},
+    };
+    winghostty_terminal_snapshot_v2 snapshot;
+    winghostty_terminal_snapshot_v2_init(&snapshot);
+    snapshot.columns = 3;
+    snapshot.rows = 1;
+    snapshot.cells = cells;
+    snapshot.cell_count = 3;
+    snapshot.glyphs = glyphs;
+    snapshot.glyph_count = 3;
+    snapshot.text = text;
+    snapshot.text_length = sizeof(text);
+    if (winghostty_surface_set_terminal_snapshot_v2(surface, &snapshot) !=
+            WINGHOSTTY_OK ||
+        winghostty_surface_make_current(surface) != WINGHOSTTY_OK ||
+        glGetError() != 0) {
+        failed = fail("glyph caller-error snapshot or binding failed");
+        goto cleanup;
+    }
+
+    /* No previous render: the first supported glyph must miss the cache. */
+    const uint64_t before = winghostty_surface_get_present_count(surface);
+    if (prime_error) glEnable(0xFFFFFFFFu); /* Invalid enum, no state change. */
+    if (winghostty_surface_clear_current(surface) != WINGHOSTTY_OK) {
+        failed = fail("glyph caller-error release failed");
+        goto cleanup;
+    }
+    const winghostty_result first = winghostty_surface_render(surface);
+    const uint32_t diagnostic = winghostty_surface_get_last_error(surface);
+    const winghostty_result repeat = first == WINGHOSTTY_OK ?
+        winghostty_surface_render(surface) : first;
+    const uint64_t after = winghostty_surface_get_present_count(surface);
+    failed |= check(first == WINGHOSTTY_OK && repeat == WINGHOSTTY_OK,
+        "pre-existing caller GL error rejected a fresh supported glyph upload");
+    failed |= check(after == before + 2,
+        "caller-error control did not present both supported frames");
+    failed |= check(current_is_clear(),
+        "caller-error render leaked its scoped binding");
+    if (winghostty_surface_make_current(surface) != WINGHOSTTY_OK) {
+        failed |= fail("glyph caller-error readback binding failed");
+        goto cleanup;
+    }
+    glReadBuffer(0x0405);
+    glReadPixels(0, 0, width, height, 0x1908, 0x1401, pixels);
+    unsigned narrow_white = 0;
+    unsigned wide_white = 0;
+    for (unsigned y = 0; y < height; ++y) {
+        for (unsigned x = 0; x < width; ++x) {
+            const unsigned char *p = pixels + (y * width + x) * 4;
+            if (p[0] > 247 && p[1] > 247 && p[2] > 247) {
+                if (x < cell_width) ++narrow_white;
+                else ++wide_white;
+            }
+        }
+    }
+    const unsigned gl_error = glGetError();
+    fprintf(stderr,
+        "glyph caller-error fresh=1 prime=%d result=%d/%d diagnostic=%u "
+        "presents=%llu/%llu narrow_white=%u wide_white=%u gl_error=0x%x\n",
+        prime_error, first, repeat, diagnostic,
+        (unsigned long long)before, (unsigned long long)after,
+        narrow_white, wide_white, gl_error);
+    failed |= check(narrow_white > 0 && wide_white > 0,
+        "caller-error control lost expected narrow or wide white ink");
+    failed |= check(pixels[0] == 0x11 && pixels[1] == 0x33 && pixels[2] == 0x55,
+        "caller-error control changed the supplied background");
+    failed |= check(gl_error == 0, "caller-error control left a GL error");
+cleanup:
+    if (surface != NULL) {
+        winghostty_surface_clear_current(surface);
+        failed |= check(winghostty_surface_destroy(surface) == WINGHOSTTY_OK,
+            "glyph caller-error surface teardown failed");
+    }
+    if (host != NULL) {
+        failed |= check(winghostty_host_deinitialize(host) == WINGHOSTTY_OK,
+            "glyph caller-error host teardown failed");
+    }
+    return failed != 0;
+}
+
+static int run_glyph_caller_error_contract(HWND parent) {
+    unsigned failed = 0;
+    failed += run_glyph_caller_error_case(parent, 0) != 0;
+    failed += run_glyph_caller_error_case(parent, 1) != 0;
+    fprintf(stderr, "glyph caller-error contract: executed=2 failed=%u\n", failed);
+    return failed != 0;
+}
+
 static int run_glyph_capacity_case(
     HWND parent,
     unsigned cell_width,
@@ -2844,6 +2959,23 @@ int main(int argc, char **argv) {
         CoUninitialize();
         return result;
     }
+    if (argc == 2 && strcmp(argv[1], "--glyph-errors") == 0) {
+        const int result = run_glyph_caller_error_contract(state.parent);
+        DestroyWindow(state.parent);
+        CoUninitialize();
+        return result;
+    }
+    if (argc == 2 && strcmp(argv[1], "--glyph-offscreen") == 0) {
+        unsigned failed = 0;
+        failed += run_vt_render_state_contract(state.parent) != 0;
+        failed += run_glyph_render_contract(state.parent) != 0;
+        failed += run_glyph_capacity_contract(state.parent) != 0;
+        failed += run_glyph_caller_error_contract(state.parent) != 0;
+        fprintf(stderr, "offscreen glyph suite: contracts=4 failed=%u\n", failed);
+        DestroyWindow(state.parent);
+        CoUninitialize();
+        return failed != 0;
+    }
     SetWindowLongPtrW(
         state.parent,
         GWLP_USERDATA,
@@ -2866,6 +2998,10 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (run_glyph_capacity_contract(state.parent) != 0) {
+        DestroyWindow(state.parent);
+        return 1;
+    }
+    if (run_glyph_caller_error_contract(state.parent) != 0) {
         DestroyWindow(state.parent);
         return 1;
     }

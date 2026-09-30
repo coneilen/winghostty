@@ -154,7 +154,30 @@ pub const Error = error{
     GlyphDimensionsUnsupported,
     GlyphRasterFailed,
     GlyphUploadFailed,
+    GlErrorBoundaryFailed,
 };
+
+const max_prior_gl_error_queries = 16;
+
+fn consumePriorGlErrors(
+    comptime query_error: fn () callconv(.winapi) u32,
+    comptime report_error: fn (u32) void,
+) Error!void {
+    for (0..max_prior_gl_error_queries) |_| {
+        const gl_error = query_error();
+        if (gl_error == 0) return;
+        report_error(gl_error);
+    }
+    return error.GlErrorBoundaryFailed;
+}
+
+fn reportCallerGlError(gl_error: u32) void {
+    log.warn("consumed pre-existing caller GL error before provider render gl_error=0x{x}", .{gl_error});
+}
+
+fn checkGlyphUploadError(gl_error: u32) Error!void {
+    if (gl_error != 0) return error.GlyphUploadFailed;
+}
 
 pub const Theme = enum(i32) {
     system = 0,
@@ -318,7 +341,8 @@ const GlyphCache = struct {
         var handle: [1]u32 = .{0};
         glGenTextures(1, &handle);
         if (handle[0] == 0) {
-            log.err("glyph texture creation failed", .{});
+            const gl_error = glGetError();
+            log.err("glyph texture creation failed gl_error=0x{x}", .{gl_error});
             return error.GlyphUploadFailed;
         }
         errdefer glDeleteTextures(1, &handle);
@@ -340,10 +364,10 @@ const GlyphCache = struct {
             texels.ptr,
         );
         const gl_error = glGetError();
-        if (gl_error != 0) {
+        checkGlyphUploadError(gl_error) catch |err| {
             log.err("glyph texture upload failed padded={d}x{d} gl_error=0x{x}", .{ texture_width, texture_height, gl_error });
-            return error.GlyphUploadFailed;
-        }
+            return err;
+        };
 
         const entry = self.reserve();
         self.clock += 1;
@@ -568,10 +592,14 @@ pub const Context = struct {
         }
 
         var operation_error: ?Error = null;
-        const texture_limit = preflightGlyphDimensions(state) catch |err| failed: {
+        consumePriorGlErrors(glGetError, reportCallerGlError) catch |err| {
+            log.err("caller GL error boundary did not clear within {d} queries", .{max_prior_gl_error_queries});
+            operation_error = err;
+        };
+        const texture_limit = if (operation_error == null) preflightGlyphDimensions(state) catch |err| failed: {
             operation_error = err;
             break :failed 0;
-        };
+        } else 0;
         if (operation_error == null) {
             const width: i32 = @intCast(@min(state.width, @as(u32, std.math.maxInt(i32))));
             const height: i32 = @intCast(@min(state.height, @as(u32, std.math.maxInt(i32))));
@@ -974,3 +1002,56 @@ threadlocal var persistent_context: ?*Context = null;
 /// Transient allocator for glyph rasterization. Coverage buffers live only
 /// between the GDI raster and the texture upload on a cache miss.
 const raster_allocator = std.heap.page_allocator;
+
+const GlErrorTestProbe = struct {
+    var errors: []const u32 = &.{};
+    var fallback: u32 = 0;
+    var queries: usize = 0;
+    var report_count: usize = 0;
+    var reported: [max_prior_gl_error_queries]u32 = undefined;
+
+    fn reset(values: []const u32, fallback_error: u32) void {
+        errors = values;
+        fallback = fallback_error;
+        queries = 0;
+        report_count = 0;
+    }
+
+    fn query() callconv(.winapi) u32 {
+        const index = queries;
+        queries += 1;
+        return if (index < errors.len) errors[index] else fallback;
+    }
+
+    fn report(gl_error: u32) void {
+        reported[report_count] = gl_error;
+        report_count += 1;
+    }
+};
+
+test "GL error boundary records caller flags without consuming a later provider error" {
+    const errors = [_]u32{ 0x500, 0x501, 0, 0x505 };
+    GlErrorTestProbe.reset(&errors, 0);
+    try consumePriorGlErrors(GlErrorTestProbe.query, GlErrorTestProbe.report);
+    try std.testing.expectEqual(@as(usize, 3), GlErrorTestProbe.queries);
+    try std.testing.expectEqualSlices(u32, errors[0..2], GlErrorTestProbe.reported[0..GlErrorTestProbe.report_count]);
+    const provider_error = GlErrorTestProbe.query();
+    try std.testing.expectEqual(@as(u32, 0x505), provider_error);
+    try std.testing.expectError(error.GlyphUploadFailed, checkGlyphUploadError(provider_error));
+}
+
+test "GL error boundary refuses a non-clearing source after bounded queries" {
+    GlErrorTestProbe.reset(&.{}, 0x502);
+    try std.testing.expectError(
+        error.GlErrorBoundaryFailed,
+        consumePriorGlErrors(GlErrorTestProbe.query, GlErrorTestProbe.report),
+    );
+    try std.testing.expectEqual(@as(usize, max_prior_gl_error_queries), GlErrorTestProbe.queries);
+    try std.testing.expectEqual(@as(usize, max_prior_gl_error_queries), GlErrorTestProbe.report_count);
+}
+
+test "glyph-upload check still fails for provider GL errors" {
+    try checkGlyphUploadError(0);
+    try std.testing.expectError(error.GlyphUploadFailed, checkGlyphUploadError(0x500));
+    try std.testing.expectError(error.GlyphUploadFailed, checkGlyphUploadError(0x505));
+}

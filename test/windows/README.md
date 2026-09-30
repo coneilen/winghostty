@@ -283,6 +283,19 @@ recover when supported data is reinstalled. Supported cases require real
 white foreground ink and the supplied background; no pseudo-glyph fallback
 or relaxed color expectation is used.
 
+The same executable accepts `--glyph-errors` for two offscreen controls on
+fresh, unrendered surfaces: a clean context and a caller-primed
+`GL_INVALID_ENUM` that changes no rendering state. Neither consumes that
+primed error before provider rendering. Both must succeed on the initial
+glyph-cache miss, present, restore the WGL binding, and paint actual narrow
+and wide white ink over the supplied background. Direct Zig host tests also
+seed ambient Win32 errors 0 and 5 and require glyph-upload failure to report
+`WINGHOSTTY_RENDERER_ERROR` with `ERROR_GEN_FAILURE` (31).
+`--glyph-offscreen` runs these two controls and the capacity cases together
+with the existing VT cell-color/distinctness and v2 glyph contracts, keeping
+the parent hidden throughout. The full runner still shows its parent and
+also includes the new controls.
+
 For a retained, focused executable (use your own build/cache/output paths):
 
 ```powershell
@@ -290,7 +303,10 @@ For a retained, focused executable (use your own build/cache/output paths):
 .\scripts\dev-windows.cmd zig build -Demit-lib-vt=true
 .\scripts\dev-windows.cmd zig cc -target x86_64-windows-msvc -I include test\windows\win32-host-renderer.c zig-out\lib\winghostty-win32-host.lib zig-out\lib\ghostty-vt.lib -luser32 -lgdi32 -lopengl32 -lkernel32 -limm32 -loleaut32 -lole32 -luiautomationcore -lws2_32 -lbcrypt -o zig-out\bin\win32-host-glyph-capacity.exe
 .\zig-out\bin\win32-host-glyph-capacity.exe --glyph-capacity
+.\zig-out\bin\win32-host-glyph-capacity.exe --glyph-errors
+.\zig-out\bin\win32-host-glyph-capacity.exe --glyph-offscreen
 .\scripts\dev-windows.cmd zig test src\renderer\win32_glyph.zig -lc -lgdi32 -lkernel32 -luser32
+.\scripts\dev-windows.cmd zig test src\win32_host.zig -lc -luser32 -lkernel32 -lgdi32 -lopengl32 -lole32 -loleaut32 --test-filter glyph-upload
 ```
 
 Pixel evidence is deterministic offscreen readback, not proof of actual

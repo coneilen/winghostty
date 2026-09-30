@@ -115,6 +115,7 @@ const MK_MBUTTON: u32 = 0x0010;
 const MK_XBUTTON1: u32 = 0x0020;
 const MK_XBUTTON2: u32 = 0x0040;
 const max_input_text_bytes: u32 = 16 * 1024 * 1024;
+const ERROR_GEN_FAILURE: DWORD = 31;
 const ERROR_NOT_SUPPORTED: DWORD = 50;
 
 const TrackMouseEventArgs = extern struct {
@@ -1319,8 +1320,12 @@ fn claimRenderThread(host: *HostState) Result {
 }
 
 fn rendererResult(surface: *SurfaceState, err: win32_context.Error) Result {
-    // A deliberate capacity refusal has no failing Win32 call to query.
-    surface.last_error.store(if (err == error.GlyphDimensionsUnsupported) ERROR_NOT_SUPPORTED else GetLastError(), .release);
+    // GL failures and deliberate refusal have no failing Win32 call to query.
+    surface.last_error.store(switch (err) {
+        error.GlyphDimensionsUnsupported => ERROR_NOT_SUPPORTED,
+        error.GlyphUploadFailed, error.GlErrorBoundaryFailed => ERROR_GEN_FAILURE,
+        else => GetLastError(),
+    }, .release);
     return switch (err) {
         error.WrongThread => result_wrong_thread,
         error.Destroying => result_shutting_down,
@@ -4477,6 +4482,33 @@ pub export fn winghostty_host_drain(
     if (result != result_ok) return result;
     if (out_drained) |count| count.* = 0;
     return result_ok;
+}
+
+fn expectGlyphUploadDiagnostic(ambient_error: DWORD) !void {
+    const kernel32 = struct {
+        extern "kernel32" fn SetLastError(value: DWORD) callconv(.winapi) void;
+    };
+    const previous_error = GetLastError();
+    defer kernel32.SetLastError(previous_error);
+    var state: SurfaceState = undefined;
+    state.last_error = .init(0);
+    kernel32.SetLastError(ambient_error);
+    try std.testing.expectEqual(ambient_error, GetLastError());
+    const result = rendererResult(&state, error.GlyphUploadFailed);
+    const diagnostic = state.last_error.load(.acquire);
+    std.debug.print("glyph-upload diagnostic ambient={d} result={d} diagnostic={d} expected=31\n", .{
+        ambient_error, result, diagnostic,
+    });
+    try std.testing.expectEqual(result_renderer_error, result);
+    try std.testing.expectEqual(@as(DWORD, 31), diagnostic);
+}
+
+test "glyph-upload diagnostic ignores zero ambient error" {
+    try expectGlyphUploadDiagnostic(0);
+}
+
+test "glyph-upload diagnostic ignores stale ambient error" {
+    try expectGlyphUploadDiagnostic(5);
 }
 
 test "SurfaceOptions copies caller-owned strings" {
