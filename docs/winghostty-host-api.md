@@ -34,8 +34,9 @@ independent of GraphCode product types.
   not clear, rendering is refused before frame/cache mutation with
   `WINGHOSTTY_RENDERER_ERROR` and Win32 `ERROR_GEN_FAILURE`. Embedders that need
   their own error flags should inspect them before calling `render`.
-  New glyph texture creation/upload errors still fail rendering, retain the
-  captured GL code in diagnostics, and report `ERROR_GEN_FAILURE` through
+  Glyph rasterization and texture creation/upload errors still fail rendering.
+  Raster error names and captured GL codes remain in diagnostics; these
+  failures report `ERROR_GEN_FAILURE` through
   `winghostty_surface_get_last_error`, not an ambient Win32 last-error value.
 - Scoped render and presentation save and restore the prior WGL binding, so a
   persistent context on one surface remains current across another surface's

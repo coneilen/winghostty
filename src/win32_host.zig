@@ -1320,10 +1320,13 @@ fn claimRenderThread(host: *HostState) Result {
 }
 
 fn rendererResult(surface: *SurfaceState, err: win32_context.Error) Result {
-    // GL failures and deliberate refusal have no failing Win32 call to query.
+    // Glyph failures and refusal have no reliable ambient Win32 code.
     surface.last_error.store(switch (err) {
         error.GlyphDimensionsUnsupported => ERROR_NOT_SUPPORTED,
-        error.GlyphUploadFailed, error.GlErrorBoundaryFailed => ERROR_GEN_FAILURE,
+        error.GlyphRasterFailed,
+        error.GlyphUploadFailed,
+        error.GlErrorBoundaryFailed,
+        => ERROR_GEN_FAILURE,
         else => GetLastError(),
     }, .release);
     return switch (err) {
@@ -4484,7 +4487,7 @@ pub export fn winghostty_host_drain(
     return result_ok;
 }
 
-fn expectGlyphUploadDiagnostic(ambient_error: DWORD) !void {
+fn expectRendererFailureDiagnostic(err: win32_context.Error, ambient_error: DWORD) !void {
     const kernel32 = struct {
         extern "kernel32" fn SetLastError(value: DWORD) callconv(.winapi) void;
     };
@@ -4494,21 +4497,37 @@ fn expectGlyphUploadDiagnostic(ambient_error: DWORD) !void {
     state.last_error = .init(0);
     kernel32.SetLastError(ambient_error);
     try std.testing.expectEqual(ambient_error, GetLastError());
-    const result = rendererResult(&state, error.GlyphUploadFailed);
+    const result = rendererResult(&state, err);
     const diagnostic = state.last_error.load(.acquire);
-    std.debug.print("glyph-upload diagnostic ambient={d} result={d} diagnostic={d} expected=31\n", .{
-        ambient_error, result, diagnostic,
+    std.debug.print("renderer-diagnostic variant={s} ambient={d} result={d} diagnostic={d} expected=31\n", .{
+        @errorName(err), ambient_error, result, diagnostic,
     });
     try std.testing.expectEqual(result_renderer_error, result);
     try std.testing.expectEqual(@as(DWORD, 31), diagnostic);
 }
 
-test "glyph-upload diagnostic ignores zero ambient error" {
-    try expectGlyphUploadDiagnostic(0);
+test "renderer-diagnostic upload ignores zero ambient error" {
+    try expectRendererFailureDiagnostic(error.GlyphUploadFailed, 0);
 }
 
-test "glyph-upload diagnostic ignores stale ambient error" {
-    try expectGlyphUploadDiagnostic(5);
+test "renderer-diagnostic upload ignores stale ambient error" {
+    try expectRendererFailureDiagnostic(error.GlyphUploadFailed, 5);
+}
+
+test "renderer-diagnostic raster ignores zero ambient error" {
+    try expectRendererFailureDiagnostic(error.GlyphRasterFailed, 0);
+}
+
+test "renderer-diagnostic raster ignores stale ambient error" {
+    try expectRendererFailureDiagnostic(error.GlyphRasterFailed, 5);
+}
+
+test "renderer-diagnostic boundary ignores zero ambient error" {
+    try expectRendererFailureDiagnostic(error.GlErrorBoundaryFailed, 0);
+}
+
+test "renderer-diagnostic boundary ignores stale ambient error" {
+    try expectRendererFailureDiagnostic(error.GlErrorBoundaryFailed, 5);
 }
 
 test "SurfaceOptions copies caller-owned strings" {

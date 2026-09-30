@@ -289,7 +289,8 @@ fresh, unrendered surfaces: a clean context and a caller-primed
 primed error before provider rendering. Both must succeed on the initial
 glyph-cache miss, present, restore the WGL binding, and paint actual narrow
 and wide white ink over the supplied background. Direct Zig host tests also
-seed ambient Win32 errors 0 and 5 and require glyph-upload failure to report
+seed ambient Win32 errors 0 and 5 for all three generic renderer failure
+variants (raster, upload, and GL error boundary). All six controls require
 `WINGHOSTTY_RENDERER_ERROR` with `ERROR_GEN_FAILURE` (31).
 `--glyph-offscreen` runs these two controls and the capacity cases together
 with the existing VT cell-color/distinctness and v2 glyph contracts, keeping
@@ -306,7 +307,7 @@ For a retained, focused executable (use your own build/cache/output paths):
 .\zig-out\bin\win32-host-glyph-capacity.exe --glyph-errors
 .\zig-out\bin\win32-host-glyph-capacity.exe --glyph-offscreen
 .\scripts\dev-windows.cmd zig test src\renderer\win32_glyph.zig -lc -lgdi32 -lkernel32 -luser32
-.\scripts\dev-windows.cmd zig test src\win32_host.zig -lc -luser32 -lkernel32 -lgdi32 -lopengl32 -lole32 -loleaut32 --test-filter glyph-upload
+.\scripts\dev-windows.cmd zig test src\win32_host.zig -lc -luser32 -lkernel32 -lgdi32 -lopengl32 -lole32 -loleaut32 --test-filter renderer-diagnostic
 ```
 
 Pixel evidence is deterministic offscreen readback, not proof of actual
