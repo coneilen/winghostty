@@ -8,6 +8,7 @@
 const std = @import("std");
 const win32_types = @import("../apprt/win32_types.zig");
 const glyph = @import("win32_glyph.zig");
+const log = std.log.scoped(.win32_context);
 
 const HWND = win32_types.HWND;
 const HDC = win32_types.HDC;
@@ -41,6 +42,7 @@ const GL_CLAMP: i32 = 0x2900;
 const GL_TEXTURE_ENV: u32 = 0x2300;
 const GL_TEXTURE_ENV_MODE: u32 = 0x2200;
 const GL_MODULATE: i32 = 0x2100;
+const GL_MAX_TEXTURE_SIZE: u32 = 0x0D33;
 
 const PIXELFORMATDESCRIPTOR = extern struct {
     nSize: WORD,
@@ -136,6 +138,8 @@ extern "opengl32" fn glTexParameteri(
 extern "opengl32" fn glTexEnvi(target: u32, name: u32, value: i32) callconv(.winapi) void;
 extern "opengl32" fn glPixelStorei(name: u32, value: i32) callconv(.winapi) void;
 extern "opengl32" fn glTexCoord2f(s: f32, t: f32) callconv(.winapi) void;
+extern "opengl32" fn glGetIntegerv(name: u32, value: *i32) callconv(.winapi) void;
+extern "opengl32" fn glGetError() callconv(.winapi) u32;
 
 pub const Error = error{
     GetDCFailed,
@@ -147,7 +151,33 @@ pub const Error = error{
     SwapBuffersFailed,
     WrongThread,
     Destroying,
+    GlyphDimensionsUnsupported,
+    GlyphRasterFailed,
+    GlyphUploadFailed,
+    GlErrorBoundaryFailed,
 };
+
+const max_prior_gl_error_queries = 16;
+
+fn consumePriorGlErrors(
+    comptime query_error: fn () callconv(.winapi) u32,
+    comptime report_error: fn (u32) void,
+) Error!void {
+    for (0..max_prior_gl_error_queries) |_| {
+        const gl_error = query_error();
+        if (gl_error == 0) return;
+        report_error(gl_error);
+    }
+    return error.GlErrorBoundaryFailed;
+}
+
+fn reportCallerGlError(gl_error: u32) void {
+    log.warn("consumed pre-existing caller GL error before provider render gl_error=0x{x}", .{gl_error});
+}
+
+fn checkGlyphUploadError(gl_error: u32) Error!void {
+    if (gl_error != 0) return error.GlyphUploadFailed;
+}
 
 pub const Theme = enum(i32) {
     system = 0,
@@ -282,16 +312,19 @@ const GlyphCache = struct {
         self: *GlyphCache,
         key: glyph.CacheKey,
         coverage: glyph.Coverage,
-    ) ?*Entry {
+        texture_limit: u32,
+    ) Error!*Entry {
         // OpenGL 1.1 has no non-power-of-two texture support, so the
         // coverage is padded and addressed with partial texture coordinates.
-        const texture_width = glyph.nextPowerOfTwo(coverage.width);
-        const texture_height = glyph.nextPowerOfTwo(coverage.height);
-        const texel_count = @as(usize, texture_width) *
-            @as(usize, texture_height);
-        if (texel_count > max_glyph_texels) return null;
-
-        var texels: []u8 = self.staging[0 .. texel_count * 2];
+        const layout = glyph.textureLayout(coverage.width, coverage.height, texture_limit, max_glyph_texels) catch |err| {
+            log.err("glyph upload dimensions rejected raster={d}x{d} texture_limit={d} texel_limit={d}: {s}", .{
+                coverage.width, coverage.height, texture_limit, max_glyph_texels, @errorName(err),
+            });
+            return error.GlyphDimensionsUnsupported;
+        };
+        const texture_width = layout.width;
+        const texture_height = layout.height;
+        var texels: []u8 = self.staging[0..layout.byte_count];
         @memset(texels, 0);
         var y: u32 = 0;
         while (y < coverage.height) : (y += 1) {
@@ -307,7 +340,12 @@ const GlyphCache = struct {
 
         var handle: [1]u32 = .{0};
         glGenTextures(1, &handle);
-        if (handle[0] == 0) return null;
+        if (handle[0] == 0) {
+            const gl_error = glGetError();
+            log.err("glyph texture creation failed gl_error=0x{x}", .{gl_error});
+            return error.GlyphUploadFailed;
+        }
+        errdefer glDeleteTextures(1, &handle);
         glBindTexture(GL_TEXTURE_2D, handle[0]);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -325,6 +363,11 @@ const GlyphCache = struct {
             GL_UNSIGNED_BYTE,
             texels.ptr,
         );
+        const gl_error = glGetError();
+        checkGlyphUploadError(gl_error) catch |err| {
+            log.err("glyph texture upload failed padded={d}x{d} gl_error=0x{x}", .{ texture_width, texture_height, gl_error });
+            return err;
+        };
 
         const entry = self.reserve();
         self.clock += 1;
@@ -341,7 +384,7 @@ const GlyphCache = struct {
     }
 };
 
-/// Upper bound on a single glyph texture, which bounds the stack staging
+/// Upper bound on a single glyph texture, which bounds the cache staging
 /// buffer used for the padded upload.
 const max_glyph_texels: usize = 256 * 256;
 
@@ -548,17 +591,29 @@ pub const Context = struct {
             return error.MakeCurrentFailed;
         }
 
-        const width: i32 = @intCast(@min(state.width, @as(u32, std.math.maxInt(i32))));
-        const height: i32 = @intCast(@min(state.height, @as(u32, std.math.maxInt(i32))));
-        glViewport(0, 0, width, height);
-        const background = backgroundColor(state.theme);
-        glClearColor(background[0], background[1], background[2], 1.0);
-        glClear(GL_COLOR_BUFFER_BIT);
-
-        renderTerminalCells(self, state);
-
         var operation_error: ?Error = null;
-        if (SwapBuffers(self.hdc) == 0) operation_error = error.SwapBuffersFailed;
+        consumePriorGlErrors(glGetError, reportCallerGlError) catch |err| {
+            log.err("caller GL error boundary did not clear within {d} queries", .{max_prior_gl_error_queries});
+            operation_error = err;
+        };
+        const texture_limit = if (operation_error == null) preflightGlyphDimensions(state) catch |err| failed: {
+            operation_error = err;
+            break :failed 0;
+        } else 0;
+        if (operation_error == null) {
+            const width: i32 = @intCast(@min(state.width, @as(u32, std.math.maxInt(i32))));
+            const height: i32 = @intCast(@min(state.height, @as(u32, std.math.maxInt(i32))));
+            glViewport(0, 0, width, height);
+            const background = backgroundColor(state.theme);
+            glClearColor(background[0], background[1], background[2], 1.0);
+            glClear(GL_COLOR_BUFFER_BIT);
+            renderTerminalCells(self, state, texture_limit) catch |err| {
+                operation_error = err;
+            };
+            if (operation_error == null and SwapBuffers(self.hdc) == 0) {
+                operation_error = error.SwapBuffersFailed;
+            }
+        }
         if (rebound) {
             restoreCurrent(previous) catch |err| {
                 if (operation_error == null) operation_error = err;
@@ -567,12 +622,14 @@ pub const Context = struct {
         if (operation_error) |err| return err;
     }
 
-    fn renderTerminalCells(self: *Context, state: RenderState) void {
+    const Grid = struct { columns: u32, rows: u32 };
+
+    fn terminalGrid(state: RenderState) ?Grid {
         if (state.terminal_columns == 0 or
             state.terminal_rows == 0 or
             state.terminal_cells.len == 0)
         {
-            return;
+            return null;
         }
 
         const columns = @min(
@@ -586,7 +643,78 @@ pub const Context = struct {
                 columns,
             ),
         );
-        if (columns == 0 or rows == 0) return;
+        if (columns == 0 or rows == 0) return null;
+        return .{ .columns = columns, .rows = rows };
+    }
+
+    const InkRun = struct {
+        cell: TerminalCell,
+        span: TerminalGlyph,
+        text: []const u8,
+        cells_wide: u32,
+    };
+
+    fn inkRun(state: RenderState, index: usize, columns: u32) ?InkRun {
+        const span = state.terminal_glyphs[index];
+        if (span.width == glyph.width_continuation or span.length == 0) return null;
+        const cell = state.terminal_cells[index];
+        if (cell.codepoint == 0 or cell.codepoint == ' ') return null;
+        const start: usize = span.offset;
+        const end = std.math.add(usize, start, span.length) catch return null;
+        if (end > state.terminal_text.len) return null;
+        const cells_wide: u32 = if (span.width == glyph.width_wide) 2 else 1;
+        if (index % columns + cells_wide > columns) return null;
+        return .{ .cell = cell, .span = span, .text = state.terminal_text[start..end], .cells_wide = cells_wide };
+    }
+
+    /// Refusal happens before clear, cache flushing, raster allocation, or swap.
+    fn preflightGlyphDimensions(state: RenderState) Error!u32 {
+        if (!state.hasGlyphs()) return 0;
+        const grid = terminalGrid(state) orelse return 0;
+        const options = glyph.RasterOptions{
+            .cell_width = state.width / grid.columns,
+            .cell_height = state.height / grid.rows,
+            .clip_to_cell = false,
+        };
+        // Zero-pixel cells still use the legacy path, as before.
+        if (options.cell_width == 0 or options.cell_height == 0) return 0;
+        var texture_limit: u32 = 0;
+        var checked_narrow = false;
+        var checked_wide = false;
+        for (0..@as(usize, grid.columns) * grid.rows) |index| {
+            const run = inkRun(state, index, grid.columns) orelse continue;
+            const checked = if (run.cells_wide == 2) &checked_wide else &checked_narrow;
+            if (checked.*) continue;
+            const dimensions = glyph.rasterDimensions(run.span.width, options) catch |err| {
+                log.err("unsupported glyph metrics cell={d}x{d} columns={d} raster_cell_limit={d}: {s}", .{
+                    options.cell_width, options.cell_height, run.cells_wide, glyph.max_raster_cell_dimension, @errorName(err),
+                });
+                return error.GlyphDimensionsUnsupported;
+            };
+            if (texture_limit == 0) {
+                var limit: i32 = 0;
+                glGetIntegerv(GL_MAX_TEXTURE_SIZE, &limit);
+                if (limit <= 0) {
+                    log.err("invalid GL glyph texture limit: {d}", .{limit});
+                    return error.GlyphDimensionsUnsupported;
+                }
+                texture_limit = @intCast(limit);
+            }
+            _ = glyph.textureLayout(dimensions.width, dimensions.height, texture_limit, max_glyph_texels) catch |err| {
+                log.err("unsupported glyph dimensions cell={d}x{d} raster={d}x{d} texture_limit={d} texel_limit={d}: {s}", .{
+                    options.cell_width, options.cell_height, dimensions.width, dimensions.height, texture_limit, max_glyph_texels, @errorName(err),
+                });
+                return error.GlyphDimensionsUnsupported;
+            };
+            checked.* = true;
+        }
+        return texture_limit;
+    }
+
+    fn renderTerminalCells(self: *Context, state: RenderState, texture_limit: u32) Error!void {
+        const grid = terminalGrid(state) orelse return;
+        const columns = grid.columns;
+        const rows = grid.rows;
 
         const cell_width = 2.0 / @as(f32, @floatFromInt(columns));
         const cell_height = 2.0 / @as(f32, @floatFromInt(rows));
@@ -613,7 +741,7 @@ pub const Context = struct {
             pixel_cell_width > 0 and
             pixel_cell_height > 0)
         {
-            self.renderGlyphInk(
+            try self.renderGlyphInk(
                 state,
                 columns,
                 rows,
@@ -621,6 +749,7 @@ pub const Context = struct {
                 cell_height,
                 pixel_cell_width,
                 pixel_cell_height,
+                texture_limit,
             );
             return;
         }
@@ -641,7 +770,8 @@ pub const Context = struct {
         cell_height: f32,
         pixel_cell_width: u32,
         pixel_cell_height: u32,
-    ) void {
+        texture_limit: u32,
+    ) Error!void {
         self.glyph_cache.syncMetrics(pixel_cell_width, pixel_cell_height);
 
         glEnable(GL_TEXTURE_2D);
@@ -657,49 +787,36 @@ pub const Context = struct {
         for (0..@intCast(rows)) |row| {
             for (0..@intCast(columns)) |column| {
                 const index = row * @as(usize, @intCast(columns)) + column;
-                const span = state.terminal_glyphs[index];
-                // Continuation cells never carry ink of their own; the wide
-                // lead's raster already covers both columns.
-                if (span.width == glyph.width_continuation) continue;
-                if (span.length == 0) continue;
-
-                const cell = state.terminal_cells[index];
-                if (cell.codepoint == 0 or cell.codepoint == ' ') continue;
-
-                const start: usize = span.offset;
-                const end = start + @as(usize, span.length);
-                if (end > state.terminal_text.len) continue;
-                const run = state.terminal_text[start..end];
-
-                const cells_wide: u32 = if (span.width == glyph.width_wide) 2 else 1;
-                if (column + cells_wide > columns) continue;
+                const run = inkRun(state, index, columns) orelse continue;
 
                 const options = glyph.RasterOptions{
                     .cell_width = pixel_cell_width,
                     .cell_height = pixel_cell_height,
                     .clip_to_cell = false,
                 };
-                const key = glyph.cacheKey(run, span.width, options);
+                const key = glyph.cacheKey(run.text, run.span.width, options);
                 const entry = self.glyph_cache.find(key) orelse cached: {
                     var coverage = glyph.rasterize(
                         raster_allocator,
-                        run,
-                        span.width,
+                        run.text,
+                        run.span.width,
                         options,
-                    ) catch continue;
+                    ) catch |err| {
+                        log.err("glyph raster failed cell={d}x{d}: {s}", .{ pixel_cell_width, pixel_cell_height, @errorName(err) });
+                        return error.GlyphRasterFailed;
+                    };
                     defer coverage.deinit(raster_allocator);
-                    break :cached self.glyph_cache.upload(key, coverage) orelse
-                        continue;
+                    break :cached try self.glyph_cache.upload(key, coverage, texture_limit);
                 };
 
                 const left = -1.0 + @as(f32, @floatFromInt(column)) * cell_width;
                 const top = 1.0 - @as(f32, @floatFromInt(row)) * cell_height;
-                const quad_width = cell_width * @as(f32, @floatFromInt(cells_wide));
+                const quad_width = cell_width * @as(f32, @floatFromInt(run.cells_wide));
                 const max_s = @as(f32, @floatFromInt(entry.glyph_width)) /
                     @as(f32, @floatFromInt(entry.texture_width));
                 const max_t = @as(f32, @floatFromInt(entry.glyph_height)) /
                     @as(f32, @floatFromInt(entry.texture_height));
-                const foreground = foregroundColor(cell);
+                const foreground = foregroundColor(run.cell);
 
                 glBindTexture(GL_TEXTURE_2D, entry.texture);
                 glBegin(GL_QUADS);
@@ -885,3 +1002,56 @@ threadlocal var persistent_context: ?*Context = null;
 /// Transient allocator for glyph rasterization. Coverage buffers live only
 /// between the GDI raster and the texture upload on a cache miss.
 const raster_allocator = std.heap.page_allocator;
+
+const GlErrorTestProbe = struct {
+    var errors: []const u32 = &.{};
+    var fallback: u32 = 0;
+    var queries: usize = 0;
+    var report_count: usize = 0;
+    var reported: [max_prior_gl_error_queries]u32 = undefined;
+
+    fn reset(values: []const u32, fallback_error: u32) void {
+        errors = values;
+        fallback = fallback_error;
+        queries = 0;
+        report_count = 0;
+    }
+
+    fn query() callconv(.winapi) u32 {
+        const index = queries;
+        queries += 1;
+        return if (index < errors.len) errors[index] else fallback;
+    }
+
+    fn report(gl_error: u32) void {
+        reported[report_count] = gl_error;
+        report_count += 1;
+    }
+};
+
+test "GL error boundary records caller flags without consuming a later provider error" {
+    const errors = [_]u32{ 0x500, 0x501, 0, 0x505 };
+    GlErrorTestProbe.reset(&errors, 0);
+    try consumePriorGlErrors(GlErrorTestProbe.query, GlErrorTestProbe.report);
+    try std.testing.expectEqual(@as(usize, 3), GlErrorTestProbe.queries);
+    try std.testing.expectEqualSlices(u32, errors[0..2], GlErrorTestProbe.reported[0..GlErrorTestProbe.report_count]);
+    const provider_error = GlErrorTestProbe.query();
+    try std.testing.expectEqual(@as(u32, 0x505), provider_error);
+    try std.testing.expectError(error.GlyphUploadFailed, checkGlyphUploadError(provider_error));
+}
+
+test "GL error boundary refuses a non-clearing source after bounded queries" {
+    GlErrorTestProbe.reset(&.{}, 0x502);
+    try std.testing.expectError(
+        error.GlErrorBoundaryFailed,
+        consumePriorGlErrors(GlErrorTestProbe.query, GlErrorTestProbe.report),
+    );
+    try std.testing.expectEqual(@as(usize, max_prior_gl_error_queries), GlErrorTestProbe.queries);
+    try std.testing.expectEqual(@as(usize, max_prior_gl_error_queries), GlErrorTestProbe.report_count);
+}
+
+test "glyph-upload check still fails for provider GL errors" {
+    try checkGlyphUploadError(0);
+    try std.testing.expectError(error.GlyphUploadFailed, checkGlyphUploadError(0x500));
+    try std.testing.expectError(error.GlyphUploadFailed, checkGlyphUploadError(0x505));
+}

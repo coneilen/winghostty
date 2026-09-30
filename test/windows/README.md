@@ -271,3 +271,46 @@ B, destroys A on the UI thread, and switches B again.
 ```powershell
 .\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\test\windows\run-win32-host-renderer.ps1
 ```
+
+The renderer executable also accepts `--glyph-capacity` to run only its
+11 capacity cases without showing or focusing its parent window. This
+exercises valid public v2 snapshots at normal, exact-capacity, and first
+oversized padded dimensions, narrow/wide differences, and oversized blanks.
+Unsupported cases must return `WINGHOSTTY_RENDERER_ERROR` with
+`ERROR_NOT_SUPPORTED`, preserve the prior frame at unchanged HWND bounds,
+leave the present count unchanged, restore the scoped WGL binding, and
+recover when supported data is reinstalled. Supported cases require real
+white foreground ink and the supplied background; no pseudo-glyph fallback
+or relaxed color expectation is used.
+
+The same executable accepts `--glyph-errors` for two offscreen controls on
+fresh, unrendered surfaces: a clean context and a caller-primed
+`GL_INVALID_ENUM` that changes no rendering state. Neither consumes that
+primed error before provider rendering. Both must succeed on the initial
+glyph-cache miss, present, restore the WGL binding, and paint actual narrow
+and wide white ink over the supplied background. Direct Zig host tests also
+seed ambient Win32 errors 0 and 5 for all three generic renderer failure
+variants (raster, upload, and GL error boundary). All six controls require
+`WINGHOSTTY_RENDERER_ERROR` with `ERROR_GEN_FAILURE` (31).
+`--glyph-offscreen` runs these two controls and the capacity cases together
+with the existing VT cell-color/distinctness and v2 glyph contracts, keeping
+the parent hidden throughout. The full runner still shows its parent and
+also includes the new controls.
+
+For a retained, focused executable (use your own build/cache/output paths):
+
+```powershell
+.\scripts\dev-windows.cmd zig build -Demit-win32-host=true
+.\scripts\dev-windows.cmd zig build -Demit-lib-vt=true
+.\scripts\dev-windows.cmd zig cc -target x86_64-windows-msvc -I include test\windows\win32-host-renderer.c zig-out\lib\winghostty-win32-host.lib zig-out\lib\ghostty-vt.lib -luser32 -lgdi32 -lopengl32 -lkernel32 -limm32 -loleaut32 -lole32 -luiautomationcore -lws2_32 -lbcrypt -o zig-out\bin\win32-host-glyph-capacity.exe
+.\zig-out\bin\win32-host-glyph-capacity.exe --glyph-capacity
+.\zig-out\bin\win32-host-glyph-capacity.exe --glyph-errors
+.\zig-out\bin\win32-host-glyph-capacity.exe --glyph-offscreen
+.\scripts\dev-windows.cmd zig test src\renderer\win32_glyph.zig -lc -lgdi32 -lkernel32 -luser32
+.\scripts\dev-windows.cmd zig test src\win32_host.zig -lc -luser32 -lkernel32 -lgdi32 -lopengl32 -lole32 -loleaut32 --test-filter renderer-diagnostic
+```
+
+Pixel evidence is deterministic offscreen readback, not proof of actual
+on-screen rendering or cross-platform parity. The default full renderer
+contract still shows its test parent and runs three fresh processes; in a
+shared desktop it requires exclusive coordination.

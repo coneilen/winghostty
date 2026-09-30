@@ -115,6 +115,8 @@ const MK_MBUTTON: u32 = 0x0010;
 const MK_XBUTTON1: u32 = 0x0020;
 const MK_XBUTTON2: u32 = 0x0040;
 const max_input_text_bytes: u32 = 16 * 1024 * 1024;
+const ERROR_GEN_FAILURE: DWORD = 31;
+const ERROR_NOT_SUPPORTED: DWORD = 50;
 
 const TrackMouseEventArgs = extern struct {
     cbSize: u32,
@@ -1318,7 +1320,15 @@ fn claimRenderThread(host: *HostState) Result {
 }
 
 fn rendererResult(surface: *SurfaceState, err: win32_context.Error) Result {
-    surface.last_error.store(GetLastError(), .release);
+    // Glyph failures and refusal have no reliable ambient Win32 code.
+    surface.last_error.store(switch (err) {
+        error.GlyphDimensionsUnsupported => ERROR_NOT_SUPPORTED,
+        error.GlyphRasterFailed,
+        error.GlyphUploadFailed,
+        error.GlErrorBoundaryFailed,
+        => ERROR_GEN_FAILURE,
+        else => GetLastError(),
+    }, .release);
     return switch (err) {
         error.WrongThread => result_wrong_thread,
         error.Destroying => result_shutting_down,
@@ -4475,6 +4485,49 @@ pub export fn winghostty_host_drain(
     if (result != result_ok) return result;
     if (out_drained) |count| count.* = 0;
     return result_ok;
+}
+
+fn expectRendererFailureDiagnostic(err: win32_context.Error, ambient_error: DWORD) !void {
+    const kernel32 = struct {
+        extern "kernel32" fn SetLastError(value: DWORD) callconv(.winapi) void;
+    };
+    const previous_error = GetLastError();
+    defer kernel32.SetLastError(previous_error);
+    var state: SurfaceState = undefined;
+    state.last_error = .init(0);
+    kernel32.SetLastError(ambient_error);
+    try std.testing.expectEqual(ambient_error, GetLastError());
+    const result = rendererResult(&state, err);
+    const diagnostic = state.last_error.load(.acquire);
+    std.debug.print("renderer-diagnostic variant={s} ambient={d} result={d} diagnostic={d} expected=31\n", .{
+        @errorName(err), ambient_error, result, diagnostic,
+    });
+    try std.testing.expectEqual(result_renderer_error, result);
+    try std.testing.expectEqual(@as(DWORD, 31), diagnostic);
+}
+
+test "renderer-diagnostic upload ignores zero ambient error" {
+    try expectRendererFailureDiagnostic(error.GlyphUploadFailed, 0);
+}
+
+test "renderer-diagnostic upload ignores stale ambient error" {
+    try expectRendererFailureDiagnostic(error.GlyphUploadFailed, 5);
+}
+
+test "renderer-diagnostic raster ignores zero ambient error" {
+    try expectRendererFailureDiagnostic(error.GlyphRasterFailed, 0);
+}
+
+test "renderer-diagnostic raster ignores stale ambient error" {
+    try expectRendererFailureDiagnostic(error.GlyphRasterFailed, 5);
+}
+
+test "renderer-diagnostic boundary ignores zero ambient error" {
+    try expectRendererFailureDiagnostic(error.GlErrorBoundaryFailed, 0);
+}
+
+test "renderer-diagnostic boundary ignores stale ambient error" {
+    try expectRendererFailureDiagnostic(error.GlErrorBoundaryFailed, 5);
 }
 
 test "SurfaceOptions copies caller-owned strings" {

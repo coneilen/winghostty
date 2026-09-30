@@ -390,6 +390,67 @@ pub const RasterOptions = struct {
     clip_to_cell: bool = true,
 };
 
+pub const max_raster_cell_dimension: u32 = 4096;
+
+pub const RasterDimensions = struct {
+    width: u32,
+    height: u32,
+    pixel_count: usize,
+    dib_bytes: usize,
+};
+
+pub fn rasterDimensions(width: u8, options: RasterOptions) error{InvalidMetrics}!RasterDimensions {
+    if (options.cell_width == 0 or options.cell_height == 0 or
+        options.cell_width > max_raster_cell_dimension or
+        options.cell_height > max_raster_cell_dimension)
+    {
+        return error.InvalidMetrics;
+    }
+    const columns: u32 = if (width == width_wide and !options.clip_to_cell) 2 else 1;
+    const bitmap_width = std.math.mul(u32, options.cell_width, columns) catch
+        return error.InvalidMetrics;
+    const pixel_count = std.math.mul(usize, bitmap_width, options.cell_height) catch
+        return error.InvalidMetrics;
+    return .{
+        .width = bitmap_width,
+        .height = options.cell_height,
+        .pixel_count = pixel_count,
+        .dib_bytes = std.math.mul(usize, pixel_count, 4) catch return error.InvalidMetrics,
+    };
+}
+
+pub const TextureLayout = struct {
+    width: u32,
+    height: u32,
+    texel_count: usize,
+    byte_count: usize,
+};
+
+pub fn textureLayout(
+    width: u32,
+    height: u32,
+    dimension_limit: u32,
+    texel_limit: usize,
+) error{ InvalidMetrics, TextureTooLarge }!TextureLayout {
+    if (width == 0 or height == 0) return error.InvalidMetrics;
+    const padded_width = try nextPowerOfTwo(width);
+    const padded_height = try nextPowerOfTwo(height);
+    if (padded_width > dimension_limit or padded_height > dimension_limit or
+        padded_width > std.math.maxInt(i32) or padded_height > std.math.maxInt(i32))
+    {
+        return error.TextureTooLarge;
+    }
+    const texels = std.math.mul(usize, padded_width, padded_height) catch
+        return error.TextureTooLarge;
+    if (texels > texel_limit) return error.TextureTooLarge;
+    return .{
+        .width = padded_width,
+        .height = padded_height,
+        .texel_count = texels,
+        .byte_count = std.math.mul(usize, texels, 2) catch return error.TextureTooLarge,
+    };
+}
+
 /// An 8-bit coverage bitmap, one byte per pixel, top-down.
 pub const Coverage = struct {
     width: u32,
@@ -440,19 +501,9 @@ pub fn rasterize(
     options: RasterOptions,
 ) RasterError!Coverage {
     if (text.len == 0) return error.EmptyRun;
-    if (options.cell_width == 0 or options.cell_height == 0) {
-        return error.InvalidMetrics;
-    }
-    if (options.cell_width > 4096 or options.cell_height > 4096) {
-        return error.InvalidMetrics;
-    }
-
-    const columns: u32 = if (width == width_wide and !options.clip_to_cell)
-        2
-    else
-        1;
-    const bitmap_width = options.cell_width * columns;
-    const bitmap_height = options.cell_height;
+    const dimensions = try rasterDimensions(width, options);
+    const bitmap_width = dimensions.width;
+    const bitmap_height = dimensions.height;
 
     const utf16 = std.unicode.utf8ToUtf16LeAlloc(alloc, text) catch |err| {
         return switch (err) {
@@ -492,9 +543,7 @@ pub fn rasterize(
     const previous_bitmap = SelectObject(hdc, bitmap);
     defer _ = SelectObject(hdc, previous_bitmap);
 
-    const byte_count: usize = @as(usize, bitmap_width) *
-        @as(usize, bitmap_height) * 4;
-    @memset(bits.?[0..byte_count], 0);
+    @memset(bits.?[0..dimensions.dib_bytes], 0);
 
     var logfont = std.mem.zeroes(LOGFONTW);
     // A positive lfHeight is a cell height request (it includes internal
@@ -543,7 +592,7 @@ pub fn rasterize(
     }
     _ = GdiFlush();
 
-    const pixels = try alloc.alloc(u8, @as(usize, bitmap_width) * bitmap_height);
+    const pixels = try alloc.alloc(u8, dimensions.pixel_count);
     errdefer alloc.free(pixels);
     var index: usize = 0;
     while (index < pixels.len) : (index += 1) {
@@ -579,9 +628,8 @@ fn setFaceName(destination: *[32]u16, face: []const u8) void {
 /// OpenGL 1.1 (including the Microsoft software implementation the host can
 /// fall back to) has no non-power-of-two texture support, so glyph coverage
 /// must be uploaded into a padded power-of-two texture.
-pub fn nextPowerOfTwo(value: u32) u32 {
-    if (value <= 1) return 1;
-    return @as(u32, 1) << @intCast(32 - @clz(value - 1));
+pub fn nextPowerOfTwo(value: u32) error{InvalidMetrics}!u32 {
+    return std.math.ceilPowerOfTwo(u32, @max(value, 1)) catch error.InvalidMetrics;
 }
 
 // -- Tests ------------------------------------------------------------------
@@ -865,11 +913,57 @@ test "glyph cache keys separate combining sequences and widths" {
 }
 
 test "power-of-two padding covers GL 1.1 texture limits" {
-    try testing.expectEqual(@as(u32, 1), nextPowerOfTwo(0));
-    try testing.expectEqual(@as(u32, 1), nextPowerOfTwo(1));
-    try testing.expectEqual(@as(u32, 16), nextPowerOfTwo(12));
-    try testing.expectEqual(@as(u32, 32), nextPowerOfTwo(24));
-    try testing.expectEqual(@as(u32, 32), nextPowerOfTwo(32));
+    try testing.expectEqual(@as(u32, 1), try nextPowerOfTwo(0));
+    try testing.expectEqual(@as(u32, 1), try nextPowerOfTwo(1));
+    try testing.expectEqual(@as(u32, 16), try nextPowerOfTwo(12));
+    try testing.expectEqual(@as(u32, 32), try nextPowerOfTwo(24));
+    try testing.expectEqual(@as(u32, 32), try nextPowerOfTwo(32));
+    try testing.expectEqual(@as(u32, 1) << 31, try nextPowerOfTwo(@as(u32, 1) << 31));
+    try testing.expectError(error.InvalidMetrics, nextPowerOfTwo((@as(u32, 1) << 31) + 1));
+    try testing.expectError(error.InvalidMetrics, nextPowerOfTwo(std.math.maxInt(u32)));
+}
+
+test "glyph capacity checked raster dimensions bound narrow and wide allocations" {
+    const maximum = RasterOptions{ .cell_width = 4096, .cell_height = 4096, .clip_to_cell = false };
+    const narrow = try rasterDimensions(width_narrow, maximum);
+    const wide = try rasterDimensions(width_wide, maximum);
+    try testing.expectEqual(@as(u32, 4096), narrow.width);
+    try testing.expectEqual(@as(u32, 8192), wide.width);
+    try testing.expectEqual(@as(usize, 33554432), wide.pixel_count);
+    try testing.expectEqual(@as(usize, 134217728), wide.dib_bytes);
+    for ([_]u32{ 0, 4097, std.math.maxInt(u32) }) |invalid| {
+        try testing.expectError(error.InvalidMetrics, rasterDimensions(width_wide, .{
+            .cell_width = invalid,
+            .cell_height = 4096,
+            .clip_to_cell = false,
+        }));
+        try testing.expectError(error.InvalidMetrics, rasterDimensions(width_narrow, .{
+            .cell_width = 4096,
+            .cell_height = invalid,
+        }));
+        try testing.expectError(error.InvalidMetrics, rasterize(testing.allocator, "e", width_narrow, .{
+            .cell_width = invalid,
+            .cell_height = invalid,
+        }));
+    }
+}
+
+test "glyph capacity texture boundaries include padding and actual GL limits" {
+    const limit = 256 * 256;
+    for ([_][2]u32{ .{ 256, 129 }, .{ 258, 128 }, .{ 256, 256 }, .{ 1024, 64 }, .{ 64, 1024 } }) |size| {
+        const layout = try textureLayout(size[0], size[1], 1024, limit);
+        try testing.expectEqual(@as(usize, limit), layout.texel_count);
+        try testing.expectEqual(@as(usize, limit * 2), layout.byte_count);
+    }
+    for ([_][2]u32{ .{ 258, 129 }, .{ 257, 256 }, .{ 1025, 64 }, .{ 64, 1025 } }) |size| {
+        try testing.expectError(error.TextureTooLarge, textureLayout(size[0], size[1], 4096, limit));
+    }
+    const control = try textureLayout(16, 32, 1024, limit);
+    try testing.expectEqual(@as(usize, 512), control.texel_count);
+    try testing.expectError(error.TextureTooLarge, textureLayout(258, 128, 256, limit));
+    try testing.expectError(error.InvalidMetrics, textureLayout(0, 32, 1024, limit));
+    try testing.expectError(error.InvalidMetrics, textureLayout(32, std.math.maxInt(u32), std.math.maxInt(u32), std.math.maxInt(usize)));
+    try testing.expectError(error.TextureTooLarge, textureLayout(@as(u32, 1) << 31, 1, std.math.maxInt(u32), std.math.maxInt(usize)));
 }
 
 test "GDI raster distinguishes a combining sequence from its base" {
