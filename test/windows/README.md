@@ -72,6 +72,13 @@ Unknown reservations and genuinely overlapping identities fail closed with
 owned-only typed guard state. An internal phase runtime seam exercises the
 actual observer, real PS5 record writer, collector and finalizer with the
 existing nine synthetic fixtures; it is not a native GUI replacement.
+Snapshot-to-handle acquisition handles only the exact `ProcessNotFound`
+error: a fresh available census must confirm the observed PID is absent,
+its owned parent reservation must cover creation, and no captured or
+parent-linked descendant may survive. That identity is recorded as
+observed/confirmed absent, never as a native handle reservation. Reused or
+still-present PIDs, inaccessible processes and unavailable/partial census
+remain failures with the original acquisition error and typed guard state.
 
 `scripts\setup-hosted-opengl.ps1` verifies the exact release asset, size and
 SHA256 from `fixtures\hosted-opengl-lock.json` before extraction. It stages

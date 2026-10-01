@@ -58,7 +58,7 @@ function Get-HostedOwnedProcesses($Known, [object[]] $Table, [scriptblock] $Reta
             if ($parents.Count -eq 1) {
                 $record=@{process_id=[int]$entry.ProcessId;parent_id=$parentId;started_at=$created.ToString('o')}
                 if ($RetainIdentity) {
-                    $record=& $RetainIdentity $entry
+                    $record=& $RetainIdentity $entry $parents[0] $Table
                     if ($record.process_id -ne $entry.ProcessId -or $record.parent_id -ne $parentId -or
                         -not (Test-HostedProcessCreationBinding ([datetime]$record.started_at) $created)) {
                         throw 'Retained descendant handle does not match its observed PID/parent/creation interval.'
@@ -89,6 +89,85 @@ function Get-HostedOwnedCleanup($Known, [object[]] $Table) {
     return @{available=$true;observed_process_count=$Known.Count;remaining_process_count=$live;processes=@($Known.Values)}
 }
 
+function Get-HostedRetainedIdentity {
+    [CmdletBinding()]
+    param($Entry, $Parent, [object[]] $ObservedTable, [hashtable] $HeldHandles,
+        [Parameter(Mandatory)] [scriptblock] $FreshCensus, [scriptblock] $AcquireProcess)
+    if (-not $AcquireProcess) { $AcquireProcess={param($id) Get-Process -Id $id -ErrorAction Stop} }
+    $created=([datetime]$Entry.CreationDate).ToUniversalTime()
+    try { $owned=& $AcquireProcess ([int]$Entry.ProcessId) }
+    catch {
+        $missing=$_
+        if ($_.Exception -isnot [Microsoft.PowerShell.Commands.ProcessCommandException] -or
+            $_.FullyQualifiedErrorId -notmatch '^NoProcessFoundForGivenId(?:,|$)' -or
+            $_.CategoryInfo.Category -ne [Management.Automation.ErrorCategory]::ObjectNotFound) {
+            throw
+        }
+        $state=@{process_id=[int]$Entry.ProcessId;parent_id=[int]$Entry.ParentProcessId
+            observed_started_at=$created.ToString('o');fresh_census_available=$null;fresh_pid_count=$null;surviving_related_count=$null}
+        $missing.Exception.Data['owned_guard_state']=$state
+        try {
+            $fresh=@(& $FreshCensus)
+            if ($fresh.Count -eq 0) { throw 'Fresh process census is empty, not confirmation of exit.' }
+            $state.fresh_census_available=$true
+        } catch {
+            $missing.Exception.Data['hosted_secondary_failures']=@(@{
+                phase='fresh acquisition census';type=$_.Exception.GetType().FullName;message=$_.Exception.Message
+            })
+            throw $missing
+        }
+        $current=@($fresh | Where-Object ProcessId -EQ $Entry.ProcessId)
+        $state.fresh_pid_count=$current.Count
+        if ($current.Count -ne 0) {
+            $state.reason='PID still exists or was reused; missing handle is not confirmed exit'
+            throw $missing
+        }
+        if ($Parent.process_id -ne $Entry.ParentProcessId -or -not $Parent.ContainsKey('pid_reserved_through') -or
+            $created -lt ([datetime]$Parent.started_at).ToUniversalTime() -or
+            $created -gt ([datetime]$Parent.pid_reserved_through).ToUniversalTime()) {
+            $state.reason='Observed parent has no retained-handle reservation covering this identity'
+            throw $missing
+        }
+        $observed=@{}
+        $observed[[int]$Entry.ProcessId]=$created
+        $changed=$true
+        while ($changed) {
+            $changed=$false
+            foreach ($row in $ObservedTable) {
+                if ($observed.ContainsKey([int]$row.ProcessId) -or -not $observed.ContainsKey([int]$row.ParentProcessId)) { continue }
+                $rowCreated=([datetime]$row.CreationDate).ToUniversalTime()
+                if ($rowCreated -lt $observed[[int]$row.ParentProcessId]) { continue }
+                $observed[[int]$row.ProcessId]=$rowCreated
+                $changed=$true
+            }
+        }
+        $related=@($fresh | Where-Object {
+            $observed.ContainsKey([int]$_.ProcessId) -or
+                ($observed.ContainsKey([int]$_.ParentProcessId) -and
+                    ([datetime]$_.CreationDate).ToUniversalTime() -ge $observed[[int]$_.ParentProcessId])
+        })
+        $state.surviving_related_count=$related.Count
+        if ($related.Count -ne 0) {
+            $state.reason='A captured or parent-linked descendant is still present; exit closure is unknown'
+            throw $missing
+        }
+        return @{process_id=[int]$Entry.ProcessId;parent_id=[int]$Entry.ParentProcessId;started_at=$created.ToString('o')
+            identity_capture='cim-observed-then-confirmed-absent'
+            disappearance_proof=@{fresh_census_available=$true;fresh_pid_count=0;surviving_related_count=0
+                parent_reserved_through=$Parent.pid_reserved_through}}
+    }
+    [void]$owned.Handle
+    $nativeStarted=$owned.StartTime.ToUniversalTime()
+    if (-not (Test-HostedProcessCreationBinding $nativeStarted $created)) {
+        $owned.Dispose()
+        throw 'Descendant PID changed before its identity handle could be retained.'
+    }
+    $key="$($owned.Id)|$($nativeStarted.Ticks)"
+    $HeldHandles[$key]=$owned
+    return @{process_id=$owned.Id;parent_id=[int]$Entry.ParentProcessId;started_at=$nativeStarted.ToString('o')
+        identity_capture='retained-native-handle';pid_reserved_through=[DateTime]::UtcNow.ToString('o')}
+}
+
 function Invoke-HostedHarnessProcess([string] $Script, [string[]] $Arguments, [string] $LogPath, $Known, [hashtable] $Runtime) {
     $heldHandles=@{}
     if ($null -eq $Runtime) {
@@ -110,17 +189,8 @@ function Invoke-HostedHarnessProcess([string] $Script, [string[]] $Arguments, [s
                 $table
             }
             retain={
-                param($entry)
-                $owned=Get-Process -Id $entry.ProcessId -ErrorAction Stop
-                [void]$owned.Handle
-                $nativeStarted=$owned.StartTime.ToUniversalTime()
-                if (-not (Test-HostedProcessCreationBinding $nativeStarted ([datetime]$entry.CreationDate))) {
-                    $owned.Dispose()
-                    throw 'Descendant PID changed before its identity handle could be retained.'
-                }
-                $key="$($owned.Id)|$($nativeStarted.Ticks)"
-                $heldHandles[$key]=$owned
-                @{process_id=$owned.Id;parent_id=[int]$entry.ParentProcessId;started_at=$nativeStarted.ToString('o');pid_reserved_through=[DateTime]::UtcNow.ToString('o')}
+                param($entry,$parent,$observedTable)
+                Get-HostedRetainedIdentity $entry $parent $observedTable $heldHandles -FreshCensus $Runtime.census
             }
             release={
                 foreach ($key in @($heldHandles.Keys)) {
@@ -197,7 +267,8 @@ function Invoke-HostedHarnessProcess([string] $Script, [string[]] $Arguments, [s
         try { $process.Dispose() } catch { $secondary.Add("root handle disposal: $($_.Exception.Message)") }
     }
     if ($primary) {
-        $primary.Exception.Data['hosted_secondary_failures']=@($secondary)
+        $preserved=@($primary.Exception.Data['hosted_secondary_failures']) + @($secondary)
+        $primary.Exception.Data['hosted_secondary_failures']=@($preserved | Where-Object { $null -ne $_ })
         throw $primary
     }
     if ($secondary.Count -gt 0) { throw "Hosted phase secondary failures: $($secondary -join '; ')" }

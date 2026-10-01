@@ -326,6 +326,71 @@ Assert-Rejected {
         [pscustomobject]@{ProcessId=205;ParentProcessId=200;CreationDate=$rootCreated.AddSeconds(9).AddMilliseconds(500)}
     )
 } 'next owned generation alone cannot prove the intervening PID reservation gap'
+$acquisitionEntry=[pscustomobject]@{ProcessId=201;ParentProcessId=100;CreationDate=$rootCreated.AddSeconds(1)}
+$acquisitionParent=@{process_id=100;parent_id=1;started_at=$rootCreated.ToString('o');pid_reserved_through=$rootCreated.AddSeconds(5).ToString('o')}
+$acquisitionSnapshot=@($snapshot[0],$acquisitionEntry)
+$missingAcquire={
+    [CmdletBinding()]param($id)
+    $exception=[Microsoft.PowerShell.Commands.ProcessCommandException]::new('Controlled exact ProcessNotFound acquisition race')
+    $record=[Management.Automation.ErrorRecord]::new($exception,'NoProcessFoundForGivenId',[Management.Automation.ErrorCategory]::ObjectNotFound,$id)
+    $PSCmdlet.ThrowTerminatingError($record)
+}
+$gone=Get-HostedRetainedIdentity $acquisitionEntry $acquisitionParent $acquisitionSnapshot @{} `
+    -AcquireProcess $missingAcquire -FreshCensus { $snapshot[0] }
+if ($gone.identity_capture -cne 'cim-observed-then-confirmed-absent' -or
+    $gone.disappearance_proof.fresh_pid_count -ne 0 -or $gone.disappearance_proof.surviving_related_count -ne 0 -or
+    $gone.ContainsKey('pid_reserved_through')) {
+    throw 'Confirmed snapshot-to-acquisition exit fabricated a native handle or unbounded PID reservation.'
+}
+$script:checks++
+foreach ($fresh in @(
+    @($snapshot[0],$acquisitionEntry),
+    @($snapshot[0],[pscustomobject]@{ProcessId=201;ParentProcessId=999;CreationDate=$rootCreated.AddMinutes(1)}),
+    @($snapshot[0],[pscustomobject]@{ProcessId=202;ParentProcessId=201;CreationDate=$rootCreated.AddSeconds(2)}),
+    @()
+)) {
+    Assert-Rejected {
+        Get-HostedRetainedIdentity $acquisitionEntry $acquisitionParent $acquisitionSnapshot @{} `
+            -AcquireProcess $missingAcquire -FreshCensus { $fresh }
+    } 'missing acquisition is not exit proof with present/reused PID, surviving related descendant, or unavailable census'
+}
+$unreservedParent=Copy-Fixture $acquisitionParent
+$unreservedParent.Remove('pid_reserved_through')
+Assert-Rejected {
+    Get-HostedRetainedIdentity $acquisitionEntry $unreservedParent $acquisitionSnapshot @{} `
+        -AcquireProcess $missingAcquire -FreshCensus { $snapshot[0] }
+} 'gone PID still requires an actual owned-parent reservation covering its observed creation'
+$accessFailure=[UnauthorizedAccessException]::new('Controlled process handle access denial')
+$script:freshAcquisitionQueries=0
+try {
+    Get-HostedRetainedIdentity $acquisitionEntry $acquisitionParent $acquisitionSnapshot @{} `
+        -AcquireProcess {throw $accessFailure} -FreshCensus {$script:freshAcquisitionQueries++;$snapshot[0]}
+    throw 'Access denial was accepted as process exit.'
+} catch {
+    if (-not [object]::ReferenceEquals($_.Exception,$accessFailure) -or $script:freshAcquisitionQueries -ne 0) {
+        throw 'Non-ProcessNotFound acquisition error was masked or waived by fresh-census fallback.'
+    }
+}
+$script:checks++
+try {
+    Get-HostedRetainedIdentity $acquisitionEntry $acquisitionParent $acquisitionSnapshot @{} `
+        -AcquireProcess $missingAcquire -FreshCensus {throw [IO.IOException]::new('Controlled unavailable fresh census')}
+    throw 'Missing acquisition plus unavailable census was accepted.'
+} catch {
+    if ($_.Exception -isnot [Microsoft.PowerShell.Commands.ProcessCommandException] -or
+        @($_.Exception.Data['hosted_secondary_failures']).Count -ne 1 -or
+        $_.Exception.Data['owned_guard_state'].fresh_census_available -ne $null) {
+        throw 'Acquisition primary/census secondary/unknown availability was not preserved.'
+    }
+}
+$script:checks++
+$observedGrandchild=[pscustomobject]@{ProcessId=202;ParentProcessId=201;CreationDate=$rootCreated.AddSeconds(2)}
+Assert-Rejected {
+    Get-HostedRetainedIdentity $acquisitionEntry $acquisitionParent (@($acquisitionSnapshot)+@($observedGrandchild)) @{} `
+        -AcquireProcess $missingAcquire -FreshCensus {
+            @($snapshot[0],[pscustomobject]@{ProcessId=203;ParentProcessId=202;CreationDate=$rootCreated.AddSeconds(3)})
+        }
+} 'a surviving descendant of an observed vanished intermediary is not zero-owned exit closure'
 
 $script:attempts=[Collections.Generic.List[string]]::new()
 $original=[InvalidOperationException]::new('original controlled harness failure')
@@ -804,10 +869,14 @@ $runtime=@{
     stop_root={ throw 'Positive inert phase unexpectedly requested root termination.' }
     stop_descendant={ throw 'Positive inert phase unexpectedly adopted a foreign or already-exited process.' }
     retain={
-        param($entry)
-        @{process_id=[int]$entry.ProcessId;parent_id=[int]$entry.ParentProcessId
-            started_at=([datetime]$entry.CreationDate).ToUniversalTime().AddTicks(6).ToString('o')
-            pid_reserved_through=$rootCreated.AddSeconds(30).ToString('o')}
+        param($entry,$parent,$observedTable)
+        Get-HostedRetainedIdentity $entry $parent $observedTable @{} -FreshCensus {throw 'Live acquisition must not need a fresh census'} `
+            -AcquireProcess {
+                param($id)
+                $record=[pscustomobject]@{Id=$id;Handle=[IntPtr]1;StartTime=([datetime]$entry.CreationDate).ToUniversalTime().AddTicks(6)}
+                $record | Add-Member ScriptMethod Dispose {}
+                $record
+            }
     }
     release={}
 }
