@@ -770,6 +770,9 @@ function Assert-AccessibilityInputOwner(
     [string] $Description,
     [IntPtr] $ExpectedFocusedHwnd = [IntPtr]::Zero
 ) {
+    if (Test-HostedInteractiveProfile) {
+        Assert-HostedInteractiveWindow $Process.MainWindowHandle $Process
+    }
     $deadline = [DateTime]::UtcNow.AddSeconds(3)
     $maxAttempts = 30
     $attempts = 0
@@ -801,9 +804,11 @@ function Assert-AccessibilityInputOwner(
             $focusedHwnd -ne [IntPtr]::Zero -and
             $focusedOwner -eq [uint32]$Process.Id -and
             ($ExpectedFocusedHwnd -eq [IntPtr]::Zero -or $focusedHwnd -eq $ExpectedFocusedHwnd)) {
+            Assert-HostedInteractiveWindow $focusedHwnd $Process -Capture
             return
         }
 
+        Assert-HostedInteractiveWindow $Process.MainWindowHandle $Process
         [void][WinghosttyAccessibilityNative]::ForceForeground($Process.MainWindowHandle)
         if ($attempts -lt $maxAttempts -and [DateTime]::UtcNow -lt $deadline) {
             Start-Sleep -Milliseconds 100
@@ -825,6 +830,7 @@ function Assert-AccessibilityInputOwner(
         $focusedHwnd -ne [IntPtr]::Zero -and
         $focusedOwner -eq [uint32]$Process.Id -and
         ($ExpectedFocusedHwnd -eq [IntPtr]::Zero -or $focusedHwnd -eq $ExpectedFocusedHwnd)) {
+        Assert-HostedInteractiveWindow $focusedHwnd $Process -Capture
         return
     }
 
@@ -859,6 +865,7 @@ function Get-AccessibilityClientPixelGrid {
     for ($y = $MinY; $y -le $MaxY; $y += $Step) {
         for ($x = $MinX; $x -le $MaxX; $x += $Step) {
             [uint32]$color = 0
+            Assert-HostedClientPixel $Hwnd $x $y
             if ([WinghosttyAccessibilityNative]::TrySampleWindowClientPixel(
                 $Hwnd,
                 $x,
@@ -881,6 +888,7 @@ function Find-AccessibilityClientPixel {
 
     foreach ($entry in $OriginalGrid.Values) {
         [uint32]$color = 0
+        Assert-HostedClientPixel $Hwnd ([int]$entry.x) ([int]$entry.y)
         if ([WinghosttyAccessibilityNative]::TrySampleWindowClientPixel(
             $Hwnd,
             [int]$entry.x,
@@ -1672,6 +1680,7 @@ function Wait-AccessibilityTerminalCommandEcho(
                 )
             }
             $diagnostic.focus_recovery_count++
+            Assert-HostedInteractiveWindow $Process.MainWindowHandle $Process
             [void][WinghosttyAccessibilityNative]::ForceForeground($Process.MainWindowHandle)
             $recoveredForegroundHwnd = [WinghosttyAccessibilityNative]::GetForegroundWindow()
             $recoveredFocusedHwnd =
@@ -1908,6 +1917,7 @@ function Open-AccessibilitySettingsProbe {
             }
         }
         elseif (-not $sentForCurrentNoWindowState) {
+            Assert-HostedInteractiveWindow $Process.MainWindowHandle $Process
             [void][WinghosttyAccessibilityNative]::ForceForeground($Process.MainWindowHandle)
             $terminalHwnds = @([WinghosttyAccessibilityNative]::VisibleTerminalChildren(
                 $Process.MainWindowHandle
@@ -1933,6 +1943,7 @@ function Open-AccessibilitySettingsProbe {
                     [WinghosttyAccessibilityNative]::FocusedWindowFor(
                         $Process.MainWindowHandle
                     ) -eq $terminalHwnd) {
+                    Assert-HostedInteractiveWindow $terminalHwnd $Process -Capture
                     if (-not [WinghosttyAccessibilityNative]::SendChord(
                         @([uint16]0x11, [uint16]0xBC)
                     )) {
@@ -2377,6 +2388,7 @@ function Invoke-AccessibilityHighContrastProof(
                 foreach ($xOrdinal in 1..5) {
                     $x = [Math]::Min($width - 5, [Math]::Max(4, [int]($width * $xOrdinal / 6)))
                     [uint32]$color = 0
+                    Assert-HostedClientPixel $targetHwnd $x $y
                     if (-not [WinghosttyAccessibilityNative]::TrySampleWindowClientPixel(
                         $targetHwnd,
                         $x,
@@ -2436,6 +2448,7 @@ function Invoke-AccessibilityHighContrastProof(
             exact = $false
             error = $null
         }
+        Assert-HostedCaptureWindow $Pixel.hwnd -OwnerOnly
         if (-not $diagnostic.hwnd_alive) { return $diagnostic }
         try {
             $diagnostic.actual_class =
@@ -2463,6 +2476,7 @@ function Invoke-AccessibilityHighContrastProof(
             $diagnostic.window_from_point_hwnd = $hitHwnd.ToInt64()
             $diagnostic.window_from_point_exact = $hitHwnd -eq $Pixel.hwnd
             [uint32]$color = 0
+            Assert-HostedClientPixel $Pixel.hwnd ([int]$Pixel.client_x) ([int]$Pixel.client_y)
             $diagnostic.color_sample_valid =
                 [WinghosttyAccessibilityNative]::TrySampleWindowClientPixel(
                     $Pixel.hwnd,
@@ -2874,6 +2888,7 @@ function Invoke-AccessibilitySettingsCloseAction {
         [Parameter(Mandatory)][string] $Description
     )
 
+    Assert-HostedCaptureWindow $SettingsProbe.Hwnd -OwnerOnly
     if (-not [WinghosttyAccessibilityNative]::ForceForeground($SettingsProbe.Hwnd)) {
         throw "Unable to foreground $Description before its dirty-close request."
     }
@@ -3267,6 +3282,7 @@ try {
     } while ($process.MainWindowHandle -eq [IntPtr]::Zero -and [DateTime]::UtcNow -lt $deadline)
     if ($process.MainWindowHandle -eq [IntPtr]::Zero) { throw 'winghostty did not expose a main HWND.' }
 
+    Assert-HostedInteractiveWindow $process.MainWindowHandle $process
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($process.MainWindowHandle)
     if ($null -eq $root) { throw 'UI Automation returned no root element.' }
     [void][WinghosttyAccessibilityNative]::SetForegroundWindow($process.MainWindowHandle)
@@ -3305,6 +3321,7 @@ try {
         }
         $themeDiagnosticDocument = $script:themeDiagnosticDocuments[0]
         $themeDiagnosticTerminalHwnd = [IntPtr]$themeDiagnosticDocument.Current.NativeWindowHandle
+        Assert-HostedInteractiveWindow $process.MainWindowHandle $process
         [void][WinghosttyAccessibilityNative]::ForceForeground($process.MainWindowHandle)
         $themeDiagnosticDocument.SetFocus()
         Wait-AccessibilityCondition -Deadline ([DateTime]::UtcNow.AddSeconds(3)) -Description 'theme diagnostic terminal focus' -Condition {
@@ -3422,6 +3439,7 @@ try {
             [Convert]::ToBase64String($themeDiagnosticConfigBytes)) {
             throw 'Targeted theme preview changed config.ghostty bytes.'
         }
+        Assert-HostedInteractiveWindow $process.MainWindowHandle $process
         [void][WinghosttyAccessibilityNative]::ForceForeground($process.MainWindowHandle)
         $themeDiagnosticDocument.SetFocus()
         Wait-AccessibilityCondition -Deadline ([DateTime]::UtcNow.AddSeconds(3)) -Description 'theme diagnostic pre-HC terminal focus' -Condition {
@@ -3474,6 +3492,7 @@ try {
         )) {
             throw 'Cold diagnostic terminal Text element does not expose TextPattern.'
         }
+        Assert-HostedInteractiveWindow $process.MainWindowHandle $process
         [void][WinghosttyAccessibilityNative]::ForceForeground($process.MainWindowHandle)
         $document.SetFocus()
         Wait-AccessibilityCondition -Deadline ([DateTime]::UtcNow.AddSeconds(3)) -Description 'cold diagnostic terminal focus' -Condition {
@@ -3583,6 +3602,7 @@ try {
 
         if ($focusActivationAttempts -ge $focusActivationMaxAttempts) { break }
         $focusActivationAttempts++
+        Assert-HostedInteractiveWindow $process.MainWindowHandle $process
         [void][WinghosttyAccessibilityNative]::ForceForeground($process.MainWindowHandle)
         try { $document.SetFocus() } catch { $documentFocusError = $_.Exception.Message }
 
@@ -3634,6 +3654,7 @@ try {
                                 if ($verifiedTargetHwnd -ne [IntPtr]::Zero -and
                                     $verifiedTargetThreadId -ne 0 -and
                                     $verifiedTargetOwner -eq [uint32]$process.Id) {
+                                    Assert-HostedInteractiveWindow $verifiedTargetHwnd $process -Capture
                                     if ([WinghosttyAccessibilityNative]::SendMouseClick()) {
                                         $clickedDocument = $true
                                         $lastClickError = 0
@@ -4049,6 +4070,7 @@ try {
                 $paletteNativeFocusElement.Current.Name -ne 'Command palette query') {
                 throw "Command palette query lost native focus before foreground recovery (focused=$paletteNativeFocus)."
             }
+            Assert-HostedInteractiveWindow $process.MainWindowHandle $process
             [void][WinghosttyAccessibilityNative]::ForceForeground($process.MainWindowHandle)
             return $false
         }
@@ -4205,6 +4227,7 @@ try {
 
     [WinghosttyAccessibilityNative]::ResetNotificationCount()
     Send-AccessibilityChord -Keys @([uint16]0x11, [uint16]0x41) -Description 'select command palette query for unavailable outcome' -Process $process
+    Assert-HostedInteractiveWindow $paletteQueryHwnd $process -Capture
     if (-not [WinghosttyAccessibilityNative]::SendUnicodeText($paletteUnavailableQuery)) {
         throw "SendInput failed for command palette unavailable query: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
     }
@@ -4217,6 +4240,7 @@ try {
                     if ($paletteNativeFocusBeforeRecovery -ne $paletteQueryHwnd) {
                         throw "Command palette query lost native focus before foreground recovery (focused=$paletteNativeFocusBeforeRecovery expected=$paletteQueryHwnd)."
                     }
+                    Assert-HostedInteractiveWindow $process.MainWindowHandle $process
                     [void][WinghosttyAccessibilityNative]::ForceForeground($process.MainWindowHandle)
                     return $false
                 }
@@ -4343,6 +4367,7 @@ try {
                     if ($paletteNativeFocusBeforeRecovery -ne $paletteQueryHwnd) {
                         throw "Recovered command palette query lost native focus before foreground recovery (focused=$paletteNativeFocusBeforeRecovery expected=$paletteQueryHwnd)."
                     }
+                    Assert-HostedInteractiveWindow $process.MainWindowHandle $process
                     [void][WinghosttyAccessibilityNative]::ForceForeground($process.MainWindowHandle)
                     return $false
                 }
@@ -4500,6 +4525,7 @@ try {
             if ($searchNativeFocusBeforeRecovery -ne $searchNativeHwnd) {
                 throw "Docked search query lost native focus before foreground recovery (focused=$searchNativeFocusBeforeRecovery expected=$searchNativeHwnd)."
             }
+            Assert-HostedInteractiveWindow $process.MainWindowHandle $process
             [void][WinghosttyAccessibilityNative]::ForceForeground($process.MainWindowHandle)
             return $false
         }
@@ -4729,12 +4755,14 @@ try {
                     ).ToInt64()
                     [uint32]$restoredSettingsColorProbe = 0
                     [uint32]$restoredHostColorProbe = 0
+                    Assert-HostedClientPixel $settingsHwnd $themePreviewEvidence.settings_sample_x $themePreviewEvidence.settings_sample_y
                     $restoredSettingsPixelValid = [WinghosttyAccessibilityNative]::TrySampleWindowClientPixel(
                         $settingsHwnd,
                         $themePreviewEvidence.settings_sample_x,
                         $themePreviewEvidence.settings_sample_y,
                         [ref]$restoredSettingsColorProbe
                     )
+                    Assert-HostedClientPixel $process.MainWindowHandle $themePreviewEvidence.host_sample_x $themePreviewEvidence.host_sample_y
                     $restoredHostPixelValid = [WinghosttyAccessibilityNative]::TrySampleWindowClientPixel(
                         $process.MainWindowHandle,
                         $themePreviewEvidence.host_sample_x,
@@ -4983,6 +5011,7 @@ try {
         try {
             Wait-AccessibilityCondition -Deadline ([DateTime]::UtcNow.AddSeconds(3)) -Description 'settings section focus and selection ownership' -Condition {
                 if ([WinghosttyAccessibilityNative]::GetForegroundWindow() -ne $settingsHwnd) {
+                    Assert-HostedCaptureWindow $settingsHwnd -OwnerOnly
                     [void][WinghosttyAccessibilityNative]::ForceForeground($settingsHwnd)
                     return $false
                 }
@@ -5191,12 +5220,14 @@ try {
             Wait-AccessibilityCondition -Deadline ([DateTime]::UtcNow.AddSeconds(5)) -Description 'Settings and host Light-to-Dark preview pixels' -Condition {
                 [uint32]$darkSettingsColorProbe = 0
                 [uint32]$darkHostColorProbe = 0
+                Assert-HostedClientPixel $settingsHwnd $settingsSampleX $settingsSampleY
                 $darkSettingsPixelValid = [WinghosttyAccessibilityNative]::TrySampleWindowClientPixel(
                     $settingsHwnd,
                     $settingsSampleX,
                     $settingsSampleY,
                     [ref]$darkSettingsColorProbe
                 )
+                Assert-HostedClientPixel $process.MainWindowHandle $hostSampleX $hostSampleY
                 $darkHostPixelValid = [WinghosttyAccessibilityNative]::TrySampleWindowClientPixel(
                     $process.MainWindowHandle,
                     $hostSampleX,
@@ -5281,6 +5312,7 @@ try {
             }
             Wait-AccessibilityCondition -Deadline ([DateTime]::UtcNow.AddSeconds(3)) -Description 'host pixel restore after Dark preview discard' -Condition {
                 [uint32]$discardHostColorProbe = 0
+                Assert-HostedClientPixel $process.MainWindowHandle $hostSampleX $hostSampleY
                 return [WinghosttyAccessibilityNative]::TrySampleWindowClientPixel(
                     $process.MainWindowHandle,
                     $hostSampleX,
@@ -5421,6 +5453,7 @@ try {
             if ($saveNativeFocusBeforeRecovery -ne $ownerSaveHwnd) {
                 throw "Settings Save lost native focus before foreground recovery (focused=$saveNativeFocusBeforeRecovery expected=$ownerSaveHwnd)."
             }
+            Assert-HostedInteractiveWindow $ownerSettingsHwnd $ownerProbeProcess
             [void][WinghosttyAccessibilityNative]::ForceForeground($ownerSettingsHwnd)
             return $false
         }
@@ -5443,6 +5476,7 @@ try {
     }
     Start-Sleep -Milliseconds 400
     if ([WinghosttyAccessibilityNative]::IsWindow($ownerProbeHost)) {
+        Assert-HostedInteractiveWindow $ownerProbeHost $ownerProbeProcess
         if (-not [WinghosttyAccessibilityNative]::ForceForeground($ownerProbeHost) -or
             -not [WinghosttyAccessibilityNative]::SendChord(@([uint16]0x0D))) {
             throw 'Unable to confirm settings owner host close.'
@@ -5474,6 +5508,7 @@ try {
     )
     [System.Windows.Automation.Automation]::AddAutomationFocusChangedEventHandler($settingsFocusHandler)
     $settingsFocusRegistered = $true
+    Assert-HostedInteractiveWindow $ownerSettingsHwnd $ownerProbeProcess
     if (-not [WinghosttyAccessibilityNative]::ForceForeground($ownerSettingsHwnd)) {
         throw 'Unable to foreground surviving Settings before its dirty-close request.'
     }
@@ -6013,6 +6048,8 @@ try {
             throw "Settings window was destroyed during UIA idle soak at ${second}s."
         }
         if ($IdleSoakSeconds -gt 1 -and $second -eq [Math]::Floor($IdleSoakSeconds / 2)) {
+            Assert-HostedCaptureWindow $idleSettingsHwnd -OwnerOnly
+            Assert-HostedCaptureWindow $idleTerminalHostHwnd -OwnerOnly
             if (-not [WinghosttyAccessibilityNative]::ForceForeground($idleSettingsHwnd) -or
                 -not [WinghosttyAccessibilityNative]::ForceForeground($idleTerminalHostHwnd)) {
                 throw "Settings/main-window focus round trip failed during UIA idle soak at ${second}s."

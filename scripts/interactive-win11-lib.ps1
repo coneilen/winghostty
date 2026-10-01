@@ -127,6 +127,14 @@ if (-not ('InteractiveWin11MessageNativeV2' -as [type])) {
 using System;
 using System.Runtime.InteropServices;
 public static class InteractiveWin11MessageNativeV2 {
+    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left,Top,Right,Bottom; }
+    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X,Y; }
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd,out RECT rect);
+    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hwnd,out RECT rect);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hwnd,uint flags);
+    [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT point);
     [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)] private static extern IntPtr SendMessageTimeoutW(IntPtr hwnd, uint message, UIntPtr wparam, IntPtr lparam, uint flags, uint timeout, out UIntPtr result);
     [DllImport("user32.dll", SetLastError=true)] private static extern bool PostMessageW(IntPtr hwnd, uint message, UIntPtr wparam, IntPtr lparam);
     [DllImport("user32.dll", SetLastError=true)] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
@@ -159,6 +167,310 @@ $script:InteractiveWin11SmtoBlock = [uint32]0x0001
 $script:InteractiveWin11ErrorSuccess = 0
 $script:InteractiveWin11ErrorInvalidWindowHandle = 1400
 $script:InteractiveWin11ErrorTimeout = 1460
+
+function Test-HostedInteractiveProfile {
+    return $env:WINGHOSTTY_HOSTED_PROFILE -ceq 'HOSTEDWINDOWSSERVERCPU'
+}
+
+function Get-HostedFileSha256([string] $Path) {
+    $stream=[IO.File]::OpenRead($Path)
+    try {
+        $sha256=[Security.Cryptography.SHA256]::Create()
+        try { return [BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-','').ToLowerInvariant() }
+        finally { $sha256.Dispose() }
+    } finally { $stream.Dispose() }
+}
+
+function Test-HostedProcessCreationBinding([datetime] $NativeStartedAt, [datetime] $CimStartedAt) {
+    # CIM_DATETIME exposes six fractional digits; GetProcessTimes exposes
+    # 100 ns ticks. Only that one-microsecond truncation interval is valid.
+    $nativeTicks=$NativeStartedAt.ToUniversalTime().Ticks
+    $cimTicks=$CimStartedAt.ToUniversalTime().Ticks
+    return $nativeTicks -ge $cimTicks -and $nativeTicks -lt $cimTicks+10
+}
+
+function Assert-HostedWindowObservation($Observation, [switch] $Capture) {
+    if ($null -eq $Observation -or $Observation -isnot [Collections.IDictionary]) { throw 'Hosted owner observation is unavailable.' }
+    foreach ($key in @('alive','identity_matched','module_verified')) {
+        if ($Observation[$key] -isnot [bool]) { throw 'Hosted owner availability/identity/module flags must be booleans.' }
+    }
+    foreach ($key in @('process_id','hwnd','owner_pid')) {
+        if ($Observation[$key] -isnot [int] -and $Observation[$key] -isnot [long] -and $Observation[$key] -isnot [uint32]) {
+            throw 'Hosted owner PID/HWND values must be typed integers.'
+        }
+        if ($Capture) {
+            if ($Observation.visible -isnot [bool]) { throw 'Capture visibility must be a real boolean.' }
+            foreach ($key in @('width','height','foreground_owner_pid','foreground_root','root_hwnd')) {
+                if ($Observation[$key] -isnot [int] -and $Observation[$key] -isnot [long] -and $Observation[$key] -isnot [uint32]) {
+                    throw 'Hosted capture geometry/ownership counters must be typed integers.'
+                }
+            }
+            foreach ($owner in $Observation.hit_owners) {
+                if ($owner -isnot [int] -and $owner -isnot [long] -and $owner -isnot [uint32]) { throw 'Capture hit owners must be integers.' }
+            }
+        }
+    }
+    if ($null -eq $Observation -or
+        $Observation.alive -cne $true -or $Observation.identity_matched -cne $true -or
+        $Observation.process_id -le 0 -or $Observation.hwnd -le 0 -or
+        $Observation.owner_pid -ne $Observation.process_id -or
+        $Observation.module_verified -cne $true) {
+        throw 'Hosted HWND guard: unavailable/dead/reused/unowned process or unverified loaded Mesa module.'
+    }
+    if ($Capture -and (
+        $Observation.visible -cne $true -or $Observation.width -le 0 -or $Observation.height -le 0 -or
+        $Observation.foreground_owner_pid -ne $Observation.process_id -or
+        $Observation.foreground_root -ne $Observation.root_hwnd -or
+        $Observation.hit_owners.Count -ne 5 -or
+        @($Observation.hit_owners | Where-Object { $_ -ne $Observation.process_id }).Count -ne 0)) {
+        throw 'Hosted capture guard: foreground, rectangle, or hit-test ownership is unavailable.'
+    }
+}
+
+function Invoke-HostedOwnedPrimitive($Observation, [scriptblock] $Primitive, [switch] $Capture) {
+    Assert-HostedWindowObservation $Observation -Capture:$Capture
+    & $Primitive
+}
+
+function Register-HostedInteractiveProcess([Diagnostics.Process] $Process) {
+    if (-not (Test-HostedInteractiveProfile)) { return $null }
+    if (-not $script:HostedProcesses) { $script:HostedProcesses = @{} }
+    if (-not $script:HostedProcessHandles) { $script:HostedProcessHandles = @{} }
+    $Process.Refresh()
+    if ($Process.HasExited) { throw 'Cannot register an exited hosted application identity.' }
+    $started = $Process.StartTime.ToUniversalTime()
+    $key = "$($Process.Id)|$($started.Ticks)"
+    if ($script:HostedProcesses.ContainsKey($key)) {
+        $retained=$script:HostedProcesses[$key]
+        $currentModules=@($Process.Modules | Where-Object ModuleName -IEQ 'opengl32.dll')
+        $currentGallium=@($Process.Modules | Where-Object ModuleName -IEQ 'libgallium_wgl.dll')
+        if ($currentModules.Count -ne 1 -or $currentModules[0].FileName -ine $retained.module_path -or
+            $currentModules[0].BaseAddress.ToInt64() -ne $retained.loader_base_address -or
+            $currentGallium.Count -ne 1 -or $currentGallium[0].FileName -ine $retained.megadriver_path -or
+            $currentGallium[0].BaseAddress.ToInt64() -ne $retained.megadriver_base_address) {
+            throw 'Retained hosted application Mesa module identity changed.'
+        }
+        return $retained
+    }
+    if ($Process.Path -ine $env:WINGHOSTTY_HOSTED_APP_PATH) { throw 'Hosted app is outside the CI-built executable path.' }
+    $modules = @($Process.Modules | Where-Object ModuleName -IEQ 'opengl32.dll')
+    $megadrivers = @($Process.Modules | Where-Object ModuleName -IEQ 'libgallium_wgl.dll')
+    $expectedDirectory = Split-Path -Parent $env:WINGHOSTTY_HOSTED_APP_PATH
+    if ($modules.Count -ne 1 -or $modules[0].FileName -ine (Join-Path $expectedDirectory 'opengl32.dll') -or
+        $megadrivers.Count -ne 1 -or $megadrivers[0].FileName -ine (Join-Path $expectedDirectory 'libgallium_wgl.dll') -or
+        (Get-HostedFileSha256 $modules[0].FileName) -cne $env:WINGHOSTTY_HOSTED_GL_SHA256 -or
+        (Get-HostedFileSha256 $megadrivers[0].FileName) -cne $env:WINGHOSTTY_HOSTED_GALLIUM_SHA256) {
+        throw 'Actual retained application did not load both pinned per-application Mesa WGL DLLs.'
+    }
+    $snapshot = @(Get-InteractiveWin11ProcessTreeSnapshot -RootProcessId $Process.Id -RootStartedAt $started)
+    $record = @{
+        process_id=$Process.Id;started_at=$started.ToString('o');started_ticks=$started.Ticks
+        application_path=$Process.Path
+        application_sha256=(Get-HostedFileSha256 $Process.Path)
+        module_path=$modules[0].FileName;module_sha256=$env:WINGHOSTTY_HOSTED_GL_SHA256
+        loader_base_address=$modules[0].BaseAddress.ToInt64()
+        megadriver_path=$megadrivers[0].FileName;megadriver_sha256=$env:WINGHOSTTY_HOSTED_GALLIUM_SHA256
+        megadriver_base_address=$megadrivers[0].BaseAddress.ToInt64()
+        windows=@();snapshot=$snapshot;cleanup=$null;secondary_failures=@()
+    }
+    $script:HostedProcesses[$key] = $record
+    $script:HostedProcessHandles[$key] = $Process
+    [void]$Process.Handle
+    Save-HostedProcessEvidence $record
+    return $record
+}
+
+function Save-HostedProcessEvidence($Record) {
+    if (-not $env:WINGHOSTTY_HOSTED_EVIDENCE_DIR -or $env:WINGHOSTTY_HOSTED_STAGE -notmatch '^[a-z0-9-]+$') {
+        throw 'Hosted evidence output/stage binding is absent.'
+    }
+    $directory = Join-Path $env:WINGHOSTTY_HOSTED_EVIDENCE_DIR $env:WINGHOSTTY_HOSTED_STAGE
+    [IO.Directory]::CreateDirectory($directory) | Out-Null
+    $path = Join-Path $directory "process-$($Record.process_id)-$($Record.started_ticks).json"
+    $temporary = "$path.$PID.tmp"
+    $Record | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $temporary -Encoding UTF8
+    Move-Item -LiteralPath $temporary -Destination $path -Force
+}
+
+function Assert-HostedInteractiveWindow([IntPtr] $Hwnd, [Diagnostics.Process] $Process, [switch] $Capture, $ExpectedRect) {
+    if (-not (Test-HostedInteractiveProfile)) { return }
+    $record = Register-HostedInteractiveProcess $Process
+    $Process.Refresh()
+    [uint32]$owner = 0
+    [void][InteractiveWin11MessageNativeV2]::GetWindowThreadProcessId($Hwnd,[ref]$owner)
+    $observation = @{
+        process_id=$Process.Id;hwnd=$Hwnd.ToInt64();owner_pid=$owner
+        alive=(-not $Process.HasExited)
+        identity_matched=($Process.StartTime.ToUniversalTime().Ticks -eq $record.started_ticks)
+        module_verified=$true
+    }
+    Invoke-HostedOwnedPrimitive $observation {}
+    if ($Capture) {
+        $rect = [InteractiveWin11MessageNativeV2+RECT]::new()
+        if (-not [InteractiveWin11MessageNativeV2]::GetWindowRect($Hwnd,[ref]$rect)) { throw 'Owned hosted capture bounds unavailable.' }
+        if ($null -ne $ExpectedRect -and (
+            $rect.Left -ne $ExpectedRect.Left -or $rect.Top -ne $ExpectedRect.Top -or
+            $rect.Right -ne $ExpectedRect.Right -or $rect.Bottom -ne $ExpectedRect.Bottom)) {
+            throw 'Owned capture rectangle moved or resized after the sampling ROI was retained.'
+        }
+        $foreground = [InteractiveWin11MessageNativeV2]::GetForegroundWindow()
+        [uint32]$foregroundOwner = 0
+        [void][InteractiveWin11MessageNativeV2]::GetWindowThreadProcessId($foreground,[ref]$foregroundOwner)
+        $observation.visible = [InteractiveWin11MessageNativeV2]::IsWindowVisible($Hwnd)
+        $observation.width = $rect.Right-$rect.Left
+        $observation.height = $rect.Bottom-$rect.Top
+        $observation.root_hwnd = [InteractiveWin11MessageNativeV2]::GetAncestor($Hwnd,2).ToInt64()
+        $observation.foreground_root = [InteractiveWin11MessageNativeV2]::GetAncestor($foreground,2).ToInt64()
+        $observation.foreground_owner_pid = $foregroundOwner
+        $observation.hit_owners = @()
+        foreach ($point in @(
+            @($rect.Left+2,$rect.Top+2),@($rect.Right-3,$rect.Top+2),
+            @($rect.Left+2,$rect.Bottom-3),@($rect.Right-3,$rect.Bottom-3),
+            @([int](($rect.Left+$rect.Right)/2),[int](($rect.Top+$rect.Bottom)/2))
+        )) {
+            $nativePoint = [InteractiveWin11MessageNativeV2+POINT]::new()
+            $nativePoint.X=$point[0]; $nativePoint.Y=$point[1]
+            $hit = [InteractiveWin11MessageNativeV2]::WindowFromPoint($nativePoint)
+            [uint32]$hitOwner = 0
+            [void][InteractiveWin11MessageNativeV2]::GetWindowThreadProcessId($hit,[ref]$hitOwner)
+            $observation.hit_owners += $hitOwner
+        }
+        Invoke-HostedOwnedPrimitive $observation {} -Capture
+    }
+    if ($Hwnd.ToInt64() -notin @($record.windows)) { $record.windows += $Hwnd.ToInt64() }
+    Save-HostedProcessEvidence $record
+}
+
+function Assert-HostedCaptureWindow([IntPtr] $Hwnd, [switch] $OwnerOnly, $ExpectedRect, [switch] $PassThru) {
+    if (-not (Test-HostedInteractiveProfile)) { return }
+    [uint32]$owner = 0
+    [void][InteractiveWin11MessageNativeV2]::GetWindowThreadProcessId($Hwnd,[ref]$owner)
+    if ($owner -le 0 -or -not $script:HostedProcesses) { throw 'Capture has no positively retained application owner.' }
+    $records = @($script:HostedProcesses.Values | Where-Object process_id -EQ $owner)
+    if ($records.Count -ne 1) { throw 'Capture owner is absent or ambiguous/reused.' }
+    $key="$($records[0].process_id)|$($records[0].started_ticks)"
+    $process = $script:HostedProcessHandles[$key]
+    if ($null -eq $process) { throw 'Capture retained process handle is unavailable.' }
+    if ($process.StartTime.ToUniversalTime().Ticks -ne $records[0].started_ticks) { throw 'Capture PID was reused.' }
+    Assert-HostedInteractiveWindow $Hwnd $process -Capture:(-not $OwnerOnly) -ExpectedRect $ExpectedRect
+    if ($PassThru) { return $records[0] }
+}
+
+function Assert-HostedClientPixelObservation($Observation) {
+    Assert-HostedWindowObservation $Observation
+    foreach ($key in @('client_x','client_y','client_width','client_height','foreground_owner_pid')) {
+        if ($Observation[$key] -isnot [int] -and $Observation[$key] -isnot [uint32] -and $Observation[$key] -isnot [long]) {
+            throw 'Owned window-DC pixel coordinates/bounds are unavailable or mistyped.'
+        }
+    }
+    if ($Observation.client_width -le 0 -or $Observation.client_height -le 0 -or
+        $Observation.client_x -lt 0 -or $Observation.client_x -ge $Observation.client_width -or
+        $Observation.client_y -lt 0 -or $Observation.client_y -ge $Observation.client_height -or
+        $Observation.foreground_owner_pid -ne $Observation.process_id) {
+        throw 'Owned window-DC pixel bounds or foreground application ownership changed.'
+    }
+}
+
+function Assert-HostedClientPixel([IntPtr] $Hwnd, [int] $X, [int] $Y) {
+    if (-not (Test-HostedInteractiveProfile)) { return }
+    $retained=Assert-HostedCaptureWindow $Hwnd -OwnerOnly -PassThru
+    $rect=[InteractiveWin11MessageNativeV2+RECT]::new()
+    if (-not [InteractiveWin11MessageNativeV2]::GetClientRect($Hwnd,[ref]$rect)) { throw 'Owned window-DC client rectangle unavailable.' }
+    [uint32]$owner=0
+    [void][InteractiveWin11MessageNativeV2]::GetWindowThreadProcessId($Hwnd,[ref]$owner)
+    [uint32]$foregroundOwner=0
+    [void][InteractiveWin11MessageNativeV2]::GetWindowThreadProcessId([InteractiveWin11MessageNativeV2]::GetForegroundWindow(),[ref]$foregroundOwner)
+    Assert-HostedClientPixelObservation @{
+        alive=$true;identity_matched=$true;process_id=[int]$retained.process_id;hwnd=$Hwnd.ToInt64();owner_pid=[int]$owner
+        module_verified=$true;client_x=$X;client_y=$Y;client_width=($rect.Right-$rect.Left);client_height=($rect.Bottom-$rect.Top)
+        foreground_owner_pid=[int]$foregroundOwner
+    }
+}
+
+function Get-HostedSnapshotCleanup([object[]] $Snapshot, [object[]] $Table) {
+    if ($Snapshot.Count -eq 0 -or $Table.Count -eq 0) { throw 'Unavailable or empty owned cleanup observation.' }
+    $known=@{}
+    foreach ($entry in $Snapshot) {
+        $started=([datetime]$entry.CreationDate).ToUniversalTime()
+        $known["$($entry.ProcessId)|$($started.Ticks)"]=@{
+            process_id=[int]$entry.ProcessId;parent_id=[int]$entry.ParentProcessId;started_at=$started.ToString('o')
+        }
+    }
+    $changed=$true
+    while ($changed) {
+        $changed=$false
+        foreach ($entry in $Table) {
+            if (@($known.Values | Where-Object { $_.process_id -eq $entry.ProcessId -or $_.process_id -eq $entry.ParentProcessId }).Count -eq 0) { continue }
+            $created=([datetime]$entry.CreationDate).ToUniversalTime()
+            $key="$($entry.ProcessId)|$($created.Ticks)"
+            if ($known.ContainsKey($key)) { continue }
+            $parents=@($known.Values | Where-Object { $_.process_id -eq $entry.ParentProcessId -and $created -ge ([datetime]$_.started_at).ToUniversalTime() })
+            if ($parents.Count -ne 1) { continue }
+            $currentParents=@($Table | Where-Object ProcessId -EQ $entry.ParentProcessId)
+            if ($currentParents.Count -eq 1 -and
+                ([datetime]$currentParents[0].CreationDate).ToUniversalTime().Ticks -ne ([datetime]$parents[0].started_at).ToUniversalTime().Ticks) {
+                continue
+            }
+            $known[$key]=@{process_id=[int]$entry.ProcessId;parent_id=[int]$entry.ParentProcessId;started_at=$created.ToString('o')}
+            $changed=$true
+        }
+    }
+    $remaining=0
+    foreach ($entry in $Table) {
+        if (@($known.Values | Where-Object process_id -EQ $entry.ProcessId).Count -eq 0) { continue }
+        $key="$($entry.ProcessId)|$(([datetime]$entry.CreationDate).ToUniversalTime().Ticks)"
+        if ($known.ContainsKey($key)) { $remaining++ }
+    }
+    return @{available=$true;observed_process_count=$known.Count;remaining_process_count=$remaining;processes=@($known.Values)}
+}
+
+function Stop-HostedInteractiveProcess([Diagnostics.Process] $Process) {
+    $secondary = [Collections.Generic.List[string]]::new()
+    $record = $null
+    $snapshot = @()
+    $started = $null
+    $handle = [IntPtr]::Zero
+    try {
+        $Process.Refresh()
+        if (-not $Process.HasExited) {
+            $handle=$Process.Handle; $started=$Process.StartTime
+            $key="$($Process.Id)|$($started.ToUniversalTime().Ticks)"
+            if ($script:HostedProcesses -and $script:HostedProcesses.ContainsKey($key)) { $record=$script:HostedProcesses[$key] }
+            else { $record=Register-HostedInteractiveProcess $Process }
+            $snapshot=@(Get-InteractiveWin11ProcessTreeSnapshot -RootProcessId $Process.Id -RootStartedAt $started)
+        } else {
+            $records=@($script:HostedProcesses.Values | Where-Object process_id -EQ $Process.Id)
+            if ($records.Count -ne 1) { throw 'Exited hosted root has no retained creation-time/tree identity.' }
+            $record=$records[0]; $snapshot=@($record.snapshot)
+        }
+    } catch { $secondary.Add("snapshot: $($_.Exception.Message)") }
+    # All attempts execute even if snapshot/module/evidence collection failed.
+    try {
+        if ($handle -ne [IntPtr]::Zero) {
+            Stop-InteractiveWin11RootHandle -Process $Process -RootProcessHandle $handle -RootStartedAt $started
+        }
+    } catch { $secondary.Add("termination: $($_.Exception.Message)") }
+    $cleanup=@{available=$null;observed_process_count=$snapshot.Count;remaining_process_count=$null;processes=@()}
+    try {
+        if ($snapshot.Count -eq 0) { throw 'No positive hosted process snapshot is available.' }
+        $exited=Wait-InteractiveWin11ProcessTreeSnapshotExited -Snapshot $snapshot -TimeoutSeconds 15
+        $table=@(Get-CimInstance -ClassName Win32_Process -Property ProcessId,ParentProcessId,CreationDate -OperationTimeoutSec 5 -ErrorAction Stop)
+        $cleanup=Get-HostedSnapshotCleanup $snapshot $table
+        if (-not $exited) { throw 'Captured owned processes or descendants remained live.' }
+    } catch { $secondary.Add("verification: $($_.Exception.Message)") }
+    if ($null -eq $record) {
+        $record=@{process_id=$Process.Id;started_ticks=0;started_at=$null;windows=@();secondary_failures=@()}
+    }
+    $record.cleanup=$cleanup
+    $record.secondary_failures=@($secondary)
+    try { Save-HostedProcessEvidence $record } catch { $secondary.Add("evidence: $($_.Exception.Message)") }
+    foreach ($failure in $secondary) {
+        try { Write-Warning "HOSTED_SECONDARY_FAILURE process=$($Process.Id) $failure" -WarningAction Continue }
+        catch { $record.secondary_failures += "diagnostic: $($_.Exception.Message)" }
+    }
+    # The external hosted stage collector fails on any missing/error cleanup
+    # record. Do not replace an exception already unwinding this harness.
+}
 
 function Get-InteractiveWin11MessageTimeoutMs {
     param(
@@ -201,6 +513,9 @@ function Assert-InteractiveWin11WindowOwner {
         throw "Refusing to $Verb $Description to hwnd=$Hwnd because owner pid=$windowProcessId does not match expected pid=$($Process.Id)."
     }
 
+    if ($env:WINGHOSTTY_HOSTED_PROFILE -ceq 'HOSTEDWINDOWSSERVERCPU') {
+        Assert-HostedInteractiveWindow $Hwnd $Process
+    }
     return $true
 }
 
@@ -633,7 +948,10 @@ function Get-InteractiveWin11ProcessTreeSnapshot {
     }
     $observedRootStartedAt = ([datetime]$processById[$RootProcessId].CreationDate).ToUniversalTime()
     $expectedRootStartedAt = $RootStartedAt.ToUniversalTime()
-    if ([math]::Abs(($observedRootStartedAt - $expectedRootStartedAt).TotalMilliseconds) -gt 10) {
+    if ($env:WINGHOSTTY_HOSTED_PROFILE -ceq 'HOSTEDWINDOWSSERVERCPU' -and -not (Test-HostedProcessCreationBinding $expectedRootStartedAt $observedRootStartedAt)) {
+        throw "Hosted root process $RootProcessId creation time is outside its exact CIM microsecond interval."
+    }
+    if ($env:WINGHOSTTY_HOSTED_PROFILE -cne 'HOSTEDWINDOWSSERVERCPU' -and [math]::Abs(($observedRootStartedAt - $expectedRootStartedAt).TotalMilliseconds) -gt 10) {
         throw "Interactive Win11 root process $RootProcessId identity changed before process-tree cleanup."
     }
 
@@ -649,6 +967,7 @@ function Get-InteractiveWin11ProcessTreeSnapshot {
         $processStartedAt = ([datetime]$process.CreationDate).ToUniversalTime()
         [void]$snapshot.Add([pscustomobject]@{
             ProcessId    = [int]$process.ProcessId
+            ParentProcessId = [int]$process.ParentProcessId
             CreationDate = $processStartedAt
         })
         if ($childrenByParent.ContainsKey($processId)) {
@@ -795,6 +1114,11 @@ function Stop-InteractiveWin11Process {
     $lifecycleModeCount = @($RequireLiveRoot, $Contained, $AllowAlreadyExited).Where({ $_.IsPresent }).Count
     if ($lifecycleModeCount -gt 1) {
         throw 'RequireLiveRoot, Contained, and AllowAlreadyExited are mutually exclusive.'
+    }
+
+    if ($env:WINGHOSTTY_HOSTED_PROFILE -ceq 'HOSTEDWINDOWSSERVERCPU') {
+        Stop-HostedInteractiveProcess $Process
+        return
     }
 
     $rootProcessId = $Process.Id

@@ -135,6 +135,7 @@ function Get-StatefulPixel([IntPtr] $Hwnd) {
             foreach ($row in 1..4) {
                 $sampleX = $rect.Left + [int](($width * $column) / 5)
                 $sampleY = $rect.Top + [int](($height * $row) / 5)
+                Assert-HostedCaptureWindow $Hwnd -ExpectedRect $rect
                 $graphics.CopyFromScreen($sampleX, $sampleY, 0, 0, [Drawing.Size]::new(1, 1))
                 $color = $bitmap.GetPixel(0, 0).ToArgb()
                 $count = 1 + [int]($counts[$color])

@@ -289,6 +289,7 @@ function Capture-WindowImage {
         try {
             $gfx = [System.Drawing.Graphics]::FromImage($bmp)
             try {
+                Assert-HostedCaptureWindow $Hwnd -ExpectedRect $rect
                 try {
                     $gfx.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bmp.Size)
                     $captured = $true

@@ -157,12 +157,44 @@ try {
         $graphics = [Drawing.Graphics]::FromImage($bitmap)
         try {
             Show-StatefulHost $hostHwnd
+            Assert-HostedInteractiveWindow $surface.Hwnd $process -Capture -ExpectedRect $rect
             $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size)
         }
         finally {
             $graphics.Dispose()
         }
         $bitmap.Save($screenshotPath, [Drawing.Imaging.ImageFormat]::Png)
+        if (Test-HostedInteractiveProfile) {
+            $shaderEvidence = @{
+                process_id=$process.Id;started_at=$process.StartTime.ToUniversalTime().ToString('o')
+                hwnd=$surface.Hwnd.ToInt64();screenshot=$screenshotPath
+                screenshot_sha256=(Get-HostedFileSha256 $screenshotPath)
+                width=$bitmap.Width;height=$bitmap.Height;sampled_pixels=0;magenta_pixels=0
+                png_bytes=(Get-Item -LiteralPath $screenshotPath).Length
+                roi=@{left=$rect.Left;top=$rect.Top;width=$bitmap.Width;height=$bitmap.Height}
+                sample_points=@();dominant_color=$null
+            }
+            $sampleCounts=@{};$dominantCount=0;$dominantArgb=0
+            foreach ($column in 1..4) {
+                foreach ($row in 1..4) {
+                    $sampleX=[int](($bitmap.Width*$column)/5)
+                    $sampleY=[int](($bitmap.Height*$row)/5)
+                    $shaderEvidence.sample_points+=@{x=$sampleX;y=$sampleY}
+                    $pixel=$bitmap.GetPixel($sampleX,$sampleY)
+                    $shaderEvidence.sampled_pixels++
+                    if ($pixel.R -ge 220 -and $pixel.G -le 40 -and $pixel.B -ge 220) { $shaderEvidence.magenta_pixels++ }
+                    $sampleArgb=$pixel.ToArgb()
+                    $sampleCounts[$sampleArgb]=1+[int]$sampleCounts[$sampleArgb]
+                    if ($sampleCounts[$sampleArgb] -gt $dominantCount) {
+                        $dominantCount=$sampleCounts[$sampleArgb];$dominantArgb=$sampleArgb
+                    }
+                }
+            }
+            $dominantColor=[Drawing.Color]::FromArgb($dominantArgb)
+            $shaderEvidence.dominant_color=@{r=[int]$dominantColor.R;g=[int]$dominantColor.G;b=[int]$dominantColor.B;count=$dominantCount}
+            $shaderEvidence | ConvertTo-Json -Depth 6 | Set-Content `
+                -LiteralPath (Join-Path $env:WINGHOSTTY_HOSTED_EVIDENCE_DIR 'shaders\shader-capture.json') -Encoding UTF8
+        }
     }
     finally {
         $bitmap.Dispose()

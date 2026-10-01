@@ -2,6 +2,145 @@
 
 Manual and interactive harnesses for Windows-specific functionality.
 
+## GitHub-hosted Windows Server CPU profile
+
+The `windows-interactive` job uses **`windows-2025` X64 (Windows Server 2025)**,
+not Windows 11 client, with application-local **Mesa 26.2.3 WGL llvmpipe**.
+Its required check name remains **Windows 11 Interactive Composite** solely
+for historical rule compatibility. The job summary, artifact
+`hosted-windows-server-cpu-<run>-<attempt>`, and versioned evidence identify
+the actual profile as **`HOSTEDWINDOWSSERVERCPU`**.
+
+This is real core GUI/render/shader correctness coverage, not Windows 11
+client, physical GPU, hardware pacing/reset recovery, Snap/Mica, native
+ARM64, release, or GraphCode/macOS parity proof. No policy, required-check
+identity, renderer/application code, or provider pin is changed. The
+strict client release consumer `scripts\check-accessibility-evidence.ps1`
+is separate and unchanged; hosted evidence does not satisfy it.
+`assert-interactive-runner.ps1` defaults to `ClientRelease` and now
+explicitly requires self-hosted provenance and Windows **client**
+`ProductType=1`. This is intentional provenance tightening; its existing
+desktop/session/user/runner-version/SHA checks still apply.
+
+The hosted runner producer is `assert-interactive-runner.ps1 -Profile
+HostedServerCpu`. `winghostty.hosted-runner-provenance.v1` records the actual
+OS product type/build, runner environment/architecture, Runner.Worker
+executable resolved through trusted process ancestry, exact checkout,
+repository/run/attempt, and current session/window station/thread/input
+desktop. Native and CIM process creation times must agree within only
+the documented CIM microsecond truncation interval, never a millisecond
+PID-reuse tolerance. The owned native canary must actually acquire
+foreground/focus, receive `SendInput`, and capture its painted pixels with
+`CopyFromScreen`. Missing desktop, Explorer, ownership, input, capture, or
+cleanup capability is a **failure**, not a skip or an assumed capability.
+GitHub image documentation is not evidence that this canary will pass.
+
+The first eligible hosted run established the native canary on the actual
+`win25-vs2026` image, but stopped before app/GL execution because the dev
+wrapper's year/edition-only paths missed the installed Visual Studio.
+`scripts\dev-windows.cmd` now queries the already installed official
+`vswhere.exe` for the latest C++-capable installation and requires exactly
+one existing `Common7\Tools\VsDevCmd.bat`. Tool failure, ambiguous output
+and stale paths fail explicitly; absent discovery retains the existing
+2019/2022 developer fallback. No installation, system changes or Zig-version
+change is involved. The wrapper is included in the exact source-binding
+roster; headless controls execute the actual batch with a console-only
+tool/path fixture, never a GUI or GL proxy.
+
+The subsequent eligible source run built the actual application and
+established Mesa vendor/llvmpipe OpenGL 4.6, GLSL 4.60 and the required
+entrypoints with both pinned loaded DLL paths/hashes. It then failed the
+first smoke evidence hook because `Get-FileHash` was unavailable in its
+Windows PowerShell 5.1 child. Hosted file hashing uses a streaming .NET
+SHA256 helper with explicit I/O failures, including the shader PNG hash;
+headless controls exercise the actual PS5 shared record/hash/JSON transport
+with the legacy hash command unavailable. The early VS batch fixture uses
+an existence-only, never-executed `ZIG_HOME` placeholder so its
+`--print-cache-paths` checks do not depend on Setup Zig having run.
+Neither correction substitutes for the still-required nine real app groups.
+
+The next source run completed real smoke, key-input and new-tab harnesses
+before the outer census observer rejected multiple retained parent-PID
+generations. Its guard checked historical candidates before the current
+census identity; the exact runtime PID was not saved and is not inferred.
+The observer now matches the current creation generation first, recognizes
+native/CIM representations of the same retained root, and keeps captured
+owned process handles through phase cleanup. Historical children require
+an actual retained-handle PID reservation covering their creation time;
+elapsed time or a later owned generation alone is not ownership proof.
+Unknown reservations and genuinely overlapping identities fail closed with
+owned-only typed guard state. An internal phase runtime seam exercises the
+actual observer, real PS5 record writer, collector and finalizer with the
+existing nine synthetic fixtures; it is not a native GUI replacement.
+Snapshot-to-handle acquisition handles only the exact `ProcessNotFound`
+error: a fresh available census must confirm the observed PID is absent,
+its owned parent reservation must cover creation, and no captured or
+parent-linked descendant may survive. That identity is recorded as
+observed/confirmed absent, never as a native handle reservation. Reused or
+still-present PIDs, inaccessible processes and unavailable/partial census
+remain failures with the original acquisition error and typed guard state.
+
+`scripts\setup-hosted-opengl.ps1` verifies the exact release asset, size and
+SHA256 from `fixtures\hosted-opengl-lock.json` before extraction. It stages
+only `x64\opengl32.dll` and `x64\libgallium_wgl.dll` beside this job's
+`zig-out\bin\winghostty.exe`, never into system DLL directories or release
+packages. All existing harness executable resolvers use that exact
+application directory, including the shader-enabled rebuild. The locked
+archive SHA256 is
+`3f3613adb43cfd0f2e665ce2400b130c275f0b3317cb3a05566320a3a67589ed`.
+The loader imports the megadriver plus GDI32/KERNEL32; the megadriver
+imports only SHELL32/ole32/ADVAPI32/ntdll/KERNEL32/USER32/GDI32/VERSION.
+The producer independently decodes **both static and delay PE imports**;
+these pinned DLLs have no delay imports or extra DLL dependencies.
+Pinned distribution/Mesa/LLVM/zstd/zlib notices and build information are
+retained as artifacts. The only driver selector is `GALLIUM_DRIVER=llvmpipe`;
+GL/GLSL version and extension overrides are forbidden.
+
+A real WGL context probes GL/GLSL >= 4.3 and actual function availability.
+Each application stage separately binds the retained app PID, exact
+native creation time, owned HWNDs, and both actually loaded Mesa DLL paths
+and hashes. Screen capture validates the current foreground/hit-tested
+owned rectangle immediately before reading pixels. UIA semantic pixel
+tests retain their existing owned-window-DC sampling (not screen-capture
+substitutes), with immediate retained-owner/client-coordinate guards.
+Cleanup independently attempts all steps, preserves the original failure
+and every secondary, and records available, observed and remaining
+process counts. Unavailable counts remain null/error, never zero.
+
+`run-hosted-interactive.ps1` runs the unchanged eight PR groups (smoke,
+key input, new tab, resize, undo, accessibility, palette/theme and session
+restore) plus the real custom-shader harness. Its existing `+version`,
+solid-magenta fixture and dominant 4-by-4 sampled RGB threshold
+`R >= 220, G <= 40, B >= 220` remain intact. The strict checker
+`assert-hosted-interactive-evidence.ps1` independently decodes the actual
+retained PNG and recomputes that same ordered sampling/threshold, checks
+artifact bytes/hashes, exact canonical harness/source rosters, typed
+counters, app/HWND/module correlation and nonempty, known zero-leak
+cleanup. Non-PR eligible events additionally retain the full flagship
+composite, 600-second accessibility soak, High Contrast palette test and
+session-restore run; the 60-minute budget and 14-day retention are unchanged.
+
+Headless contract controls (no local GUI/GL/input operations):
+
+```powershell
+pwsh -NoProfile -File .\test\windows\test-hosted-interactive.ps1
+pwsh -NoProfile -File .\test\windows\flagship\Test-VerificationContracts.ps1
+pwsh -NoProfile -File .\test\windows\interactive-win11.ps1
+```
+
+The synthetic fixture is explicitly marked **fixture-only**, not native
+evidence. These tests and declaration-only interop compilation cannot
+establish hosted desktop/GL feasibility. That requires the normal new
+PR's actual GitHub-hosted run; it must fail explicitly if the capability
+is unavailable. Do not provision login/users/runners or waive assertions
+to manufacture success.
+
+Public dependency/platform references:
+[GitHub-hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners),
+[Windows 2025 image](https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-Readme.md),
+[pinned Mesa distribution](https://github.com/pal1000/mesa-dist-win/tree/26.2.3),
+[llvmpipe](https://docs.mesa3d.org/drivers/llvmpipe.html).
+
 Each interactive Win11 harness uses its own repo-local sandbox under
 `.sandbox\win11\<worktree-id>\<sandbox-name>`, so `-ResetState` resets
 only that harness's logs/temp state instead of tearing down sibling

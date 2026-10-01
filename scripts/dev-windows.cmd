@@ -28,6 +28,8 @@ if "%ZIG_HOME%"=="" if exist "%_USER_HOME%\tools\zig-x86_64-windows-0.15.2\zig.e
 if "%ZIG_HOME%"=="" if exist "%_USER_HOME%\tools\zig\zig.exe" set "ZIG_HOME=%_USER_HOME%\tools\zig"
 if "%ZIG_HOME%"=="" if exist "%_PROGRAM_FILES%\Zig" set "ZIG_HOME=%_PROGRAM_FILES%\Zig"
 for %%I in (zig.exe) do if "%ZIG_HOME%"=="" if not "%%~$PATH:I"=="" set "ZIG_HOME=%%~dp$PATH:I"
+call :resolve-installed-vs
+if errorlevel 1 exit /b 1
 if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES_X86%\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES_X86%\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"
 if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES%\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES%\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat"
 if "%VSDEVCMD%"=="" if exist "%_PROGRAM_FILES%\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat" set "VSDEVCMD=%_PROGRAM_FILES%\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat"
@@ -141,3 +143,32 @@ if "%~1"=="" (
 
 %*
 exit /b %errorlevel%
+
+:resolve-installed-vs
+set "_VSWHERE=%_PROGRAM_FILES_X86%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%_VSWHERE%" exit /b 0
+set "_VSWHERE_OUT=%_TEMP_DIR%\winghostty-vswhere-%RANDOM%-%RANDOM%.txt"
+"%_VSWHERE%" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -latest -property installationPath > "%_VSWHERE_OUT%"
+if errorlevel 1 (
+  echo Installed Visual Studio discovery failed.
+  if exist "%_VSWHERE_OUT%" del "%_VSWHERE_OUT%"
+  exit /b 1
+)
+set "_VS_INSTALL_COUNT=0"
+set "_VS_INSTALL_ROOT="
+for /f "usebackq delims=" %%I in ("%_VSWHERE_OUT%") do (
+  set /a "_VS_INSTALL_COUNT+=1" >nul
+  set "_VS_INSTALL_ROOT=%%I"
+)
+del "%_VSWHERE_OUT%"
+if %_VS_INSTALL_COUNT% GTR 1 (
+  echo Installed Visual Studio discovery returned ambiguous installation paths.
+  exit /b 1
+)
+if %_VS_INSTALL_COUNT% EQU 0 exit /b 0
+if not exist "%_VS_INSTALL_ROOT%\Common7\Tools\VsDevCmd.bat" (
+  echo Installed Visual Studio discovery returned an unavailable dev shell.
+  exit /b 1
+)
+set "VSDEVCMD=%_VS_INSTALL_ROOT%\Common7\Tools\VsDevCmd.bat"
+exit /b 0
