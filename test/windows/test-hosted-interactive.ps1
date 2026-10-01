@@ -233,6 +233,99 @@ $live=Get-HostedOwnedCleanup $known @(
 if ($live.remaining_process_count -ne 3 -or $live.observed_process_count -ne 3) { throw 'Owned phase tree failed to close transitively.' }
 $script:checks++
 Assert-Rejected { Get-HostedOwnedCleanup $known @() } 'unavailable final phase table'
+$scalarKnown=@{root=@{process_id=100;parent_id=1;started_at=$rootCreated.AddTicks(9).ToString('o')}}
+$scalar=Get-HostedOwnedProcesses $scalarKnown $snapshot[0]
+if ($scalar.Count -ne 1) { throw 'A one-row census duplicated the retained native root using its CIM-rounded key.' }
+$script:checks++
+Assert-Rejected {
+    Get-HostedOwnedProcesses @{root=@{process_id=100;parent_id=1;started_at=$rootCreated.ToString('o')}} $snapshot {
+        param($entry)
+        @{process_id=[int]$entry.ProcessId;parent_id=[int]$entry.ParentProcessId
+            started_at=([datetime]$entry.CreationDate).AddMilliseconds(1).ToString('o')}
+    }
+} 'retained descendant must reject a native generation outside its source microsecond interval'
+$generations=@{
+    old=@{process_id=200;parent_id=100;started_at=$rootCreated.AddSeconds(1).ToString('o');pid_reserved_through=$rootCreated.AddSeconds(9).ToString('o')}
+    current=@{process_id=200;parent_id=100;started_at=$rootCreated.AddSeconds(10).ToString('o');pid_reserved_through=$rootCreated.AddSeconds(12).ToString('o')}
+}
+$generationTable=@(
+    [pscustomobject]@{ProcessId=200;ParentProcessId=100;CreationDate=$rootCreated.AddSeconds(10)},
+    [pscustomobject]@{ProcessId=201;ParentProcessId=200;CreationDate=$rootCreated.AddSeconds(11)}
+)
+# Extracted from the failed 0084161 source; usable in depth-one CI checkouts.
+$oldObserverText=@'
+function Get-HostedOwnedProcesses($Known, [object[]] $Table) {
+    if ($Table.Count -eq 0) { throw 'Process-table availability is unknown; empty is not zero owned helpers.' }
+    $changed = $true
+    while ($changed) {
+        $changed = $false
+        foreach ($entry in $Table) {
+            $parentId=[int]$entry.ParentProcessId
+            if (@($Known.Values | Where-Object { $_.process_id -eq $entry.ProcessId -or $_.process_id -eq $parentId }).Count -eq 0) { continue }
+            $created=([datetime]$entry.CreationDate).ToUniversalTime()
+            $identity="$([int]$entry.ProcessId)|$($created.Ticks)"
+            if ($Known.ContainsKey($identity)) { continue }
+            $parents=@($Known.Values | Where-Object { $_.process_id -eq $parentId -and $created -ge ([datetime]$_.started_at).ToUniversalTime() })
+            if ($parents.Count -gt 1) { throw 'Ambiguous/reused hosted parent PID identity.' }
+            if ($parents.Count -eq 1) {
+                $currentParents=@($Table | Where-Object ProcessId -EQ $parentId)
+                if ($currentParents.Count -eq 1 -and
+                    -not (Test-HostedProcessCreationBinding ([datetime]$parents[0].started_at) ([datetime]$currentParents[0].CreationDate))) {
+                    continue
+                }
+                $Known[$identity]=@{process_id=[int]$entry.ProcessId;parent_id=$parentId;started_at=$created.ToString('o')}
+                $changed=$true
+            }
+        }
+    }
+    return $Known
+}
+'@
+$oldTokens=$null;$oldErrors=$null
+$oldObserverAst=[Management.Automation.Language.Parser]::ParseInput($oldObserverText,[ref]$oldTokens,[ref]$oldErrors)
+$oldObserver=@($oldObserverAst.FindAll({param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-HostedOwnedProcesses'
+},$true))
+if ($oldObserver.Count -ne 1) { throw 'Failed source observer is not uniquely bound.' }
+. ([scriptblock]::Create(($oldObserver[0].Extent.Text -replace '^function Get-HostedOwnedProcesses','function Get-FailedHostedOwnedProcesses')))
+Assert-Rejected { Get-FailedHostedOwnedProcesses (Copy-Fixture $generations) $generationTable } 'actual failed observer checks history before current generation (RED)'
+$generationResult=Get-HostedOwnedProcesses $generations $generationTable
+if (@($generationResult.Values | Where-Object process_id -EQ 201).Count -ne 1) {
+    throw 'Current census generation was not bound before historical PID ambiguity.'
+}
+$script:checks++
+$duplicateGeneration=Copy-Fixture $generations
+$duplicateGeneration.clone=Copy-Fixture $generations.current
+Assert-Rejected { Get-HostedOwnedProcesses $duplicateGeneration $generationTable } 'genuinely overlapping retained identity must not be deduplicated'
+$missingParent=@([pscustomobject]@{ProcessId=202;ParentProcessId=200;CreationDate=$rootCreated.AddSeconds(5)})
+$historical=Get-HostedOwnedProcesses (Copy-Fixture $generations) $missingParent
+if (@($historical.Values | Where-Object process_id -EQ 202).Count -ne 1) { throw 'Bounded historical generation failed to retain a late-observed child.' }
+$script:checks++
+$survivingOldChild=Get-HostedOwnedProcesses (Copy-Fixture $generations) @(
+    $generationTable[0],$missingParent[0]
+)
+if (@($survivingOldChild.Values | Where-Object process_id -EQ 202).Count -ne 1) {
+    throw 'A late-observed child predating the current PID generation lost its bounded historical owner.'
+}
+$script:checks++
+$unknownGeneration=@(
+    [pscustomobject]@{ProcessId=200;ParentProcessId=999;CreationDate=$rootCreated.AddSeconds(20)},
+    [pscustomobject]@{ProcessId=203;ParentProcessId=200;CreationDate=$rootCreated.AddSeconds(21)}
+)
+$unknown=Get-HostedOwnedProcesses (Copy-Fixture $generations) $unknownGeneration
+if (@($unknown.Values | Where-Object process_id -EQ 203).Count -ne 0) { throw 'A foreign current parent generation was adopted as an owned descendant.' }
+$script:checks++
+Assert-Rejected {
+    Get-HostedOwnedProcesses (Copy-Fixture $generations) @(
+        [pscustomobject]@{ProcessId=204;ParentProcessId=200;CreationDate=$rootCreated.AddMinutes(2)}
+    )
+} 'absent latest parent is unbounded history, not proof against unobserved foreign PID reuse'
+$gap=Copy-Fixture $generations
+Assert-Rejected {
+    Get-HostedOwnedProcesses $gap @(
+        [pscustomobject]@{ProcessId=205;ParentProcessId=200;CreationDate=$rootCreated.AddSeconds(9).AddMilliseconds(500)}
+    )
+} 'next owned generation alone cannot prove the intervening PID reservation gap'
 
 $script:attempts=[Collections.Generic.List[string]]::new()
 $original=[InvalidOperationException]::new('original controlled harness failure')
@@ -631,6 +724,157 @@ $script:checks++
 $legacy=Invoke-VsDiscoveryFixture ''
 if ($legacy.exit_code -ne 0 -or $legacy.text -notmatch 'FIXTURE_LEGACY_VS_SHELL') { throw 'Registered discovery absence must preserve existing legacy fallback.' }
 $script:checks++
+
+$phaseRoot=Join-Path $fixtureRoot 'inert-phase'
+[IO.Directory]::CreateDirectory($phaseRoot) | Out-Null
+$phaseInput=Join-Path $phaseRoot 'input-fixture-only.json'
+$modeledSuite=Copy-Fixture $suite
+foreach ($group in $modeledSuite.groups) {
+    $group.cleanup.processes[0].parent_id=900
+    $nativeCapture=([DateTimeOffset]$group.loaded_modules[0].started_at).AddTicks(6).ToString('o')
+    $group.loaded_modules[0].started_at=$nativeCapture
+    $group.owned_windows[0].started_at=$nativeCapture
+}
+$modeledSuite | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $phaseInput -Encoding utf8NoBOM
+$childTransport=Join-Path $phaseRoot 'inert-record-child.ps1'
+[IO.File]::WriteAllText($childTransport,@'
+param([string]$InputPath,[string]$LibPath,[string]$Root)
+$ErrorActionPreference='Stop'
+$ProgressPreference='SilentlyContinue'
+Import-Module Microsoft.PowerShell.Management -ErrorAction Stop
+Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
+. $LibPath
+$PSModuleAutoLoadingPreference='None'
+function Get-FileHash { throw 'Legacy hash command is intentionally unavailable in this inert transport control.' }
+$suite=Get-Content -LiteralPath $InputPath -Raw | ConvertFrom-Json
+if ($suite.fixture_only -ne $true) { throw 'Child transport requires explicitly inert input.' }
+foreach ($group in $suite.groups) {
+    $module=$group.loaded_modules[0]
+    $record=@{
+        process_id=$module.process_id;started_at=$module.started_at
+        started_ticks=([DateTimeOffset]$module.started_at).UtcTicks
+        application_path=$module.application_path;application_sha256=$module.application_sha256
+        module_path=$module.path;module_sha256=$module.sha256
+        megadriver_path=$module.megadriver_path;megadriver_sha256=$module.megadriver_sha256
+        windows=@($group.owned_windows[0].hwnd);cleanup=$group.cleanup
+        secondary_failures=@();fixture_only=$true
+    }
+    $env:WINGHOSTTY_HOSTED_EVIDENCE_DIR=[IO.Path]::Combine($Root,'processes')
+    $env:WINGHOSTTY_HOSTED_STAGE=$group.name
+    Save-HostedProcessEvidence $record
+}
+[Console]::WriteLine('Inert actual PS5 child evidence writer: PASS; native capabilities not executed.')
+'@)
+$script:phasePolls=0;$script:phaseCensusCalls=0;$script:phaseDisposed=0
+$nativeRoot=$rootCreated.AddSeconds(-1).AddTicks(7)
+$cimRoot=$rootCreated.AddSeconds(-1)
+$inertProcess=[pscustomobject]@{
+    Id=900;Handle=[IntPtr]1;StartTime=$nativeRoot;HasExited=$false;ExitCode=0
+    StandardOutput=$null;StandardError=$null
+}
+$inertProcess | Add-Member ScriptMethod WaitForExit {
+    param($milliseconds)
+    $script:phasePolls++
+    if ($script:phasePolls -ge 2) { $this.HasExited=$true;return $true }
+    return $false
+}
+$inertProcess | Add-Member ScriptMethod Dispose { $script:phaseDisposed++ }
+$runtime=@{
+    start={
+        param($scriptPath,$arguments)
+        $text=@(& powershell.exe -NoLogo -NoProfile -NonInteractive -File $scriptPath @arguments 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw "Actual inert PS5 child writer failed: $($text -join "`n")" }
+        $stream=[pscustomobject]@{Value=($text -join "`n")}
+        $stream | Add-Member ScriptMethod ReadToEndAsync { return [Threading.Tasks.Task]::FromResult([string]$this.Value) }
+        $empty=[pscustomobject]@{Value=''}
+        $empty | Add-Member ScriptMethod ReadToEndAsync { return [Threading.Tasks.Task]::FromResult([string]$this.Value) }
+        $inertProcess.StandardOutput=$stream;$inertProcess.StandardError=$empty
+        return $inertProcess
+    }
+    census={
+        $script:phaseCensusCalls++
+        if ($script:phaseCensusCalls -gt 1) { return $unrelated }
+        @(
+            [pscustomobject]@{ProcessId=900;ParentProcessId=$PID;CreationDate=$cimRoot},
+            [pscustomobject]@{ProcessId=10;ParentProcessId=900;CreationDate=$rootCreated},
+            [pscustomobject]@{ProcessId=11;ParentProcessId=10;CreationDate=$rootCreated.AddSeconds(1)},
+            [pscustomobject]@{ProcessId=12;ParentProcessId=11;CreationDate=$rootCreated.AddSeconds(2)}
+        ) + $generationTable
+    }
+    stop_root={ throw 'Positive inert phase unexpectedly requested root termination.' }
+    stop_descendant={ throw 'Positive inert phase unexpectedly adopted a foreign or already-exited process.' }
+    retain={
+        param($entry)
+        @{process_id=[int]$entry.ProcessId;parent_id=[int]$entry.ParentProcessId
+            started_at=([datetime]$entry.CreationDate).ToUniversalTime().AddTicks(6).ToString('o')
+            pid_reserved_through=$rootCreated.AddSeconds(30).ToString('o')}
+    }
+    release={}
+}
+$phaseKnown=Copy-Fixture $generations
+$phaseLog=Join-Path $phaseRoot 'phase.log'
+Invoke-HostedHarnessProcess $childTransport @(
+    '-InputPath',$phaseInput,'-LibPath',(Join-Path $repoRoot 'scripts\interactive-win11-lib.ps1'),'-Root',$phaseRoot
+) $phaseLog $phaseKnown $runtime
+if ($script:phaseDisposed -ne 1 -or @($phaseKnown.Values | Where-Object process_id -EQ 900).Count -ne 1 -or
+    (Get-Content $phaseLog -Raw) -notmatch 'Inert actual PS5 child evidence writer: PASS') {
+    throw 'Actual phase entry/census/native-versus-CIM identity/PS5 output transport did not complete.'
+}
+$modeledSuite.groups=@($modeledSuite.groups | ForEach-Object {
+    Get-HostedGroupEvidence @{name=$_.name;harness=$_.harness;harness_sha256=$_.harness_sha256;status='pass';exit_code=0} $phaseRoot
+})
+$modeledSuite.groups[8].shader_pixels=Copy-Fixture $suite.groups[8].shader_pixels
+$modeledSuite.groups[8].shader_pixels.started_at=$modeledSuite.groups[8].loaded_modules[0].started_at
+$modeledSuite.groups[8].screenshot=Copy-Fixture $suite.groups[8].screenshot
+Copy-Item -LiteralPath $pngPath -Destination (Join-Path $phaseRoot 'fixture.png') -Force
+$phaseErrors=[Collections.Generic.List[object]]::new()
+Complete-HostedInteractiveRun -Result $modeledSuite -OldEnvironment @{} -Primary $null -Secondary $phaseErrors `
+    -CleanupProof { $modeledSuite.cleanup=Get-HostedOwnedCleanup $phaseKnown @($unrelated);Assert-HostedCleanup $modeledSuite.cleanup } `
+    -SourceBindings {} -RestoreVariable {} -SummaryWriter {} -DiagnosticWriter {} `
+    -EvidenceValidator { Assert-HostedInteractiveEvidence $modeledSuite $phaseRoot $repoRoot } `
+    -ResultWriter { $modeledSuite | ConvertTo-Json -Depth 40 | Set-Content (Join-Path $phaseRoot 'result-fixture-only.json') -Encoding utf8NoBOM }
+if ($modeledSuite.groups.Count -ne 9 -or $modeledSuite.cleanup.remaining_process_count -ne 0 -or
+    $modeledSuite.fixture_only -ne $true) { throw 'Inert phase/PS5 record collector/finalizer/strict consumer did not complete nine existing fixtures.' }
+$script:checks++
+$savedStreams=@{out=$inertProcess.StandardOutput;err=$inertProcess.StandardError}
+$phaseFailure=[InvalidOperationException]::new('inert actual phase census unavailable')
+$faultRuntime=@{
+    start={
+        param($scriptPath,$arguments)
+        $inertProcess.HasExited=$false
+        $broken=[pscustomobject]@{}
+        $broken | Add-Member ScriptMethod ReadToEndAsync {
+            return [Threading.Tasks.Task]::FromException[string]([IO.IOException]::new('partial owned output'))
+        }
+        $inertProcess.StandardOutput=$broken
+        return $inertProcess
+    }
+    census={ throw $phaseFailure }
+    stop_root={ $inertProcess.HasExited=$true;throw 'root cleanup failure' }
+    stop_descendant={ throw 'Unexpected descendant adoption from unavailable census.' }
+    retain={ throw 'Unexpected retention from unavailable census.' }
+    release={}
+}
+$script:phasePolls=0;$script:phaseDisposed=0
+try {
+    Invoke-HostedHarnessProcess 'inert-no-native.ps1' @() (Join-Path $phaseRoot 'fault-output.log') @{} $faultRuntime
+    throw 'Actual phase swallowed primary census failure.'
+} catch {
+    if (-not [object]::ReferenceEquals($_.Exception,$phaseFailure) -or
+        @($_.Exception.Data['hosted_secondary_failures']).Count -ne 3 -or $script:phaseDisposed -ne 1) {
+        throw 'Actual phase lost original failure, partial-output secondary, or independent handle disposal.'
+    }
+} finally {
+    $inertProcess.StandardOutput=$savedStreams.out;$inertProcess.StandardError=$savedStreams.err
+}
+$script:checks++
+$partialRecord=Join-Path $phaseRoot 'processes\smoke\process-partial.json'
+[IO.File]::WriteAllText($partialRecord,'{"process_id":')
+try {
+    Assert-Rejected {
+        Get-HostedGroupEvidence @{name='smoke';harness='test\windows\interactive-win11-smoke.ps1'} $phaseRoot
+    } 'partial actual child JSON must not become completed group evidence'
+} finally { [IO.File]::Delete($partialRecord) }
 
 function Assert-HostedSourceGuards([string] $Text, [string] $Context, [string[]] $Members, [int] $ExpectedCount) {
     $tokens=$null;$errors=$null

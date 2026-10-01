@@ -59,6 +59,20 @@ an existence-only, never-executed `ZIG_HOME` placeholder so its
 `--print-cache-paths` checks do not depend on Setup Zig having run.
 Neither correction substitutes for the still-required nine real app groups.
 
+The next source run completed real smoke, key-input and new-tab harnesses
+before the outer census observer rejected multiple retained parent-PID
+generations. Its guard checked historical candidates before the current
+census identity; the exact runtime PID was not saved and is not inferred.
+The observer now matches the current creation generation first, recognizes
+native/CIM representations of the same retained root, and keeps captured
+owned process handles through phase cleanup. Historical children require
+an actual retained-handle PID reservation covering their creation time;
+elapsed time or a later owned generation alone is not ownership proof.
+Unknown reservations and genuinely overlapping identities fail closed with
+owned-only typed guard state. An internal phase runtime seam exercises the
+actual observer, real PS5 record writer, collector and finalizer with the
+existing nine synthetic fixtures; it is not a native GUI replacement.
+
 `scripts\setup-hosted-opengl.ps1` verifies the exact release asset, size and
 SHA256 from `fixtures\hosted-opengl-lock.json` before extraction. It stages
 only `x64\opengl32.dll` and `x64\libgallium_wgl.dll` beside this job's

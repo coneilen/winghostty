@@ -6,7 +6,7 @@ param(
     [string] $OutputDirectory
 )
 
-function Get-HostedOwnedProcesses($Known, [object[]] $Table) {
+function Get-HostedOwnedProcesses($Known, [object[]] $Table, [scriptblock] $RetainIdentity) {
     if ($Table.Count -eq 0) { throw 'Process-table availability is unknown; empty is not zero owned helpers.' }
     $changed = $true
     while ($changed) {
@@ -16,16 +16,56 @@ function Get-HostedOwnedProcesses($Known, [object[]] $Table) {
             if (@($Known.Values | Where-Object { $_.process_id -eq $entry.ProcessId -or $_.process_id -eq $parentId }).Count -eq 0) { continue }
             $created=([datetime]$entry.CreationDate).ToUniversalTime()
             $identity="$([int]$entry.ProcessId)|$($created.Ticks)"
-            if ($Known.ContainsKey($identity)) { continue }
+            $retained=@($Known.Values | Where-Object {
+                $_.process_id -eq $entry.ProcessId -and
+                    (Test-HostedProcessCreationBinding ([datetime]$_.started_at) $created)
+            })
+            if ($retained.Count -gt 1) { throw 'Ambiguous current owned process generation identity.' }
+            if ($retained.Count -eq 1) { continue }
             $parents=@($Known.Values | Where-Object { $_.process_id -eq $parentId -and $created -ge ([datetime]$_.started_at).ToUniversalTime() })
-            if ($parents.Count -gt 1) { throw 'Ambiguous/reused hosted parent PID identity.' }
-            if ($parents.Count -eq 1) {
-                $currentParents=@($Table | Where-Object ProcessId -EQ $parentId)
-                if ($currentParents.Count -eq 1 -and
-                    -not (Test-HostedProcessCreationBinding ([datetime]$parents[0].started_at) ([datetime]$currentParents[0].CreationDate))) {
-                    continue
+            $currentParents=@($Table | Where-Object ProcessId -EQ $parentId)
+            if ($currentParents.Count -gt 1) { throw 'Ambiguous current census parent PID identity.' }
+            if ($currentParents.Count -eq 1 -and $created -ge ([datetime]$currentParents[0].CreationDate).ToUniversalTime()) {
+                $parents=@($parents | Where-Object {
+                    Test-HostedProcessCreationBinding ([datetime]$_.started_at) ([datetime]$currentParents[0].CreationDate)
+                })
+            } else {
+                $parents=@($parents | Where-Object {
+                    $candidateStart=([datetime]$_.started_at).ToUniversalTime().Ticks
+                    $_.ContainsKey('pid_reserved_through') -and
+                        $created.Ticks -ge $candidateStart -and
+                        $created.Ticks -le ([datetime]$_.pid_reserved_through).ToUniversalTime().Ticks
+                })
+                if ($parents.Count -eq 0 -and @($Known.Values | Where-Object {
+                    $_.process_id -eq $parentId -and $created -ge ([datetime]$_.started_at).ToUniversalTime()
+                }).Count -gt 0) {
+                    $failure=[InvalidOperationException]::new('Hosted parent generation has no current identity or retained-handle reservation covering the child creation time.')
+                    $failure.Data['owned_guard_state']=@{
+                        child_pid=[int]$entry.ProcessId;child_started_at=$created.ToString('o');parent_pid=$parentId
+                        current_parent_count=$currentParents.Count
+                    }
+                    throw $failure
                 }
-                $Known[$identity]=@{process_id=[int]$entry.ProcessId;parent_id=$parentId;started_at=$created.ToString('o')}
+            }
+            if ($parents.Count -gt 1) {
+                $failure=[InvalidOperationException]::new('Ambiguous/reused hosted parent PID generation identity.')
+                $failure.Data['owned_guard_state']=@{
+                    child_pid=[int]$entry.ProcessId;child_started_at=$created.ToString('o');parent_pid=$parentId
+                    parent_candidates=@($parents);current_parent_count=$currentParents.Count
+                }
+                throw $failure
+            }
+            if ($parents.Count -eq 1) {
+                $record=@{process_id=[int]$entry.ProcessId;parent_id=$parentId;started_at=$created.ToString('o')}
+                if ($RetainIdentity) {
+                    $record=& $RetainIdentity $entry
+                    if ($record.process_id -ne $entry.ProcessId -or $record.parent_id -ne $parentId -or
+                        -not (Test-HostedProcessCreationBinding ([datetime]$record.started_at) $created)) {
+                        throw 'Retained descendant handle does not match its observed PID/parent/creation interval.'
+                    }
+                    $identity="$($record.process_id)|$(([datetime]$record.started_at).ToUniversalTime().Ticks)"
+                }
+                $Known[$identity]=$record
                 $changed=$true
             }
         }
@@ -49,16 +89,71 @@ function Get-HostedOwnedCleanup($Known, [object[]] $Table) {
     return @{available=$true;observed_process_count=$Known.Count;remaining_process_count=$live;processes=@($Known.Values)}
 }
 
-function Invoke-HostedHarnessProcess([string] $Script, [string[]] $Arguments, [string] $LogPath, $Known) {
-    $start = [Diagnostics.ProcessStartInfo]::new()
-    $start.FileName = (Get-Command pwsh.exe -CommandType Application -ErrorAction Stop).Source
-    $start.UseShellExecute=$false
-    $start.RedirectStandardOutput=$true; $start.RedirectStandardError=$true
-    foreach ($argument in @('-NoLogo','-NoProfile','-File',$Script)+$Arguments) { $start.ArgumentList.Add($argument) }
-    $process=[Diagnostics.Process]::Start($start)
+function Invoke-HostedHarnessProcess([string] $Script, [string[]] $Arguments, [string] $LogPath, $Known, [hashtable] $Runtime) {
+    $heldHandles=@{}
+    if ($null -eq $Runtime) {
+        $Runtime=@{
+            start={
+                param($scriptPath,$scriptArguments)
+                $start=[Diagnostics.ProcessStartInfo]::new()
+                $start.FileName=(Get-Command pwsh.exe -CommandType Application -ErrorAction Stop).Source
+                $start.UseShellExecute=$false
+                $start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true
+                foreach ($argument in @('-NoLogo','-NoProfile','-File',$scriptPath)+$scriptArguments) { $start.ArgumentList.Add($argument) }
+                [Diagnostics.Process]::Start($start)
+            }
+            census={
+                $table=@(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate -OperationTimeoutSec 5 -ErrorAction Stop)
+                foreach ($key in $heldHandles.Keys) {
+                    if ($Known.ContainsKey($key)) { $Known[$key].pid_reserved_through=[DateTime]::UtcNow.ToString('o') }
+                }
+                $table
+            }
+            retain={
+                param($entry)
+                $owned=Get-Process -Id $entry.ProcessId -ErrorAction Stop
+                [void]$owned.Handle
+                $nativeStarted=$owned.StartTime.ToUniversalTime()
+                if (-not (Test-HostedProcessCreationBinding $nativeStarted ([datetime]$entry.CreationDate))) {
+                    $owned.Dispose()
+                    throw 'Descendant PID changed before its identity handle could be retained.'
+                }
+                $key="$($owned.Id)|$($nativeStarted.Ticks)"
+                $heldHandles[$key]=$owned
+                @{process_id=$owned.Id;parent_id=[int]$entry.ParentProcessId;started_at=$nativeStarted.ToString('o');pid_reserved_through=[DateTime]::UtcNow.ToString('o')}
+            }
+            release={
+                foreach ($key in @($heldHandles.Keys)) {
+                    try {
+                        $Known[$key].pid_reserved_through=[DateTime]::UtcNow.ToString('o')
+                        if (-not [object]::ReferenceEquals($heldHandles[$key],$process)) { $heldHandles[$key].Dispose() }
+                    } catch { $secondary.Add("retained handle release: $($_.Exception.Message)") }
+                }
+            }
+            stop_root={
+                param($root,$rootHandle,$rootStarted)
+                Stop-InteractiveWin11RootHandle -Process $root -RootProcessHandle $rootHandle -RootStartedAt $rootStarted
+            }
+            stop_descendant={
+                param($entry)
+                $owned=Get-Process -Id $entry.ProcessId -ErrorAction Stop
+                if (-not (Test-HostedProcessCreationBinding $owned.StartTime ([datetime]$entry.CreationDate))) {
+                    throw 'Owned descendant PID was reused before cleanup.'
+                }
+                [void]$owned.Handle
+                Stop-Process -Id $owned.Id -ErrorAction Stop
+                if (-not $owned.WaitForExit(15000)) { throw 'Owned descendant termination exceeded 15 seconds.' }
+            }
+        }
+    }
+    foreach ($name in @('start','census','retain','release','stop_root','stop_descendant')) {
+        if ($Runtime[$name] -isnot [scriptblock]) { throw "Hosted phase runtime is incomplete: $name" }
+    }
+    $process=& $Runtime.start $Script $Arguments
     $handle=$process.Handle
     $started=$process.StartTime.ToUniversalTime()
     $Known["$($process.Id)|$($started.Ticks)"]=@{process_id=$process.Id;parent_id=$PID;started_at=$started.ToString('o')}
+    $heldHandles["$($process.Id)|$($started.Ticks)"]=$process
     $stdout=$process.StandardOutput.ReadToEndAsync()
     $stderr=$process.StandardError.ReadToEndAsync()
     $primary=$null
@@ -67,33 +162,30 @@ function Invoke-HostedHarnessProcess([string] $Script, [string[]] $Arguments, [s
     try {
         while (-not $process.WaitForExit(200)) {
             if ([DateTime]::UtcNow -gt $deadline) { throw 'Hosted harness phase exceeded its bounded deadline.' }
-            $table=@(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate -OperationTimeoutSec 5 -ErrorAction Stop)
-            [void](Get-HostedOwnedProcesses $Known $table)
+            $table=@(& $Runtime.census)
+            [void](Get-HostedOwnedProcesses $Known $table $Runtime.retain)
         }
         if ($process.ExitCode -ne 0) { throw "Actual harness exited $($process.ExitCode): $(Split-Path -Leaf $Script)" }
     } catch { $primary=$_ }
     finally {
         try {
             if (-not $process.HasExited) {
-                Stop-InteractiveWin11RootHandle -Process $process -RootProcessHandle $handle -RootStartedAt $started
+                [void](& $Runtime.stop_root $process $handle $started)
             }
         } catch { $secondary.Add("root cleanup: $($_.Exception.Message)") }
         try {
             # Only terminate identity-matched descendants of our retained phase
             # roots. Never query or print foreign command lines/UI contents.
-            $table=@(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate -OperationTimeoutSec 5 -ErrorAction Stop)
-            [void](Get-HostedOwnedProcesses $Known $table)
+            $table=@(& $Runtime.census)
+            [void](Get-HostedOwnedProcesses $Known $table $Runtime.retain)
             foreach ($entry in $table | Sort-Object CreationDate -Descending) {
-                $identity="$([int]$entry.ProcessId)|$(([datetime]$entry.CreationDate).ToUniversalTime().Ticks)"
-                if (-not $Known.ContainsKey($identity)) { continue }
+                $matches=@($Known.Values | Where-Object {
+                    $_.process_id -eq $entry.ProcessId -and (Test-HostedProcessCreationBinding ([datetime]$_.started_at) ([datetime]$entry.CreationDate))
+                })
+                if ($matches.Count -gt 1) { throw 'Ambiguous retained descendant generation before cleanup.' }
+                if ($matches.Count -eq 0) { continue }
                 try {
-                    $owned=Get-Process -Id $entry.ProcessId -ErrorAction Stop
-                    if (-not (Test-HostedProcessCreationBinding $owned.StartTime ([datetime]$entry.CreationDate))) {
-                        throw 'Owned descendant PID was reused before cleanup.'
-                    }
-                    [void]$owned.Handle
-                    Stop-Process -Id $owned.Id -ErrorAction Stop
-                    if (-not $owned.WaitForExit(15000)) { throw 'Owned descendant termination exceeded 15 seconds.' }
+                    [void](& $Runtime.stop_descendant $entry)
                 } catch { $secondary.Add("descendant $($entry.ProcessId) cleanup: $($_.Exception.Message)") }
             }
         } catch { $secondary.Add("descendant cleanup: $($_.Exception.Message)") }
@@ -101,6 +193,7 @@ function Invoke-HostedHarnessProcess([string] $Script, [string[]] $Arguments, [s
             if (-not $stdout.Wait(5000) -or -not $stderr.Wait(5000)) { throw 'Owned harness output streams did not close.' }
             [IO.File]::WriteAllText($LogPath,$stdout.Result+"`n"+$stderr.Result)
         } catch { $secondary.Add("harness evidence: $($_.Exception.Message)") }
+        try { [void](& $Runtime.release) } catch { $secondary.Add("retained handle disposal: $($_.Exception.Message)") }
         try { $process.Dispose() } catch { $secondary.Add("root handle disposal: $($_.Exception.Message)") }
     }
     if ($primary) {
@@ -287,6 +380,7 @@ if ($MyInvocation.InvocationName -ne '.') {
     } catch {
         $primary=$_
         $result.failure=@{type=$_.Exception.GetType().FullName;message=$_.Exception.Message}
+        if ($_.Exception.Data.Contains('owned_guard_state')) { $result.failure.guard_state=$_.Exception.Data['owned_guard_state'] }
         if ($_.Exception.Data.Contains('hosted_secondary_failures')) {
             foreach ($errorMessage in $_.Exception.Data['hosted_secondary_failures']) {
                 if ($errorMessage -is [Collections.IDictionary]) { $secondary.Add($errorMessage) }
