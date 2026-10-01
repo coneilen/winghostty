@@ -11,6 +11,9 @@ if (-not (Test-Path -LiteralPath $checker)) {
 . $checker
 
 $script:checks = 0
+if ((Get-Content (Join-Path $repoRoot 'scripts\dev-windows.cmd') -Raw) -notmatch '(?m)^:resolve-installed-vs\s*$') {
+    throw 'RED: actual batch wrapper has no installed VS discovery; hosted win25-vs2026 cannot bootstrap.'
+}
 function Assert-Rejected([scriptblock] $Action, [string] $Reason) {
     $rejected = $false
     try { & $Action } catch { $rejected = $true }
@@ -260,7 +263,7 @@ try {
     $bitmap.Save($pngPath,[Drawing.Imaging.ImageFormat]::Png)
 } finally { $bitmap.Dispose() }
 $sourcePaths=@(
-    '.github\workflows\test.yml','scripts\setup-hosted-opengl.ps1','scripts\interactive-win11-lib.ps1',
+    '.github\workflows\test.yml','scripts\dev-windows.cmd','scripts\setup-hosted-opengl.ps1','scripts\interactive-win11-lib.ps1',
     'test\windows\interactive-win11-stateful-lib.ps1','test\windows\interactive-win11-pr-smoke.ps1',
     'test\windows\run-hosted-interactive.ps1','test\windows\assert-interactive-runner.ps1',
     'test\windows\assert-hosted-interactive-evidence.ps1','test\windows\fixtures\hosted-opengl-lock.json'
@@ -494,6 +497,85 @@ $finalizerCalls=@($outerAst.FindAll({param($node)
 if ($finalizerCalls.Count -ne 1 -or $finalizerCalls[0].Parent.Parent -isnot [Management.Automation.Language.StatementBlockAst]) {
     throw 'The tested finalizer is not the actual outer production finally path.'
 }
+$script:checks++
+
+$vsFixture=Join-Path $fixtureRoot 'installed-vs'
+[IO.Directory]::CreateDirectory($vsFixture) | Out-Null
+$fakeProgramFiles=Join-Path $vsFixture 'Program Files'
+$fakeProgramFilesX86=Join-Path $vsFixture 'Program Files (x86)'
+$installer=Join-Path $fakeProgramFilesX86 'Microsoft Visual Studio\Installer'
+[IO.Directory]::CreateDirectory($installer) | Out-Null
+$fakeVswhere=Join-Path $installer 'vswhere.exe'
+if (-not (Test-Path $fakeVswhere)) {
+    $compilerScript=@'
+Add-Type -OutputType ConsoleApplication -OutputAssembly $env:WINGHOSTTY_VSWHERE_STUB_PATH -TypeDefinition @"
+using System;
+public static class VswhereDiscoveryFixture {
+    public static int Main(string[] args) {
+        string actual=String.Join("|",args);
+        string expected="-products|*|-requires|Microsoft.VisualStudio.Component.VC.Tools.x86.x64|-latest|-property|installationPath";
+        if (actual != expected) return 17;
+        Console.Write(Environment.GetEnvironmentVariable("WINGHOSTTY_VSWHERE_FIXTURE_OUTPUT"));
+        return Int32.Parse(Environment.GetEnvironmentVariable("WINGHOSTTY_VSWHERE_FIXTURE_EXIT"));
+    }
+}
+"@
+'@
+    $savedStub=$env:WINGHOSTTY_VSWHERE_STUB_PATH
+    try {
+        $env:WINGHOSTTY_VSWHERE_STUB_PATH=$fakeVswhere
+        $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($compilerScript))
+        & powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $fakeVswhere)) { throw 'Headless discovery tool fixture compilation failed.' }
+    } finally { $env:WINGHOSTTY_VSWHERE_STUB_PATH=$savedStub }
+}
+$newVsRoot=Join-Path $fakeProgramFiles 'Microsoft Visual Studio\18\Enterprise'
+$newShell=Join-Path $newVsRoot 'Common7\Tools\VsDevCmd.bat'
+$legacyRoot=Join-Path $fakeProgramFiles 'Microsoft Visual Studio\2022\Community'
+$legacyShell=Join-Path $legacyRoot 'Common7\Tools\VsDevCmd.bat'
+if ([IO.File]::Exists($legacyShell)) { [IO.File]::Delete($legacyShell) }
+[IO.Directory]::CreateDirectory((Split-Path -Parent $newShell)) | Out-Null
+[IO.File]::WriteAllText($newShell,"@echo off`r`necho FIXTURE_VS_SHELL`r`nexit /b 0`r`n")
+function Invoke-VsDiscoveryFixture([string] $Output, [int] $ExitCode=0) {
+    $saved=@{}
+    foreach ($name in @('ProgramFiles','ProgramFiles(x86)','WINGHOSTTY_VSWHERE_FIXTURE_OUTPUT','WINGHOSTTY_VSWHERE_FIXTURE_EXIT')) {
+        $saved[$name]=[Environment]::GetEnvironmentVariable($name)
+    }
+    try {
+        [Environment]::SetEnvironmentVariable('ProgramFiles',$fakeProgramFiles)
+        [Environment]::SetEnvironmentVariable('ProgramFiles(x86)',$fakeProgramFilesX86)
+        $env:WINGHOSTTY_VSWHERE_FIXTURE_OUTPUT=$Output
+        $env:WINGHOSTTY_VSWHERE_FIXTURE_EXIT=[string]$ExitCode
+        $batchCommand='set "ProgramFiles='+$fakeProgramFiles+'" & set "ProgramFiles(x86)='+$fakeProgramFilesX86+'" & call "'+
+            (Join-Path $repoRoot 'scripts\dev-windows.cmd')+'" --print-cache-paths'
+        $text=@(& $env:ComSpec /d /c $batchCommand 2>&1)
+        return @{exit_code=$LASTEXITCODE;text=($text -join "`n")}
+    } finally {
+        foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name,$saved[$name]) }
+    }
+}
+$discovered=Invoke-VsDiscoveryFixture $newVsRoot
+if ($discovered.exit_code -ne 0 -or $discovered.text -notmatch 'FIXTURE_VS_SHELL' -or
+    $discovered.text -notmatch 'ZIG_LOCAL_CACHE_DIR=') { throw "Actual wrapper failed installed current VS layout: $($discovered.text)" }
+$script:checks++
+foreach ($case in @(
+    @{output=($newVsRoot+"`r`n"+$newVsRoot);exit=0;reason='ambiguous'},
+    @{output=(Join-Path $vsFixture 'missing installation');exit=0;reason='unavailable'},
+    @{output=$newVsRoot;exit=9;reason='failed'}
+)) {
+    $result=Invoke-VsDiscoveryFixture $case.output $case.exit
+    if ($result.exit_code -eq 0 -or $result.text -notmatch $case.reason -or $result.text -match 'FIXTURE_VS_SHELL') {
+        throw "Actual wrapper accepted $($case.reason) installed discovery."
+    }
+    $script:checks++
+}
+$missing=Invoke-VsDiscoveryFixture ''
+if ($missing.exit_code -eq 0 -or $missing.text -notmatch 'Missing VS Dev shell bootstrap') { throw "No installed or legacy VS must fail explicitly: $($missing.text)" }
+$script:checks++
+[IO.Directory]::CreateDirectory((Split-Path -Parent $legacyShell)) | Out-Null
+[IO.File]::WriteAllText($legacyShell,"@echo off`r`necho FIXTURE_LEGACY_VS_SHELL`r`nexit /b 0`r`n")
+$legacy=Invoke-VsDiscoveryFixture ''
+if ($legacy.exit_code -ne 0 -or $legacy.text -notmatch 'FIXTURE_LEGACY_VS_SHELL') { throw 'Registered discovery absence must preserve existing legacy fallback.' }
 $script:checks++
 
 function Assert-HostedSourceGuards([string] $Text, [string] $Context, [string[]] $Members, [int] $ExpectedCount) {

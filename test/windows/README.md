@@ -35,6 +35,18 @@ foreground/focus, receive `SendInput`, and capture its painted pixels with
 cleanup capability is a **failure**, not a skip or an assumed capability.
 GitHub image documentation is not evidence that this canary will pass.
 
+The first eligible hosted run established the native canary on the actual
+`win25-vs2026` image, but stopped before app/GL execution because the dev
+wrapper's year/edition-only paths missed the installed Visual Studio.
+`scripts\dev-windows.cmd` now queries the already installed official
+`vswhere.exe` for the latest C++-capable installation and requires exactly
+one existing `Common7\Tools\VsDevCmd.bat`. Tool failure, ambiguous output
+and stale paths fail explicitly; absent discovery retains the existing
+2019/2022 developer fallback. No installation, system changes or Zig-version
+change is involved. The wrapper is included in the exact source-binding
+roster; headless controls execute the actual batch with a console-only
+tool/path fixture, never a GUI or GL proxy.
+
 `scripts\setup-hosted-opengl.ps1` verifies the exact release asset, size and
 SHA256 from `fixtures\hosted-opengl-lock.json` before extraction. It stages
 only `x64\opengl32.dll` and `x64\libgallium_wgl.dll` beside this job's

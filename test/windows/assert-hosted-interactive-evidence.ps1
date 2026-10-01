@@ -449,7 +449,7 @@ function Assert-HostedInteractiveEvidence($Evidence, [string] $Root, [string] $S
         $_.process_id -eq $shader.shader_pixels.process_id -and $_.started_at -ceq $shader.shader_pixels.started_at -and $_.hwnd -eq $shader.shader_pixels.hwnd
     }).Count -ne 1) { throw 'Shader PNG is not correlated to its retained app/HWND capture.' }
     $expectedSources=@(
-        '.github\workflows\test.yml','scripts\setup-hosted-opengl.ps1','scripts\interactive-win11-lib.ps1',
+        '.github\workflows\test.yml','scripts\dev-windows.cmd','scripts\setup-hosted-opengl.ps1','scripts\interactive-win11-lib.ps1',
         'test\windows\interactive-win11-stateful-lib.ps1','test\windows\interactive-win11-pr-smoke.ps1',
         'test\windows\run-hosted-interactive.ps1','test\windows\assert-interactive-runner.ps1',
         'test\windows\assert-hosted-interactive-evidence.ps1','test\windows\fixtures\hosted-opengl-lock.json'
