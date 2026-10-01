@@ -443,6 +443,8 @@ function Assert-HostedInteractiveEvidence($Evidence, [string] $Root, [string] $S
     }
     if ($shader.shader_pixels.roi.width -ne $actualPixels.width -or $shader.shader_pixels.roi.height -ne $actualPixels.height) { throw 'Owned sampling ROI dimensions disagree with actual PNG.' }
     Assert-HostedRequired $shader.shader_pixels @('process_id','started_at','hwnd')
+    Assert-HostedIntegerFields $shader.shader_pixels @('process_id','hwnd')
+    if ($shader.shader_pixels.started_at -isnot [string]) { throw 'Shader capture creation identity must be a string.' }
     if (@($shader.owned_windows | Where-Object {
         $_.process_id -eq $shader.shader_pixels.process_id -and $_.started_at -ceq $shader.shader_pixels.started_at -and $_.hwnd -eq $shader.shader_pixels.hwnd
     }).Count -ne 1) { throw 'Shader PNG is not correlated to its retained app/HWND capture.' }

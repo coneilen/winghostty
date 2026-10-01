@@ -141,6 +141,53 @@ function Get-HostedGroupEvidence($Group, [string] $Root) {
     return $Group
 }
 
+function Complete-HostedInteractiveRun {
+    param(
+        [hashtable] $Result,
+        [hashtable] $OldEnvironment,
+        $Primary,
+        [Collections.Generic.List[object]] $Secondary,
+        [scriptblock] $CleanupProof,
+        [scriptblock] $SourceBindings,
+        [scriptblock] $RestoreVariable,
+        [scriptblock] $SummaryWriter,
+        [scriptblock] $ResultWriter,
+        [scriptblock] $DiagnosticWriter
+    )
+    foreach ($step in @(
+        @{name='final cleanup proof';action=$CleanupProof},
+        @{name='suite source bindings';action=$SourceBindings}
+    )) {
+        try { [void](& $step.action) }
+        catch { $Secondary.Add(@{phase=$step.name;type=$_.Exception.GetType().FullName;message=$_.Exception.Message}) }
+    }
+    foreach ($key in $OldEnvironment.Keys) {
+        try { [void](& $RestoreVariable $key $OldEnvironment[$key]) }
+        catch { $Secondary.Add(@{phase="environment restore $key";type=$_.Exception.GetType().FullName;message=$_.Exception.Message}) }
+    }
+    if ($Primary -or $Secondary.Count -gt 0) { $Result.status='error' }
+    try { [void](& $SummaryWriter) }
+    catch { $Secondary.Add(@{phase='job summary';type=$_.Exception.GetType().FullName;message=$_.Exception.Message}) }
+    $diagnosticCount=$Secondary.Count
+    for ($index=0;$index -lt $diagnosticCount;$index++) {
+        try { [void](& $DiagnosticWriter $Secondary[$index]) }
+        catch { $Secondary.Add(@{phase='secondary diagnostic';type=$_.Exception.GetType().FullName;message=$_.Exception.Message}) }
+    }
+    $Result.secondary_failures=@($Secondary)
+    if ($Secondary.Count -gt 0) { $Result.status='error' }
+    try { [void](& $ResultWriter) }
+    catch { $Secondary.Add(@{phase='final evidence write';type=$_.Exception.GetType().FullName;message=$_.Exception.Message}) }
+    if ($Primary) {
+        $Primary.Exception.Data['hosted_secondary_failures']=@($Secondary)
+        throw $Primary
+    }
+    if ($Secondary.Count -gt 0) {
+        $failure=[InvalidOperationException]::new('Hosted finalization failed: '+(($Secondary | ForEach-Object { "$($_.phase): $($_.message)" }) -join '; '))
+        $failure.Data['hosted_secondary_failures']=@($Secondary)
+        throw $failure
+    }
+}
+
 if ($MyInvocation.InvocationName -ne '.') {
     $ErrorActionPreference='Stop'
     $repoRoot=Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -162,7 +209,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         sources=@();event_name=$EventName
     }
     $primary=$null
-    $secondary=[Collections.Generic.List[string]]::new()
+    $secondary=[Collections.Generic.List[object]]::new()
     $known=@{}
     $oldEnvironment=@{}
     foreach ($key in @('WINGHOSTTY_HOSTED_PROFILE','WINGHOSTTY_HOSTED_APP_PATH','WINGHOSTTY_HOSTED_GL_SHA256','WINGHOSTTY_HOSTED_GALLIUM_SHA256','WINGHOSTTY_HOSTED_EVIDENCE_DIR','WINGHOSTTY_HOSTED_STAGE','GALLIUM_DRIVER')) {
@@ -233,15 +280,17 @@ if ($MyInvocation.InvocationName -ne '.') {
         $primary=$_
         $result.failure=@{type=$_.Exception.GetType().FullName;message=$_.Exception.Message}
         if ($_.Exception.Data.Contains('hosted_secondary_failures')) {
-            foreach ($errorMessage in $_.Exception.Data['hosted_secondary_failures']) { $secondary.Add($errorMessage) }
+            foreach ($errorMessage in $_.Exception.Data['hosted_secondary_failures']) {
+                if ($errorMessage -is [Collections.IDictionary]) { $secondary.Add($errorMessage) }
+                else { $secondary.Add(@{phase='harness cleanup/evidence';type='System.InvalidOperationException';message=[string]$errorMessage}) }
+            }
         }
     } finally {
-        try {
+        Complete-HostedInteractiveRun -Result $result -OldEnvironment $oldEnvironment -Primary $primary -Secondary $secondary -CleanupProof {
             $table=@(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate -OperationTimeoutSec 5 -ErrorAction Stop)
             $result.cleanup=Get-HostedOwnedCleanup $known $table
             Assert-HostedCleanup $result.cleanup
-        } catch { $secondary.Add("final cleanup proof: $($_.Exception.Message)") }
-        try {
+        } -SourceBindings {
             foreach ($path in @(
                 '.github\workflows\test.yml','scripts\setup-hosted-opengl.ps1','scripts\interactive-win11-lib.ps1',
                 'test\windows\interactive-win11-stateful-lib.ps1','test\windows\interactive-win11-pr-smoke.ps1',
@@ -250,13 +299,10 @@ if ($MyInvocation.InvocationName -ne '.') {
             )) {
                 $result.sources+=@{path=$path;sha256=(Get-FileHash (Join-Path $repoRoot $path)).Hash.ToLowerInvariant()}
             }
-        } catch { $secondary.Add("suite source bindings: $($_.Exception.Message)") }
-        $result.secondary_failures=@($secondary)
-        if ($secondary.Count -gt 0) { $result.status='error' }
-        try {
-            $result | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'result.json') -Encoding utf8NoBOM
-        } catch { $secondary.Add("final evidence write: $($_.Exception.Message)") }
-        foreach ($key in $oldEnvironment.Keys) { [Environment]::SetEnvironmentVariable($key,$oldEnvironment[$key]) }
+        } -RestoreVariable {
+            param($key,$value)
+            [Environment]::SetEnvironmentVariable($key,$value)
+        } -SummaryWriter {
         if ($env:GITHUB_STEP_SUMMARY) {
             @"
 ## HOSTEDWINDOWSSERVERCPU: $($result.status)
@@ -266,11 +312,12 @@ Completed real groups: $($result.groups.Count). Missing desktop, GL, pixels, gro
 **NOT** Windows 11 client, physical GPU/pacing/reset, Snap/Mica, native ARM64, release, or GraphCode macOS parity proof.
 "@ | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
         }
+        } -DiagnosticWriter {
+            param($errorRecord)
+            Write-Warning "HOSTED_SECONDARY_FAILURE $($errorRecord.phase): $($errorRecord.message)" -WarningAction Continue
+        } -ResultWriter {
+            $result | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'result.json') -Encoding utf8NoBOM
+        }
     }
-    if ($primary) {
-        foreach ($errorMessage in $secondary) { Write-Warning "HOSTED_SECONDARY_FAILURE $errorMessage" }
-        throw $primary
-    }
-    if ($secondary.Count -gt 0) { throw "Hosted secondary failures: $($secondary -join '; ')" }
     Assert-HostedInteractiveEvidence $result $OutputDirectory $repoRoot
 }

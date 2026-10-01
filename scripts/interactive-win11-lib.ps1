@@ -456,7 +456,8 @@ function Stop-HostedInteractiveProcess([Diagnostics.Process] $Process) {
     $record.secondary_failures=@($secondary)
     try { Save-HostedProcessEvidence $record } catch { $secondary.Add("evidence: $($_.Exception.Message)") }
     foreach ($failure in $secondary) {
-        Write-Warning "HOSTED_SECONDARY_FAILURE process=$($Process.Id) $failure"
+        try { Write-Warning "HOSTED_SECONDARY_FAILURE process=$($Process.Id) $failure" -WarningAction Continue }
+        catch { $record.secondary_failures += "diagnostic: $($_.Exception.Message)" }
     }
     # The external hosted stage collector fails on any missing/error cleanup
     # record. Do not replace an exception already unwinding this harness.

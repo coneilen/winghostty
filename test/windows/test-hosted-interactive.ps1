@@ -324,6 +324,14 @@ foreach ($key in @('observed_app_count','observed_window_count')) {
 }
 $bad=Copy-Fixture $suite; $bad.groups[8].screenshot.path='absent.png'
 Assert-Rejected { Assert-HostedInteractiveEvidence $bad $fixtureRoot $repoRoot } 'missing PNG'
+foreach ($key in @('process_id','hwnd')) {
+    foreach ($value in @([string]$suite.groups[8].shader_pixels[$key],[double]$suite.groups[8].shader_pixels[$key],$true)) {
+        $bad=Copy-Fixture $suite;$bad.groups[8].shader_pixels[$key]=$value
+        Assert-Rejected { Assert-HostedInteractiveEvidence $bad $fixtureRoot $repoRoot } "wrong shader capture integer type $key"
+    }
+}
+$bad=Copy-Fixture $suite;$bad.groups[8].shader_pixels.started_at=[DateTimeOffset]$cleanup.processes[0].started_at
+Assert-Rejected { Assert-HostedInteractiveEvidence $bad $fixtureRoot $repoRoot } 'shader identity must be an explicit string'
 $bad=Copy-Fixture $suite; $bad.groups[0].artifacts[0].sha256='0'*64
 Assert-Rejected { Assert-HostedInteractiveEvidence $bad $fixtureRoot $repoRoot } 'unbound group artifact'
 $bad=Copy-Fixture $suite; $bad.groups[0].harness_sha256='0'*64
@@ -427,6 +435,49 @@ $bad=Copy-Fixture $clientPixel;$bad.owner_pid=200
 Assert-Rejected { Assert-HostedClientPixelObservation $bad } 'window-DC HWND ownership changed'
 $bad=Copy-Fixture $observation;$bad.module_verified='True'
 Assert-Rejected { Invoke-HostedOwnedPrimitive $bad {} -Capture } 'string boolean cannot authorize primitive'
+
+$script:finalizerAttempts=[Collections.Generic.List[string]]::new()
+$finalizerException=[InvalidOperationException]::new('actual outer primary fixture')
+$primaryRecord=$null
+try { throw $finalizerException } catch { $primaryRecord=$_ }
+$finalizerResult=@{status='pass';secondary_failures=@()}
+$finalizerErrors=[Collections.Generic.List[object]]::new()
+$oldWarnings=$WarningPreference
+try {
+    $WarningPreference='Stop'
+    try {
+        Complete-HostedInteractiveRun -Result $finalizerResult -OldEnvironment @{ONE='one';TWO='two'} `
+            -Primary $primaryRecord -Secondary $finalizerErrors `
+            -CleanupProof { $script:finalizerAttempts.Add('cleanup');throw 'unavailable actual cleanup seam' } `
+            -SourceBindings { $script:finalizerAttempts.Add('sources');throw 'source writer failed' } `
+            -RestoreVariable {param($key,$value) $script:finalizerAttempts.Add("environment $key");throw 'restore failed'} `
+            -SummaryWriter { $script:finalizerAttempts.Add('summary');throw [IO.IOException]::new('summary IO failed') } `
+            -DiagnosticWriter {param($errorRecord) $script:finalizerAttempts.Add('warning');Write-Warning 'controlled diagnostic failure'} `
+            -ResultWriter { $script:finalizerAttempts.Add('result');throw [IO.IOException]::new('result IO failed') }
+        throw 'Actual outer finalizer swallowed the primary.'
+    } catch {
+        if (-not [object]::ReferenceEquals($_.Exception,$finalizerException) -or
+            @($_.Exception.Data['hosted_secondary_failures']).Count -ne 11 -or
+            $finalizerResult.status -cne 'error' -or
+            @($script:finalizerAttempts | Where-Object { $_ -like 'environment *' }).Count -ne 2 -or
+            ($script:finalizerAttempts | Select-Object -Last 1) -cne 'result') {
+            throw 'Actual outer production finalizer masked the original or skipped an independent step.'
+        }
+        foreach ($secondaryFailure in $_.Exception.Data['hosted_secondary_failures']) {
+            Assert-HostedRequired $secondaryFailure @('phase','type','message')
+        }
+    }
+} finally { $WarningPreference=$oldWarnings }
+$script:checks++
+$tokens=$null;$errors=$null
+$outerAst=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'run-hosted-interactive.ps1'),[ref]$tokens,[ref]$errors)
+$finalizerCalls=@($outerAst.FindAll({param($node)
+    $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ceq 'Complete-HostedInteractiveRun'
+},$true))
+if ($finalizerCalls.Count -ne 1 -or $finalizerCalls[0].Parent.Parent -isnot [Management.Automation.Language.StatementBlockAst]) {
+    throw 'The tested finalizer is not the actual outer production finally path.'
+}
+$script:checks++
 
 function Assert-HostedSourceGuards([string] $Text, [string] $Context, [string[]] $Members, [int] $ExpectedCount) {
     $tokens=$null;$errors=$null
