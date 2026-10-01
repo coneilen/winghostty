@@ -149,6 +149,7 @@ function Complete-HostedInteractiveRun {
         [Collections.Generic.List[object]] $Secondary,
         [scriptblock] $CleanupProof,
         [scriptblock] $SourceBindings,
+        [Parameter(Mandatory)] [scriptblock] $EvidenceValidator,
         [scriptblock] $RestoreVariable,
         [scriptblock] $SummaryWriter,
         [scriptblock] $ResultWriter,
@@ -164,6 +165,13 @@ function Complete-HostedInteractiveRun {
     foreach ($key in $OldEnvironment.Keys) {
         try { [void](& $RestoreVariable $key $OldEnvironment[$key]) }
         catch { $Secondary.Add(@{phase="environment restore $key";type=$_.Exception.GetType().FullName;message=$_.Exception.Message}) }
+    }
+    if (-not $Primary -and $Secondary.Count -eq 0) {
+        try { [void](& $EvidenceValidator) }
+        catch {
+            $Primary=$_
+            $Result.failure=@{type=$_.Exception.GetType().FullName;message=$_.Exception.Message}
+        }
     }
     if ($Primary -or $Secondary.Count -gt 0) { $Result.status='error' }
     try { [void](& $SummaryWriter) }
@@ -299,6 +307,8 @@ if ($MyInvocation.InvocationName -ne '.') {
             )) {
                 $result.sources+=@{path=$path;sha256=(Get-FileHash (Join-Path $repoRoot $path)).Hash.ToLowerInvariant()}
             }
+        } -EvidenceValidator {
+            Assert-HostedInteractiveEvidence $result $OutputDirectory $repoRoot
         } -RestoreVariable {
             param($key,$value)
             [Environment]::SetEnvironmentVariable($key,$value)
@@ -319,5 +329,4 @@ Completed real groups: $($result.groups.Count). Missing desktop, GL, pixels, gro
             $result | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'result.json') -Encoding utf8NoBOM
         }
     }
-    Assert-HostedInteractiveEvidence $result $OutputDirectory $repoRoot
 }

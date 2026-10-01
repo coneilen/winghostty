@@ -450,6 +450,7 @@ try {
             -Primary $primaryRecord -Secondary $finalizerErrors `
             -CleanupProof { $script:finalizerAttempts.Add('cleanup');throw 'unavailable actual cleanup seam' } `
             -SourceBindings { $script:finalizerAttempts.Add('sources');throw 'source writer failed' } `
+            -EvidenceValidator { throw 'Validator must not replace an existing primary or cleanup error.' } `
             -RestoreVariable {param($key,$value) $script:finalizerAttempts.Add("environment $key");throw 'restore failed'} `
             -SummaryWriter { $script:finalizerAttempts.Add('summary');throw [IO.IOException]::new('summary IO failed') } `
             -DiagnosticWriter {param($errorRecord) $script:finalizerAttempts.Add('warning');Write-Warning 'controlled diagnostic failure'} `
@@ -468,6 +469,22 @@ try {
         }
     }
 } finally { $WarningPreference=$oldWarnings }
+$script:checks++
+$validationFailure=[InvalidOperationException]::new('actual retained PNG validation failed')
+$validationResult=@{status='pass';failure=$null;secondary_failures=@()}
+$validationErrors=[Collections.Generic.List[object]]::new()
+$script:writtenValidationStatus=$null
+try {
+    Complete-HostedInteractiveRun -Result $validationResult -OldEnvironment @{} -Primary $null -Secondary $validationErrors `
+        -CleanupProof {} -SourceBindings {} -RestoreVariable {} -SummaryWriter {} -DiagnosticWriter {} `
+        -EvidenceValidator {throw $validationFailure} -ResultWriter {$script:writtenValidationStatus=$validationResult.status}
+    throw 'Finalizer accepted invalid complete evidence.'
+} catch {
+    if (-not [object]::ReferenceEquals($_.Exception,$validationFailure) -or
+        $script:writtenValidationStatus -cne 'error' -or $null -eq $validationResult.failure) {
+        throw 'Strict validation failure emitted success-shaped evidence or lost its identity.'
+    }
+}
 $script:checks++
 $tokens=$null;$errors=$null
 $outerAst=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'run-hosted-interactive.ps1'),[ref]$tokens,[ref]$errors)
