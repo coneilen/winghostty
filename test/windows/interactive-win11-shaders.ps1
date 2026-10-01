@@ -168,7 +168,7 @@ try {
             $shaderEvidence = @{
                 process_id=$process.Id;started_at=$process.StartTime.ToUniversalTime().ToString('o')
                 hwnd=$surface.Hwnd.ToInt64();screenshot=$screenshotPath
-                screenshot_sha256=(Get-FileHash -LiteralPath $screenshotPath).Hash.ToLowerInvariant()
+                screenshot_sha256=(Get-HostedFileSha256 $screenshotPath)
                 width=$bitmap.Width;height=$bitmap.Height;sampled_pixels=0;magenta_pixels=0
                 png_bytes=(Get-Item -LiteralPath $screenshotPath).Length
                 roi=@{left=$rect.Left;top=$rect.Top;width=$bitmap.Width;height=$bitmap.Height}

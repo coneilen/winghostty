@@ -155,6 +155,9 @@ foreach ($replacement in @(
 }
 
 . (Join-Path $repoRoot 'scripts\interactive-win11-lib.ps1')
+if (-not (Get-Command Get-HostedFileSha256 -ErrorAction SilentlyContinue)) {
+    throw 'RED: hosted app evidence depends on unavailable Get-FileHash in the actual PS5.1 child.'
+}
 . (Join-Path $PSScriptRoot 'run-hosted-interactive.ps1')
 . (Join-Path $repoRoot 'scripts\setup-hosted-opengl.ps1')
 $tokens=$null;$errors=$null
@@ -255,6 +258,53 @@ $fixtureRoot=Join-Path $repoRoot '.sandbox\hosted-headless-contracts'
 [IO.Directory]::CreateDirectory($fixtureRoot) | Out-Null
 $logPath=Join-Path $fixtureRoot 'fixture.log'
 [IO.File]::WriteAllText($logPath,'Synthetic headless contract fixture; NOT native GUI evidence.')
+$hashFixture=Join-Path $fixtureRoot 'hash-abc.bin'
+[IO.File]::WriteAllBytes($hashFixture,[Text.Encoding]::ASCII.GetBytes('abc'))
+if ((Get-HostedFileSha256 $hashFixture) -cne 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad' -or
+    (Get-HostedFileSha256 $hashFixture) -cne (Get-FileHash $hashFixture).Hash.ToLowerInvariant()) {
+    throw 'Streaming SHA256 changed exact file-byte hash semantics.'
+}
+$script:checks++
+Assert-Rejected { Get-HostedFileSha256 (Join-Path $fixtureRoot 'hash-absent.bin') } 'missing hash file must preserve explicit IO failure'
+$ps5Transport=@'
+$ErrorActionPreference='Stop'
+$ProgressPreference='SilentlyContinue'
+Import-Module Microsoft.PowerShell.Management -ErrorAction Stop
+Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
+. $env:WINGHOSTTY_TRANSPORT_LIB
+$PSModuleAutoLoadingPreference='None'
+function Get-FileHash { throw 'Unavailable legacy command must not be used.' }
+$hash=Get-HostedFileSha256 $env:WINGHOSTTY_TRANSPORT_HASH_FILE
+if ($hash -cne 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad') { throw 'PS5 streaming hash mismatch' }
+$record=@{
+    process_id=123;started_ticks=456;started_at='2026-10-01T10:00:00.0000000Z'
+    module_sha256=$hash;windows=@(789);secondary_failures=@()
+    cleanup=@{available=$true;observed_process_count=1;remaining_process_count=0;processes=@(@{process_id=123;parent_id=1;started_at='2026-10-01T10:00:00.0000000Z'})}
+    fixture_only=$true
+}
+Save-HostedProcessEvidence $record
+$path=Join-Path $env:WINGHOSTTY_HOSTED_EVIDENCE_DIR 'transport\process-123-456.json'
+$read=Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+if ($read.module_sha256 -cne $hash -or $read.cleanup.available -ne $true -or $read.windows[0] -ne 789 -or
+    $read.fixture_only -ne $true) { throw 'Actual PS5 owned record JSON transport failed' }
+[Console]::WriteLine('Actual PS5 shared hash/owned-record JSON writer/read transport: PASS (inert records; no native calls)')
+'@
+$transportEnvironment=@{}
+foreach ($name in @('WINGHOSTTY_TRANSPORT_LIB','WINGHOSTTY_TRANSPORT_HASH_FILE','WINGHOSTTY_HOSTED_EVIDENCE_DIR','WINGHOSTTY_HOSTED_STAGE')) {
+    $transportEnvironment[$name]=[Environment]::GetEnvironmentVariable($name)
+}
+try {
+    $env:WINGHOSTTY_TRANSPORT_LIB=Join-Path $repoRoot 'scripts\interactive-win11-lib.ps1'
+    $env:WINGHOSTTY_TRANSPORT_HASH_FILE=$hashFixture
+    $env:WINGHOSTTY_HOSTED_EVIDENCE_DIR=Join-Path $fixtureRoot 'ps5-transport'
+    $env:WINGHOSTTY_HOSTED_STAGE='transport'
+    $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($ps5Transport))
+    & powershell.exe -NoLogo -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand $encoded
+    if ($LASTEXITCODE -ne 0) { throw 'Actual production PS5 transport control failed.' }
+    $script:checks++
+} finally {
+    foreach ($name in $transportEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name,$transportEnvironment[$name]) }
+}
 $pngPath=Join-Path $fixtureRoot 'fixture.png'
 Add-Type -AssemblyName System.Drawing
 $bitmap=[Drawing.Bitmap]::new(16,16)
@@ -506,6 +556,9 @@ $fakeProgramFilesX86=Join-Path $vsFixture 'Program Files (x86)'
 $installer=Join-Path $fakeProgramFilesX86 'Microsoft Visual Studio\Installer'
 [IO.Directory]::CreateDirectory($installer) | Out-Null
 $fakeVswhere=Join-Path $installer 'vswhere.exe'
+$fixtureZig=Join-Path $vsFixture 'zig-existence-only'
+[IO.Directory]::CreateDirectory($fixtureZig) | Out-Null
+[IO.File]::WriteAllText((Join-Path $fixtureZig 'zig.exe'),'Existence-only inert fixture; never execute or claim a Zig version.')
 if (-not (Test-Path $fakeVswhere)) {
     $compilerScript=@'
 Add-Type -OutputType ConsoleApplication -OutputAssembly $env:WINGHOSTTY_VSWHERE_STUB_PATH -TypeDefinition @"
@@ -538,7 +591,7 @@ if ([IO.File]::Exists($legacyShell)) { [IO.File]::Delete($legacyShell) }
 [IO.File]::WriteAllText($newShell,"@echo off`r`necho FIXTURE_VS_SHELL`r`nexit /b 0`r`n")
 function Invoke-VsDiscoveryFixture([string] $Output, [int] $ExitCode=0) {
     $saved=@{}
-    foreach ($name in @('ProgramFiles','ProgramFiles(x86)','WINGHOSTTY_VSWHERE_FIXTURE_OUTPUT','WINGHOSTTY_VSWHERE_FIXTURE_EXIT')) {
+    foreach ($name in @('ProgramFiles','ProgramFiles(x86)','ZIG_HOME','WINGHOSTTY_VSWHERE_FIXTURE_OUTPUT','WINGHOSTTY_VSWHERE_FIXTURE_EXIT')) {
         $saved[$name]=[Environment]::GetEnvironmentVariable($name)
     }
     try {
@@ -546,6 +599,7 @@ function Invoke-VsDiscoveryFixture([string] $Output, [int] $ExitCode=0) {
         [Environment]::SetEnvironmentVariable('ProgramFiles(x86)',$fakeProgramFilesX86)
         $env:WINGHOSTTY_VSWHERE_FIXTURE_OUTPUT=$Output
         $env:WINGHOSTTY_VSWHERE_FIXTURE_EXIT=[string]$ExitCode
+        $env:ZIG_HOME=$fixtureZig
         $batchCommand='set "ProgramFiles='+$fakeProgramFiles+'" & set "ProgramFiles(x86)='+$fakeProgramFilesX86+'" & call "'+
             (Join-Path $repoRoot 'scripts\dev-windows.cmd')+'" --print-cache-paths'
         $text=@(& $env:ComSpec /d /c $batchCommand 2>&1)

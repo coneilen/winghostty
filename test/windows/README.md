@@ -47,6 +47,18 @@ change is involved. The wrapper is included in the exact source-binding
 roster; headless controls execute the actual batch with a console-only
 tool/path fixture, never a GUI or GL proxy.
 
+The subsequent eligible source run built the actual application and
+established Mesa vendor/llvmpipe OpenGL 4.6, GLSL 4.60 and the required
+entrypoints with both pinned loaded DLL paths/hashes. It then failed the
+first smoke evidence hook because `Get-FileHash` was unavailable in its
+Windows PowerShell 5.1 child. Hosted file hashing uses a streaming .NET
+SHA256 helper with explicit I/O failures, including the shader PNG hash;
+headless controls exercise the actual PS5 shared record/hash/JSON transport
+with the legacy hash command unavailable. The early VS batch fixture uses
+an existence-only, never-executed `ZIG_HOME` placeholder so its
+`--print-cache-paths` checks do not depend on Setup Zig having run.
+Neither correction substitutes for the still-required nine real app groups.
+
 `scripts\setup-hosted-opengl.ps1` verifies the exact release asset, size and
 SHA256 from `fixtures\hosted-opengl-lock.json` before extraction. It stages
 only `x64\opengl32.dll` and `x64\libgallium_wgl.dll` beside this job's

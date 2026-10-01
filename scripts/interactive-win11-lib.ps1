@@ -172,6 +172,15 @@ function Test-HostedInteractiveProfile {
     return $env:WINGHOSTTY_HOSTED_PROFILE -ceq 'HOSTEDWINDOWSSERVERCPU'
 }
 
+function Get-HostedFileSha256([string] $Path) {
+    $stream=[IO.File]::OpenRead($Path)
+    try {
+        $sha256=[Security.Cryptography.SHA256]::Create()
+        try { return [BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-','').ToLowerInvariant() }
+        finally { $sha256.Dispose() }
+    } finally { $stream.Dispose() }
+}
+
 function Test-HostedProcessCreationBinding([datetime] $NativeStartedAt, [datetime] $CimStartedAt) {
     # CIM_DATETIME exposes six fractional digits; GetProcessTimes exposes
     # 100 ns ticks. Only that one-microsecond truncation interval is valid.
@@ -249,15 +258,15 @@ function Register-HostedInteractiveProcess([Diagnostics.Process] $Process) {
     $expectedDirectory = Split-Path -Parent $env:WINGHOSTTY_HOSTED_APP_PATH
     if ($modules.Count -ne 1 -or $modules[0].FileName -ine (Join-Path $expectedDirectory 'opengl32.dll') -or
         $megadrivers.Count -ne 1 -or $megadrivers[0].FileName -ine (Join-Path $expectedDirectory 'libgallium_wgl.dll') -or
-        (Get-FileHash -LiteralPath $modules[0].FileName).Hash.ToLowerInvariant() -cne $env:WINGHOSTTY_HOSTED_GL_SHA256 -or
-        (Get-FileHash -LiteralPath $megadrivers[0].FileName).Hash.ToLowerInvariant() -cne $env:WINGHOSTTY_HOSTED_GALLIUM_SHA256) {
+        (Get-HostedFileSha256 $modules[0].FileName) -cne $env:WINGHOSTTY_HOSTED_GL_SHA256 -or
+        (Get-HostedFileSha256 $megadrivers[0].FileName) -cne $env:WINGHOSTTY_HOSTED_GALLIUM_SHA256) {
         throw 'Actual retained application did not load both pinned per-application Mesa WGL DLLs.'
     }
     $snapshot = @(Get-InteractiveWin11ProcessTreeSnapshot -RootProcessId $Process.Id -RootStartedAt $started)
     $record = @{
         process_id=$Process.Id;started_at=$started.ToString('o');started_ticks=$started.Ticks
         application_path=$Process.Path
-        application_sha256=(Get-FileHash -LiteralPath $Process.Path).Hash.ToLowerInvariant()
+        application_sha256=(Get-HostedFileSha256 $Process.Path)
         module_path=$modules[0].FileName;module_sha256=$env:WINGHOSTTY_HOSTED_GL_SHA256
         loader_base_address=$modules[0].BaseAddress.ToInt64()
         megadriver_path=$megadrivers[0].FileName;megadriver_sha256=$env:WINGHOSTTY_HOSTED_GALLIUM_SHA256
