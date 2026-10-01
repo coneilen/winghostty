@@ -3,7 +3,8 @@
 [CmdletBinding()]
 param(
     [switch] $Rebuild,
-    [switch] $ResetState
+    [switch] $ResetState,
+    [string] $SummaryPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -50,6 +51,7 @@ if (-not $childPowerShell) {
     $childPowerShell = (Get-Process -Id $PID).Path
 }
 
+$groups = [Collections.Generic.List[object]]::new()
 foreach ($harness in @(
     'interactive-win11-smoke.ps1',
     'interactive-win11-key-input.ps1',
@@ -60,6 +62,12 @@ foreach ($harness in @(
     'interactive-win11-palette-theme.ps1',
     'interactive-win11-session-restore.ps1'
 )) {
+    $groupName = $harness -replace '^interactive-win11-', '' -replace '\.ps1$', ''
+    $started = [DateTimeOffset]::UtcNow
+    $oldStage = $env:WINGHOSTTY_HOSTED_STAGE
+    if ($SummaryPath) {
+        $env:WINGHOSTTY_HOSTED_STAGE = $groupName
+    }
     $harnessArgs = @(
         '-NoLogo'
         '-NoProfile'
@@ -71,8 +79,25 @@ foreach ($harness in @(
         $harnessArgs += @('-TimeoutSeconds', '35')
     }
 
-    & $childPowerShell @harnessArgs
-    if ($LASTEXITCODE -ne 0) { throw "$harness failed with exit code $LASTEXITCODE." }
+    try {
+        & $childPowerShell @harnessArgs
+        $exitCode = $LASTEXITCODE
+        $groups.Add([ordered]@{
+            name=$groupName;harness="test\windows\$harness"
+            harness_sha256=(Get-FileHash -LiteralPath (Join-Path $PSScriptRoot $harness)).Hash.ToLowerInvariant()
+            started_at=$started.ToString('o');finished_at=[DateTimeOffset]::UtcNow.ToString('o')
+            exit_code=$exitCode;status=$(if ($exitCode -eq 0) { 'pass' } else { 'fail' })
+        })
+        if ($SummaryPath) {
+            $parent = Split-Path -Parent $SummaryPath
+            if ($parent) { [IO.Directory]::CreateDirectory($parent) | Out-Null }
+            @{schema_version='winghostty.pr-smoke-groups.v1';groups=@($groups)} |
+                ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $SummaryPath -Encoding utf8NoBOM
+        }
+        if ($exitCode -ne 0) { throw "$harness failed with exit code $exitCode." }
+    } finally {
+        $env:WINGHOSTTY_HOSTED_STAGE = $oldStage
+    }
 }
 
 Write-Host 'interactive Win11 PR smoke: PASS' -ForegroundColor Green

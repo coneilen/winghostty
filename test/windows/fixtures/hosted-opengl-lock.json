@@ -1,0 +1,75 @@
+{
+  "schema_version": "winghostty.hosted-opengl-lock.v1",
+  "profile": "HOSTEDWINDOWSSERVERCPU",
+  "architecture": "X64",
+  "release": "26.2.3",
+  "asset_url": "https://github.com/pal1000/mesa-dist-win/releases/download/26.2.3/mesa3d-26.2.3-release-msvc.7z",
+  "asset_sha256": "3f3613adb43cfd0f2e665ce2400b130c275f0b3317cb3a05566320a3a67589ed",
+  "asset_bytes": 71063681,
+  "driver": "llvmpipe",
+  "deployment": "application-local-only",
+  "runtime_files": [
+    "x64\\opengl32.dll",
+    "x64\\libgallium_wgl.dll"
+  ],
+  "runtime_sha256": {
+    "opengl32.dll": "ca2458187795aaa8f76f04e79ff46d936715e7adcf72321ec2dcd3534a9c30f4",
+    "libgallium_wgl.dll": "c35cc8e9b8bdd579d465a1c1e27d6e999a272cca54d4e0d5785e97c054055236"
+  },
+  "system_imports": [
+    "ADVAPI32.dll",
+    "GDI32.dll",
+    "KERNEL32.dll",
+    "ntdll.dll",
+    "ole32.dll",
+    "SHELL32.dll",
+    "USER32.dll",
+    "VERSION.dll"
+  ],
+  "delay_imports": [],
+  "notice_files": [
+    "mesa-dist-win-LICENSE",
+    "mesa-license.rst",
+    "llvm-LICENSE.TXT",
+    "zstd-LICENSE",
+    "zlib-LICENSE",
+    "msvc-buildinfo.txt"
+  ],
+  "notices": [
+    {
+      "name": "mesa-dist-win-LICENSE",
+      "url": "https://raw.githubusercontent.com/pal1000/mesa-dist-win/26.2.3/LICENSE",
+      "sha256": "9cd0121dc070f0ac65c1fc266bee74bdbbc22cea4210ae72ae0c1f076448d4cc"
+    },
+    {
+      "name": "mesa-license.rst",
+      "url": "https://raw.githubusercontent.com/chaotic-cx/mesa-mirror/mesa-26.2.3/docs/license.rst",
+      "sha256": "0d1a0472ecc81830e75c20d59b0ea02841e3db21255e0ebad97ab682c54d6615"
+    },
+    {
+      "name": "llvm-LICENSE.TXT",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.2/llvm/LICENSE.TXT",
+      "sha256": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee"
+    },
+    {
+      "name": "zstd-LICENSE",
+      "url": "https://raw.githubusercontent.com/facebook/zstd/v1.5.7/LICENSE",
+      "sha256": "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8"
+    },
+    {
+      "name": "zlib-LICENSE",
+      "url": "https://raw.githubusercontent.com/madler/zlib/v1.3.2/LICENSE",
+      "sha256": "e32ff4e00d9d94930537635291da39e7e612703334bf6fde8c7f1686fe8a45a2"
+    },
+    {
+      "name": "msvc-buildinfo.txt",
+      "url": "https://raw.githubusercontent.com/pal1000/mesa-dist-win/26.2.3/buildinfo/msvc.txt",
+      "sha256": "3231c29eb388a809ad5bf68331fe68d04d6b2663618b280e29dedb17c2fd32a1"
+    }
+  ],
+  "sources": [
+    "https://github.com/pal1000/mesa-dist-win/releases/tag/26.2.3",
+    "https://github.com/pal1000/mesa-dist-win/blob/26.2.3/readme.md",
+    "https://docs.mesa3d.org/drivers/llvmpipe.html"
+  ]
+}

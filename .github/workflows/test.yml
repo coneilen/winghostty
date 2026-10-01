@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       run_interactive_win11:
-        description: Run the full GUI suite on the interactive self-hosted runner
+        description: Run the full hosted Windows Server CPU GUI suite
         required: false
         default: false
         type: boolean
@@ -222,11 +222,14 @@ jobs:
       github.event_name == 'schedule' ||
       github.ref == 'refs/heads/main' ||
       (github.event_name == 'workflow_dispatch' && inputs.run_interactive_win11)
-    runs-on: [self-hosted, Windows, X64, winghostty-interactive]
+    # Historical required-check name retained above; this is Server CPU
+    # correctness evidence, NOT Windows 11 client or hardware/release proof.
+    runs-on: windows-2025
     timeout-minutes: 60
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}\.zig-global-cache
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}\.zig-cache
+      WINGHOSTTY_EXPECTED_CHECKOUT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
     steps:
       - name: Checkout code
@@ -246,40 +249,32 @@ jobs:
         shell: pwsh
         env:
           WINGHOSTTY_EXPECTED_CHECKOUT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-        run: ./test/windows/assert-interactive-runner.ps1 -OutputPath "$env:RUNNER_TEMP/winghostty-runner-provenance.json"
+        run: .\test\windows\assert-interactive-runner.ps1 -Profile HostedServerCpu -OutputPath "$env:GITHUB_WORKSPACE\.sandbox\hosted-ci\evidence\runner.json"
+
+      - name: Hosted profile headless contract tests
+        shell: pwsh
+        run: .\test\windows\test-hosted-interactive.ps1
 
       - name: Run interactive Win11 composite
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $quick = '${{ github.event_name }}' -eq 'pull_request'
-          if ($quick) {
-            ./test/windows/interactive-win11-pr-smoke.ps1 -Rebuild -ResetState
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            ./test/windows/interactive-win11-shaders.ps1 -Rebuild -ResetState
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          } else {
-            ./test/windows/flagship/Invoke-InteractiveWin11.ps1 -Rebuild -ResetState -IncludeForegroundHarness
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            ./test/windows/interactive-win11-shaders.ps1 -Rebuild -ResetState
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            ./test/windows/interactive-win11-accessibility.ps1 -ResetState -TimeoutSeconds 120 -IdleSoakSeconds 600
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            ./test/windows/interactive-win11-palette-theme.ps1 -ResetState -ExerciseHighContrast
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            ./test/windows/interactive-win11-session-restore.ps1 -ResetState
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
+          .\test\windows\run-hosted-interactive.ps1 -EventName '${{ github.event_name }}'
+
+      - name: Verify complete hosted Server CPU evidence
+        shell: pwsh
+        run: .\test\windows\assert-hosted-interactive-evidence.ps1 -EvidencePath "$env:GITHUB_WORKSPACE\.sandbox\hosted-ci\evidence\result.json"
 
       - name: Upload interactive evidence
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: flagship-interactive-win11-${{ github.run_id }}
+          name: hosted-windows-server-cpu-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: warn
           include-hidden-files: true
           retention-days: 14
           path: |
             test/windows/flagship/artifacts/interactive-win11
             ${{ github.workspace }}/.sandbox/win11/**/logs/**
-            ${{ runner.temp }}/winghostty-runner-provenance.json
+            ${{ github.workspace }}/.sandbox/hosted-ci/evidence/**
+            ${{ github.workspace }}/.sandbox/hosted-ci/mesa/notices/**

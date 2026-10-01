@@ -3227,6 +3227,7 @@ $resolutionSourceAsts = foreach ($source in @(
 foreach ($source in $resolutionSourceAsts) {
     $expectedAmpersands = if ($source.Path -eq $interactiveWin11Lib) {
         @(
+            '& $Primitive',
             '& $bootstrapCmd powershell.exe -ExecutionPolicy Bypass -File $LauncherPath @ArgumentList',
             '& cmd /c $devWindowsCmd zig build -Demit-exe=true',
             '& $Condition'
@@ -8108,29 +8109,20 @@ $interactiveRunScript = Get-YamlLiteralRunScript `
     -Source "$testWorkflow :: windows-interactive :: Run interactive Win11 composite"
 $expectedInteractiveRunScript = @'
 $ErrorActionPreference = 'Stop'
-$quick = '${{ github.event_name }}' -eq 'pull_request'
-if ($quick) {
-  ./test/windows/interactive-win11-pr-smoke.ps1 -Rebuild -ResetState
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  ./test/windows/interactive-win11-shaders.ps1 -Rebuild -ResetState
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-} else {
-  ./test/windows/flagship/Invoke-InteractiveWin11.ps1 -Rebuild -ResetState -IncludeForegroundHarness
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  ./test/windows/interactive-win11-shaders.ps1 -Rebuild -ResetState
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  ./test/windows/interactive-win11-accessibility.ps1 -ResetState -TimeoutSeconds 120 -IdleSoakSeconds 600
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  ./test/windows/interactive-win11-palette-theme.ps1 -ResetState -ExerciseHighContrast
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  ./test/windows/interactive-win11-session-restore.ps1 -ResetState
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-}
+.\test\windows\run-hosted-interactive.ps1 -EventName '${{ github.event_name }}'
 '@
 $expectedInteractiveRunScript = ($expectedInteractiveRunScript -replace '\r\n?', "`n").TrimEnd([char[]]"`n")
 if ($interactiveRunScript -cne $expectedInteractiveRunScript) {
     throw 'Interactive workflow run script drifted from its exact fail-closed source snapshot.'
 }
+. (Join-Path $repoRoot 'test\windows\assert-hosted-interactive-evidence.ps1')
+Assert-HostedWorkflowSource $testWorkflowText
+$hostedRunnerStep = Get-YamlStepBlock -Content $interactiveJobText `
+    -Name 'Prove interactive runner provenance' -Source $testWorkflow
+Assert-TextContract -Content $hostedRunnerStep `
+    -Pattern '(?m)^        run: \.\\test\\windows\\assert-interactive-runner\.ps1 -Profile HostedServerCpu -OutputPath "\$env:GITHUB_WORKSPACE\\\.sandbox\\hosted-ci\\evidence\\runner\.json"\s*$' `
+    -Description 'hosted provenance cannot use the client-release schema or bypass the native canary' -Context $testWorkflow
+& (Join-Path $repoRoot 'test\windows\test-hosted-interactive.ps1')
 Assert-WorkflowContract `
     -Path $shaderHarness `
     -Pattern 'zig build -Demit-exe=true -Dcustom-shaders=true' `
@@ -8141,7 +8133,7 @@ Assert-WorkflowContract `
     -Description 'shader harness verifies both the compiled capability and visible magenta output'
 Assert-WorkflowContract `
     -Path $shaderHarness `
-    -Pattern '(?ms)Show-StatefulHost \$hostHwnd\r?\n\s+\$graphics\.CopyFromScreen.*?Show-StatefulHost \$hostHwnd\r?\n\s+\$argb = Get-StatefulPixel' `
+    -Pattern '(?ms)Show-StatefulHost \$hostHwnd\r?\n\s+Assert-HostedInteractiveWindow \$surface\.Hwnd \$process -Capture -ExpectedRect \$rect\r?\n\s+\$graphics\.CopyFromScreen.*?Show-StatefulHost \$hostHwnd\r?\n\s+\$argb = Get-StatefulPixel' `
     -Description 'shader harness refocuses the host immediately before both screen-pixel captures'
 Assert-TextContract `
     -Content (Get-YamlStepBlock -Content $testWorkflowText -Name 'Verify default source-build shader mode' -Source $testWorkflow) `
