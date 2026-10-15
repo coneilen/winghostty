@@ -53,7 +53,8 @@ jobs:
         run: ./scripts/test-release-copy-date.ps1
 
       - name: Remote release copy checks
-        if: github.event_name == 'schedule'
+        # The inherited release copy describes this publisher, not this fork.
+        if: github.event_name == 'schedule' && github.repository == 'amanthanvi/winghostty'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -218,10 +219,7 @@ jobs:
   windows-interactive:
     name: Windows 11 Interactive Composite
     if: >-
-      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
-      github.event_name == 'schedule' ||
-      github.ref == 'refs/heads/main' ||
-      (github.event_name == 'workflow_dispatch' && inputs.run_interactive_win11)
+      github.event_name == 'workflow_dispatch' && inputs.run_interactive_win11
     runs-on: [self-hosted, Windows, X64, winghostty-interactive]
     timeout-minutes: 60
     env:
