@@ -8049,6 +8049,22 @@ Assert-TextContract `
     -Description 'scheduled remote verification authenticates gh' `
     -Context "$testWorkflow :: Remote release copy checks"
 Assert-TextContract `
+    -Content (Get-YamlStepBlock -Content $testWorkflowText -Name 'Remote release copy checks' -Source $testWorkflow) `
+    -Pattern "(?m)^\s+if: github\.event_name == 'schedule' && github\.repository == 'amanthanvi/winghostty'\s*$" `
+    -Description 'inherited remote release verification is restricted to its publisher' `
+    -Context "$testWorkflow :: Remote release copy checks"
+Assert-TextContract `
+    -Content (Get-YamlJobText -Content $testWorkflowText -Name 'windows-interactive' -Source $testWorkflow) `
+    -Pattern "(?m)^    if: >-\r?\n      github\.event_name == 'workflow_dispatch' && inputs\.run_interactive_win11\r?\n    runs-on:" `
+    -Description 'self-hosted GUI execution requires an explicit manual opt-in' `
+    -Context "$testWorkflow :: windows-interactive"
+$cleanupWorkflow = Join-Path $repoRoot '.github/workflows/clean-artifacts.yml'
+Assert-TextContract `
+    -Content (Get-YamlJobText -Content (Get-Content -LiteralPath $cleanupWorkflow -Raw) -Name 'remove-old-artifacts' -Source $cleanupWorkflow) `
+    -Pattern '(?m)^    permissions:\r?\n      actions: write\r?\n      contents: read\r?\n' `
+    -Description 'artifact deletion has job-scoped write permission and tagged-run read access' `
+    -Context "$cleanupWorkflow :: remove-old-artifacts"
+Assert-TextContract `
     -Content (Get-YamlStepBlock `
         -Content (Get-YamlJobText -Content $testWorkflowText -Name 'windows' -Source $testWorkflow) `
         -Name 'Setup Zig' `
