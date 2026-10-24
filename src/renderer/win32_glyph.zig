@@ -11,11 +11,11 @@
 //! Deliberate scope limits (native GDI subset only):
 //!   * No complex shaping. There is no HarfBuzz/Uniscribe/DirectWrite pass,
 //!     so ligatures, contextual forms, and bidi reordering are not performed.
-//!   * No color emoji. Rasterization is grayscale coverage only.
-//!   * No LCD/subpixel filtering; `ANTIALIASED_QUALITY` grayscale AA is used
-//!     so a single coverage channel is meaningful.
-//!   * Font fallback is whatever GDI font linking provides for the selected
-//!     face; there is no explicit fallback chain.
+//!   * No color emoji.
+//!   * Configured ClearType-natural rasterization is collapsed to grayscale
+//!     coverage because the renderer uploads one alpha channel.
+//!   * Configured faces use an ordered, explicit fallback chain. The legacy
+//!     path remains Consolas plus GDI font linking.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -214,7 +214,7 @@ pub const CacheKey = struct {
     cell_width: u16,
     cell_height: u16,
     dpi: u16,
-    face_hash: u32,
+    font_hash: u64,
 
     pub fn eql(self: CacheKey, other: CacheKey) bool {
         return std.meta.eql(self, other);
@@ -235,9 +235,7 @@ pub fn cacheKey(
         .cell_width = @intCast(@min(options.cell_width, std.math.maxInt(u16))),
         .cell_height = @intCast(@min(options.cell_height, std.math.maxInt(u16))),
         .dpi = @intCast(@min(options.dpi, std.math.maxInt(u16))),
-        .face_hash = @truncate(
-            std.hash.Wyhash.hash(0x1F83D9AB, options.face),
-        ),
+        .font_hash = options.font.hash(),
     };
 }
 
@@ -324,11 +322,14 @@ const DEFAULT_CHARSET: u8 = 1;
 const OUT_TT_PRECIS: u8 = 4;
 const CLIP_DEFAULT_PRECIS: u8 = 0;
 const ANTIALIASED_QUALITY: u8 = 4;
+const CLEARTYPE_NATURAL_QUALITY: u8 = 6;
 const FIXED_PITCH: u8 = 1;
 const FF_MODERN: u8 = 3 << 4;
 const FW_NORMAL: i32 = 400;
 const TA_LEFT: u32 = 0;
 const TA_TOP: u32 = 0;
+const GGI_MARK_NONEXISTING_GLYPHS: u32 = 0x0001;
+const GDI_ERROR: u32 = 0xFFFFFFFF;
 
 extern "gdi32" fn CreateCompatibleDC(hdc: HDC) callconv(.winapi) HDC;
 extern "gdi32" fn DeleteDC(hdc: HDC) callconv(.winapi) BOOL;
@@ -351,6 +352,30 @@ extern "gdi32" fn GetTextMetricsW(
     hdc: HDC,
     metrics: *TEXTMETRICW,
 ) callconv(.winapi) BOOL;
+extern "gdi32" fn GetTextFaceW(
+    hdc: HDC,
+    count: i32,
+    face: [*]u16,
+) callconv(.winapi) i32;
+extern "gdi32" fn GetGlyphIndicesW(
+    hdc: HDC,
+    text: [*]const u16,
+    count: i32,
+    glyphs: [*]u16,
+    flags: u32,
+) callconv(.winapi) u32;
+extern "gdi32" fn EnumFontFamiliesExW(
+    hdc: HDC,
+    logfont: *LOGFONTW,
+    callback: *const fn (
+        *const LOGFONTW,
+        *const TEXTMETRICW,
+        u32,
+        isize,
+    ) callconv(.winapi) i32,
+    lparam: isize,
+    flags: u32,
+) callconv(.winapi) i32;
 extern "gdi32" fn ExtTextOutW(
     hdc: HDC,
     x: i32,
@@ -375,9 +400,131 @@ pub const RasterError = error{
 };
 
 pub const default_face = "Consolas";
+pub const max_font_faces: usize = 8;
+pub const max_fallback_faces: usize = max_font_faces - 1;
+pub const face_name_capacity: usize = 32;
+pub const raster_grayscale: u32 = 0;
+pub const raster_natural: u32 = 1;
+
+pub const FontConfigError = error{
+    InvalidUtf8,
+    EmptyFace,
+    FaceTooLong,
+    TooManyFallbacks,
+    InvalidPointSize,
+    InvalidWidthRatio,
+    InvalidWeight,
+    InvalidRasterMode,
+};
+
+pub const FaceName = struct {
+    utf16: [face_name_capacity]u16 = .{0} ** face_name_capacity,
+    len: u8 = 0,
+
+    pub fn init(value: []const u8) FontConfigError!FaceName {
+        if (value.len == 0) return error.EmptyFace;
+
+        var result: FaceName = .{};
+        var view = std.unicode.Utf8View.init(value) catch
+            return error.InvalidUtf8;
+        var iterator = view.iterator();
+        var written: usize = 0;
+        while (iterator.nextCodepoint()) |codepoint| {
+            if (codepoint <= 0xFFFF) {
+                if (written + 1 >= result.utf16.len) return error.FaceTooLong;
+                result.utf16[written] = @intCast(codepoint);
+                written += 1;
+            } else {
+                if (written + 2 >= result.utf16.len) return error.FaceTooLong;
+                const scalar = codepoint - 0x10000;
+                result.utf16[written] = @intCast(0xD800 + (scalar >> 10));
+                result.utf16[written + 1] = @intCast(
+                    0xDC00 + (scalar & 0x3FF),
+                );
+                written += 2;
+            }
+        }
+        if (written == 0) return error.EmptyFace;
+        result.len = @intCast(written);
+        return result;
+    }
+
+    fn eqlSelected(self: FaceName, selected: []const u16) bool {
+        if (selected.len != self.len) return false;
+        for (self.utf16[0..self.len], selected) |expected, actual| {
+            if (asciiLowerW(expected) != asciiLowerW(actual)) return false;
+        }
+        return true;
+    }
+};
+
+pub const FontConfig = struct {
+    enabled: bool = false,
+    faces: [max_font_faces]FaceName = [_]FaceName{.{}} ** max_font_faces,
+    face_count: u8 = 0,
+    point_size: f32 = 0,
+    cell_width_ratio: f32 = 0,
+    weight: u16 = FW_NORMAL,
+    raster_mode: u8 = raster_grayscale,
+
+    pub fn init(
+        primary: []const u8,
+        fallbacks: []const []const u8,
+        point_size: f32,
+        cell_width_ratio: f32,
+        weight: u32,
+        raster_mode: u32,
+    ) FontConfigError!FontConfig {
+        if (fallbacks.len > max_fallback_faces) {
+            return error.TooManyFallbacks;
+        }
+        if (!std.math.isFinite(point_size) or
+            point_size < 1 or point_size > 255)
+        {
+            return error.InvalidPointSize;
+        }
+        if (!std.math.isFinite(cell_width_ratio) or
+            cell_width_ratio <= 0 or cell_width_ratio > 4)
+        {
+            return error.InvalidWidthRatio;
+        }
+        if (weight < 100 or weight > 900) return error.InvalidWeight;
+        if (raster_mode > raster_natural) return error.InvalidRasterMode;
+
+        var result = FontConfig{
+            .enabled = true,
+            .point_size = point_size,
+            .cell_width_ratio = cell_width_ratio,
+            .weight = @intCast(weight),
+            .raster_mode = @intCast(raster_mode),
+        };
+        result.faces[0] = try FaceName.init(primary);
+        result.face_count = 1;
+        for (fallbacks) |fallback| {
+            result.faces[result.face_count] = try FaceName.init(fallback);
+            result.face_count += 1;
+        }
+        return result;
+    }
+
+    pub fn hash(self: FontConfig) u64 {
+        var hasher = std.hash.Wyhash.init(0x1F83D9AB);
+        hasher.update(std.mem.asBytes(&self.enabled));
+        hasher.update(std.mem.asBytes(&self.face_count));
+        hasher.update(std.mem.asBytes(&self.point_size));
+        hasher.update(std.mem.asBytes(&self.cell_width_ratio));
+        hasher.update(std.mem.asBytes(&self.weight));
+        hasher.update(std.mem.asBytes(&self.raster_mode));
+        for (self.faces[0..self.face_count]) |face| {
+            hasher.update(std.mem.asBytes(&face.len));
+            hasher.update(std.mem.sliceAsBytes(face.utf16[0..face.len]));
+        }
+        return hasher.final();
+    }
+};
 
 pub const RasterOptions = struct {
-    face: []const u8 = default_face,
+    font: FontConfig = .{},
     /// Width of a single terminal column in pixels.
     cell_width: u32,
     /// Height of a terminal row in pixels.
@@ -389,6 +536,21 @@ pub const RasterOptions = struct {
     /// ink because the second cell is not part of the target at all.
     clip_to_cell: bool = true,
 };
+
+pub fn pointSizeToPixels(point_size: f32, dpi: u32) u32 {
+    if (!std.math.isFinite(point_size) or point_size <= 0) return 0;
+    const normalized_dpi = if (dpi == 0) 96 else dpi;
+    const scaled = @as(f64, point_size) *
+        @as(f64, @floatFromInt(normalized_dpi)) / 72.0;
+    if (!std.math.isFinite(scaled) or scaled <= 0) return 0;
+    if (scaled >= @as(f64, @floatFromInt(std.math.maxInt(u32)))) {
+        return std.math.maxInt(u32);
+    }
+    return @max(
+        @as(u32, 1),
+        @as(u32, @intFromFloat(@floor(scaled + 0.500001))),
+    );
+}
 
 /// An 8-bit coverage bitmap, one byte per pixel, top-down.
 pub const Coverage = struct {
@@ -496,24 +658,9 @@ pub fn rasterize(
         @as(usize, bitmap_height) * 4;
     @memset(bits.?[0..byte_count], 0);
 
-    var logfont = std.mem.zeroes(LOGFONTW);
-    // A positive lfHeight is a cell height request (it includes internal
-    // leading), which is what keeps a glyph inside one terminal row.
-    logfont.lfHeight = @intCast(options.cell_height);
-    logfont.lfWeight = FW_NORMAL;
-    logfont.lfCharSet = DEFAULT_CHARSET;
-    logfont.lfOutPrecision = OUT_TT_PRECIS;
-    logfont.lfClipPrecision = CLIP_DEFAULT_PRECIS;
-    // Grayscale AA, deliberately not ClearType: a single coverage channel is
-    // only meaningful without LCD subpixel filtering.
-    logfont.lfQuality = ANTIALIASED_QUALITY;
-    logfont.lfPitchAndFamily = FIXED_PITCH | FF_MODERN;
-    setFaceName(&logfont.lfFaceName, options.face);
-
-    const font = CreateFontIndirectW(&logfont);
-    if (font == null) return error.CreateFontFailed;
-    defer _ = DeleteObject(font);
-    const previous_font = SelectObject(hdc, font);
+    var selected = try selectFont(alloc, hdc, utf16, options);
+    defer selected.deinit();
+    const previous_font = SelectObject(hdc, selected.handle);
     defer _ = SelectObject(hdc, previous_font);
 
     _ = SetBkMode(hdc, TRANSPARENT);
@@ -529,10 +676,17 @@ pub fn rasterize(
     };
     // No DT_NOCLIP-equivalent: ETO_CLIPPED plus the destination rect is the
     // whole point, so a width-1 target cannot paint into a neighbor column.
+    var metrics = std.mem.zeroes(TEXTMETRICW);
+    const y: i32 = if (options.font.enabled and
+        GetTextMetricsW(hdc, &metrics) != 0 and
+        metrics.tmHeight < bitmap_height)
+        @divTrunc(@as(i32, @intCast(bitmap_height)) - metrics.tmHeight, 2)
+    else
+        0;
     if (ExtTextOutW(
         hdc,
         0,
-        0,
+        y,
         ETO_CLIPPED,
         &clip,
         utf16.ptr,
@@ -551,7 +705,15 @@ pub fn rasterize(
         const blue = bits.?[base];
         const green = bits.?[base + 1];
         const red = bits.?[base + 2];
-        pixels[index] = @max(red, @max(green, blue));
+        pixels[index] = if (options.font.enabled and
+            options.font.raster_mode == raster_natural)
+            @intCast(
+                (@as(u32, red) * 54 +
+                    @as(u32, green) * 183 +
+                    @as(u32, blue) * 19) >> 8,
+            )
+        else
+            @max(red, @max(green, blue));
     }
 
     return .{
@@ -561,17 +723,185 @@ pub fn rasterize(
     };
 }
 
-fn setFaceName(destination: *[32]u16, face: []const u8) void {
-    @memset(destination, 0);
-    var written: usize = 0;
-    var view = std.unicode.Utf8View.init(face) catch return;
-    var iterator = view.iterator();
-    while (iterator.nextCodepoint()) |codepoint| {
-        if (codepoint > 0xFFFF) continue;
-        if (written + 1 >= destination.len) break;
-        destination[written] = @intCast(codepoint);
-        written += 1;
+const SelectedFont = struct {
+    handle: HFONT,
+    face_index: u8,
+
+    fn deinit(self: *SelectedFont) void {
+        _ = DeleteObject(self.handle);
+        self.handle = null;
     }
+};
+
+fn selectFont(
+    alloc: std.mem.Allocator,
+    hdc: HDC,
+    utf16: []const u16,
+    options: RasterOptions,
+) RasterError!SelectedFont {
+    if (!options.font.enabled) {
+        const face = FaceName.init(default_face) catch unreachable;
+        const handle = createFont(face, options) orelse
+            return error.CreateFontFailed;
+        return .{ .handle = handle, .face_index = 0 };
+    }
+
+    var first_available: ?SelectedFont = null;
+    errdefer if (first_available) |*selected| selected.deinit();
+    for (options.font.faces[0..options.font.face_count], 0..) |face, index| {
+        if (!fontFamilyInstalled(hdc, face)) continue;
+        const handle = createFont(face, options) orelse continue;
+        const previous = SelectObject(hdc, handle);
+        const exact_face = selectedFaceMatches(hdc, face);
+        const supported = exact_face and try fontSupportsRun(
+            alloc,
+            hdc,
+            utf16,
+        );
+        _ = SelectObject(hdc, previous);
+        if (!exact_face) {
+            _ = DeleteObject(handle);
+            continue;
+        }
+        if (supported) {
+            if (first_available) |*selected| selected.deinit();
+            return .{ .handle = handle, .face_index = @intCast(index) };
+        }
+        if (first_available == null) {
+            first_available = .{
+                .handle = handle,
+                .face_index = @intCast(index),
+            };
+        } else {
+            _ = DeleteObject(handle);
+        }
+    }
+    if (first_available) |selected| return selected;
+
+    const legacy_face = FaceName.init(default_face) catch unreachable;
+    const legacy_options = RasterOptions{
+        .cell_width = options.cell_width,
+        .cell_height = options.cell_height,
+        .dpi = options.dpi,
+        .clip_to_cell = options.clip_to_cell,
+    };
+    const handle = createFont(legacy_face, legacy_options) orelse
+        return error.CreateFontFailed;
+    return .{ .handle = handle, .face_index = 0 };
+}
+
+fn createFont(face: FaceName, options: RasterOptions) HFONT {
+    var logfont = std.mem.zeroes(LOGFONTW);
+    if (options.font.enabled) {
+        const pixel_height = pointSizeToPixels(
+            options.font.point_size,
+            options.dpi,
+        );
+        if (pixel_height == 0 or pixel_height > std.math.maxInt(i32)) {
+            return null;
+        }
+        logfont.lfHeight = -@as(i32, @intCast(pixel_height));
+        const pixel_width = @round(
+            @as(f64, @floatFromInt(pixel_height)) *
+                @as(f64, options.font.cell_width_ratio),
+        );
+        if (pixel_width > std.math.maxInt(i32)) return null;
+        logfont.lfWidth = @max(
+            @as(i32, 1),
+            @as(i32, @intFromFloat(pixel_width)),
+        );
+        logfont.lfWeight = @intCast(options.font.weight);
+        logfont.lfQuality = if (options.font.raster_mode == raster_natural)
+            CLEARTYPE_NATURAL_QUALITY
+        else
+            ANTIALIASED_QUALITY;
+    } else {
+        // The legacy path retains the original positive cell-height request.
+        logfont.lfHeight = @intCast(options.cell_height);
+        logfont.lfWeight = FW_NORMAL;
+        logfont.lfQuality = ANTIALIASED_QUALITY;
+    }
+    logfont.lfCharSet = DEFAULT_CHARSET;
+    logfont.lfOutPrecision = OUT_TT_PRECIS;
+    logfont.lfClipPrecision = CLIP_DEFAULT_PRECIS;
+    logfont.lfPitchAndFamily = FIXED_PITCH | FF_MODERN;
+    logfont.lfFaceName = face.utf16;
+    return CreateFontIndirectW(&logfont);
+}
+
+fn selectedFaceMatches(hdc: HDC, expected: FaceName) bool {
+    var selected: [face_name_capacity]u16 = .{0} ** face_name_capacity;
+    const length = GetTextFaceW(
+        hdc,
+        @intCast(selected.len),
+        selected[0..].ptr,
+    );
+    if (length <= 0) return false;
+    const copied = selected[0..@intCast(length)];
+    const end = std.mem.indexOfScalar(u16, copied, 0) orelse copied.len;
+    return expected.eqlSelected(copied[0..end]);
+}
+
+fn fontFamilyInstalled(hdc: HDC, face: FaceName) bool {
+    var logfont = std.mem.zeroes(LOGFONTW);
+    logfont.lfCharSet = DEFAULT_CHARSET;
+    logfont.lfFaceName = face.utf16;
+    var context = FontEnumerationContext{
+        .expected = &face,
+    };
+    _ = EnumFontFamiliesExW(
+        hdc,
+        &logfont,
+        markFontFound,
+        @intCast(@intFromPtr(&context)),
+        0,
+    );
+    return context.found;
+}
+
+const FontEnumerationContext = struct {
+    expected: *const FaceName,
+    found: bool = false,
+};
+
+fn markFontFound(
+    logfont: *const LOGFONTW,
+    _: *const TEXTMETRICW,
+    _: u32,
+    lparam: isize,
+) callconv(.winapi) i32 {
+    const context: *FontEnumerationContext =
+        @ptrFromInt(@as(usize, @bitCast(lparam)));
+    const end = std.mem.indexOfScalar(u16, &logfont.lfFaceName, 0) orelse
+        logfont.lfFaceName.len;
+    if (!context.expected.eqlSelected(logfont.lfFaceName[0..end])) return 1;
+    context.found = true;
+    return 0;
+}
+
+fn fontSupportsRun(
+    alloc: std.mem.Allocator,
+    hdc: HDC,
+    utf16: []const u16,
+) RasterError!bool {
+    const indices = try alloc.alloc(u16, utf16.len);
+    defer alloc.free(indices);
+    const result = GetGlyphIndicesW(
+        hdc,
+        utf16.ptr,
+        @intCast(utf16.len),
+        indices.ptr,
+        GGI_MARK_NONEXISTING_GLYPHS,
+    );
+    if (result == GDI_ERROR) return false;
+    for (indices) |index| {
+        if (index == 0xFFFF) return false;
+    }
+    return true;
+}
+
+fn asciiLowerW(value: u16) u16 {
+    return if (value >= 'A' and value <= 'Z') value + ('a' - 'A') else value;
 }
 
 /// Smallest power of two at or above `value`, clamped to at least 1.
@@ -857,11 +1187,105 @@ test "glyph cache keys separate combining sequences and widths" {
     dpi.dpi = 192;
     try testing.expect(!base.eql(cacheKey("e", width_narrow, dpi)));
 
-    var face = options;
-    face.face = "Cascadia Mono";
-    try testing.expect(!base.eql(cacheKey("e", width_narrow, face)));
+    var configured = options;
+    configured.font = try FontConfig.init(
+        "Cascadia Mono",
+        &.{},
+        11.7,
+        0.6,
+        400,
+        raster_grayscale,
+    );
+    try testing.expect(!base.eql(cacheKey("e", width_narrow, configured)));
 
     try testing.expect(base.eql(cacheKey("e", width_narrow, options)));
+}
+
+test "configured point size converts through monitor DPI once" {
+    try testing.expectEqual(@as(u32, 16), pointSizeToPixels(11.7, 96));
+    try testing.expectEqual(@as(u32, 20), pointSizeToPixels(11.7, 120));
+    try testing.expectEqual(@as(u32, 23), pointSizeToPixels(11.7, 144));
+    try testing.expectEqual(@as(u32, 31), pointSizeToPixels(11.7, 192));
+}
+
+test "font config cache identity includes fallbacks and raster mode" {
+    const primary = try FontConfig.init(
+        "JetBrains Mono",
+        &.{"Consolas"},
+        11.7,
+        0.6,
+        400,
+        raster_grayscale,
+    );
+    const fallback_changed = try FontConfig.init(
+        "JetBrains Mono",
+        &.{"Segoe UI Symbol"},
+        11.7,
+        0.6,
+        400,
+        raster_grayscale,
+    );
+    const raster_changed = try FontConfig.init(
+        "JetBrains Mono",
+        &.{"Consolas"},
+        11.7,
+        0.6,
+        400,
+        raster_natural,
+    );
+    const boundary_changed = try FontConfig.init(
+        "JetBrains Mon",
+        &.{"oConsolas"},
+        11.7,
+        0.6,
+        400,
+        raster_grayscale,
+    );
+    try testing.expect(primary.hash() != fallback_changed.hash());
+    try testing.expect(primary.hash() != raster_changed.hash());
+    try testing.expect(primary.hash() != boundary_changed.hash());
+}
+
+test "font config owns normalized family names" {
+    var primary = [_]u8{ 'J', 'e', 't', 'B', 'r', 'a', 'i', 'n', 's' };
+    var fallback = [_]u8{ 'C', 'o', 'n', 's', 'o', 'l', 'a', 's' };
+    const config = try FontConfig.init(
+        &primary,
+        &.{&fallback},
+        11.7,
+        0.6,
+        400,
+        raster_grayscale,
+    );
+    @memset(primary[0..], 'X');
+    @memset(fallback[0..], 'Y');
+    try testing.expectEqual(@as(u16, 'J'), config.faces[0].utf16[0]);
+    try testing.expectEqual(@as(u16, 'C'), config.faces[1].utf16[0]);
+}
+
+test "configured font selection skips a missing primary for an explicit fallback" {
+    const alloc = testing.allocator;
+    const hdc = CreateCompatibleDC(null);
+    try testing.expect(hdc != null);
+    defer _ = DeleteDC(hdc);
+
+    const text = try std.unicode.utf8ToUtf16LeAlloc(alloc, "M");
+    defer alloc.free(text);
+    const options = RasterOptions{
+        .font = try FontConfig.init(
+            "Winghostty Missing Test Face",
+            &.{"Consolas"},
+            11.7,
+            0.6,
+            400,
+            raster_grayscale,
+        ),
+        .cell_width = 16,
+        .cell_height = 24,
+    };
+    var selected = try selectFont(alloc, hdc, text, options);
+    defer selected.deinit();
+    try testing.expectEqual(@as(u8, 1), selected.face_index);
 }
 
 test "power-of-two padding covers GL 1.1 texture limits" {

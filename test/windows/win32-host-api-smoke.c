@@ -442,6 +442,82 @@ int main(void) {
         return fail();
     }
 
+    winghostty_font_config font_config;
+    winghostty_font_config_init(&font_config);
+    if (font_config.size != sizeof(font_config) ||
+        font_config.version != WINGHOSTTY_FONT_CONFIG_VERSION_1 ||
+        font_config.primary_family != NULL ||
+        font_config.fallback_count != 0 ||
+        winghostty_surface_set_font_config(first, &font_config) !=
+            WINGHOSTTY_OK) {
+        winghostty_surface_destroy(first);
+        winghostty_host_deinitialize(context.host);
+        DestroyWindow(context.parent);
+        return fail();
+    }
+
+    const char *font_fallbacks[] = {"Consolas", "Segoe UI Symbol"};
+    font_config.primary_family = "JetBrains Mono";
+    font_config.fallback_families = font_fallbacks;
+    font_config.fallback_count = 2;
+    font_config.point_size = 11.7f;
+    font_config.cell_width_ratio = 0.6f;
+    font_config.weight = 400;
+    font_config.raster_mode = WINGHOSTTY_FONT_RASTER_NATURAL;
+    if (winghostty_surface_set_font_config(first, &font_config) !=
+        WINGHOSTTY_OK) {
+        winghostty_surface_destroy(first);
+        winghostty_host_deinitialize(context.host);
+        DestroyWindow(context.parent);
+        return fail();
+    }
+
+    winghostty_font_config invalid_font = font_config;
+    invalid_font.size -= 1;
+    if (winghostty_surface_set_font_config(first, &invalid_font) !=
+        WINGHOSTTY_INVALID_ARGUMENT) {
+        winghostty_surface_destroy(first);
+        winghostty_host_deinitialize(context.host);
+        DestroyWindow(context.parent);
+        return fail();
+    }
+    invalid_font = font_config;
+    invalid_font.fallback_count = WINGHOSTTY_FONT_FALLBACK_MAX + 1;
+    if (winghostty_surface_set_font_config(first, &invalid_font) !=
+        WINGHOSTTY_INVALID_ARGUMENT) {
+        winghostty_surface_destroy(first);
+        winghostty_host_deinitialize(context.host);
+        DestroyWindow(context.parent);
+        return fail();
+    }
+    invalid_font = font_config;
+    invalid_font.fallback_families = NULL;
+    if (winghostty_surface_set_font_config(first, &invalid_font) !=
+        WINGHOSTTY_INVALID_ARGUMENT) {
+        winghostty_surface_destroy(first);
+        winghostty_host_deinitialize(context.host);
+        DestroyWindow(context.parent);
+        return fail();
+    }
+    const char invalid_utf8[] = {(char)0xFF, '\0'};
+    invalid_font = font_config;
+    invalid_font.primary_family = invalid_utf8;
+    if (winghostty_surface_set_font_config(first, &invalid_font) !=
+        WINGHOSTTY_INVALID_UTF8) {
+        winghostty_surface_destroy(first);
+        winghostty_host_deinitialize(context.host);
+        DestroyWindow(context.parent);
+        return fail();
+    }
+    winghostty_font_config_init(&font_config);
+    if (winghostty_surface_set_font_config(first, &font_config) !=
+        WINGHOSTTY_OK) {
+        winghostty_surface_destroy(first);
+        winghostty_host_deinitialize(context.host);
+        DestroyWindow(context.parent);
+        return fail();
+    }
+
     winghostty_cell_metrics cell_metrics = {8, 16, 8, 16, 13};
     if (winghostty_surface_set_cell_metrics(first, &cell_metrics) != WINGHOSTTY_OK ||
         winghostty_surface_notify_dpi_changed(first, 96) != WINGHOSTTY_OK) {

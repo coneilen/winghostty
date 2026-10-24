@@ -247,6 +247,7 @@ extern "kernel32" fn GetModuleHandleW(module: ?LPCWSTR) callconv(.winapi) HINSTA
 
 pub const Result = i32;
 pub const Theme = i32;
+pub const FontRasterMode = i32;
 
 const result_ok: Result = 0;
 const result_invalid_argument: Result = 1;
@@ -263,6 +264,7 @@ const result_invalid_utf8: Result = 11;
 const result_clipboard_unavailable: Result = 12;
 
 const theme_system: Theme = 0;
+const font_config_version_1: u32 = 1;
 
 const key_release: u32 = 0;
 const key_press: u32 = 1;
@@ -283,6 +285,26 @@ pub const Rect = extern struct {
     width: u32,
     height: u32,
 };
+
+pub const FontConfigOptions = extern struct {
+    size: u32,
+    version: u32,
+    primary_family: ?[*:0]const u8,
+    fallback_families: ?[*]const ?[*:0]const u8,
+    fallback_count: u32,
+    point_size: f32,
+    cell_width_ratio: f32,
+    weight: u32,
+    raster_mode: FontRasterMode,
+    reserved: [4]u32,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(FontConfigOptions) == 64);
+    std.debug.assert(@offsetOf(FontConfigOptions, "primary_family") == 8);
+    std.debug.assert(@offsetOf(FontConfigOptions, "fallback_families") == 16);
+    std.debug.assert(@offsetOf(FontConfigOptions, "raster_mode") == 40);
+}
 
 pub const TerminalSnapshot = extern struct {
     size: u32,
@@ -660,6 +682,7 @@ const OwnedOptions = struct {
     focus: u8,
     theme: Theme,
     font_scale: f32,
+    font: win32_glyph.FontConfig = .{},
     callbacks: Callbacks,
     user_data: ?*anyopaque,
     input_callbacks: InputCallbacks,
@@ -672,6 +695,7 @@ const OwnedOptions = struct {
             .focus = if (options.focus == 0) 0 else 1,
             .theme = options.theme,
             .font_scale = options.font_scale,
+            .font = .{},
             .callbacks = options.callbacks,
             .user_data = options.user_data,
             .input_callbacks = options.input_callbacks,
@@ -2792,6 +2816,21 @@ pub export fn winghostty_surface_options_v2_init(options: *SurfaceOptions) void 
     };
 }
 
+pub export fn winghostty_font_config_init(config: *FontConfigOptions) void {
+    config.* = .{
+        .size = @sizeOf(FontConfigOptions),
+        .version = font_config_version_1,
+        .primary_family = null,
+        .fallback_families = null,
+        .fallback_count = 0,
+        .point_size = 0,
+        .cell_width_ratio = 0,
+        .weight = 400,
+        .raster_mode = win32_glyph.raster_grayscale,
+        .reserved = .{0} ** 4,
+    };
+}
+
 pub export fn winghostty_surface_options_init(options: *LegacySurfaceOptions) void {
     const full = defaultSurfaceOptions();
     options.* = .{
@@ -3319,6 +3358,86 @@ pub export fn winghostty_surface_set_font_scale(
     return result_ok;
 }
 
+const FontConfigParseError = error{
+    InvalidArgument,
+    InvalidUtf8,
+};
+
+fn parseFontConfig(
+    source: *const FontConfigOptions,
+) FontConfigParseError!win32_glyph.FontConfig {
+    if (source.size < @sizeOf(FontConfigOptions) or
+        source.version != font_config_version_1)
+    {
+        return error.InvalidArgument;
+    }
+    const primary_ptr = source.primary_family orelse {
+        if (source.fallback_count != 0) return error.InvalidArgument;
+        return .{};
+    };
+    if (source.fallback_count > win32_glyph.max_fallback_faces) {
+        return error.InvalidArgument;
+    }
+    if (source.raster_mode < 0) return error.InvalidArgument;
+    const fallback_ptrs = if (source.fallback_count == 0)
+        null
+    else
+        source.fallback_families orelse return error.InvalidArgument;
+
+    var fallback_storage: [win32_glyph.max_fallback_faces][]const u8 = undefined;
+    const fallback_count: usize = @intCast(source.fallback_count);
+    for (0..fallback_count) |index| {
+        const fallback = fallback_ptrs.?[index] orelse
+            return error.InvalidArgument;
+        fallback_storage[index] = std.mem.span(fallback);
+    }
+
+    return win32_glyph.FontConfig.init(
+        std.mem.span(primary_ptr),
+        fallback_storage[0..fallback_count],
+        source.point_size,
+        source.cell_width_ratio,
+        source.weight,
+        @intCast(source.raster_mode),
+    ) catch |err| switch (err) {
+        error.InvalidUtf8 => error.InvalidUtf8,
+        else => error.InvalidArgument,
+    };
+}
+
+pub export fn winghostty_surface_set_font_config(
+    surface: ?*Surface,
+    config: ?*const FontConfigOptions,
+) Result {
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    const state = admission.surface;
+    const result = checkSurface(state);
+    if (result != result_ok) {
+        releaseSurfaceAdmission(&admission);
+        return result;
+    }
+    const source = config orelse {
+        releaseSurfaceAdmission(&admission);
+        return result_invalid_argument;
+    };
+    const next = parseFontConfig(source) catch |err| {
+        releaseSurfaceAdmission(&admission);
+        return switch (err) {
+            error.InvalidUtf8 => result_invalid_utf8,
+            error.InvalidArgument => result_invalid_argument,
+        };
+    };
+
+    state.options_mutex.lock();
+    state.options.font = next;
+    state.options_mutex.unlock();
+    const hwnd = state.hwnd;
+    releaseSurfaceAdmission(&admission);
+    if (hwnd) |value| _ = InvalidateRect(value, null, 0);
+    return result_ok;
+}
+
 pub export fn winghostty_surface_set_cell_metrics(
     surface: ?*Surface,
     metrics: ?*const CellMetrics,
@@ -3655,6 +3774,8 @@ pub export fn winghostty_surface_render(surface: ?*Surface) Result {
     const render_state = win32_presentation.RenderState{
         .theme = @enumFromInt(state.options.theme),
         .font_scale = state.options.font_scale,
+        .dpi = state.dpi,
+        .font = state.options.font,
         .width = state.options.bounds.width,
         .height = state.options.bounds.height,
         .terminal_columns = state.terminal_columns,

@@ -609,6 +609,8 @@ static int invalid_state_result(winghostty_result result) {
 
 static int check_stale_surface(winghostty_surface *surface) {
     winghostty_rect bounds = {0, 0, 80, 40};
+    winghostty_font_config font_config;
+    winghostty_font_config_init(&font_config);
     char title[] = "stale";
     char cwd[] = "C:\\";
     char notification[] = "stale";
@@ -623,6 +625,10 @@ static int check_stale_surface(winghostty_surface *surface) {
                 WINGHOSTTY_THEME_SYSTEM
             )) &&
             invalid_state_result(winghostty_surface_set_font_scale(surface, 1.0f)) &&
+            invalid_state_result(winghostty_surface_set_font_config(
+                surface,
+                &font_config
+            )) &&
             invalid_state_result(winghostty_surface_make_current(surface)) &&
             invalid_state_result(winghostty_surface_clear_current(surface)) &&
             invalid_state_result(winghostty_surface_render(surface)) &&
@@ -672,6 +678,8 @@ static int check_stale_host(
 static DWORD WINAPI teardown_stress_thread(void *parameter) {
     teardown_stress *stress = (teardown_stress *)parameter;
     winghostty_rect bounds = {0, 0, 81, 41};
+    winghostty_font_config font_config;
+    winghostty_font_config_init(&font_config);
     char title[] = "stress";
     char cwd[] = "C:\\";
     char notification[] = "stress";
@@ -708,6 +716,13 @@ static DWORD WINAPI teardown_stress_thread(void *parameter) {
             InterlockedIncrement(&stress->failures);
         }
         result = winghostty_surface_set_font_scale(stress->surface, 1.0f);
+        if (!public_result_allowed(result)) {
+            InterlockedIncrement(&stress->failures);
+        }
+        result = winghostty_surface_set_font_config(
+            stress->surface,
+            &font_config
+        );
         if (!public_result_allowed(result)) {
             InterlockedIncrement(&stress->failures);
         }
@@ -1705,6 +1720,22 @@ static int run_glyph_render_contract(HWND parent) {
         surface == NULL) {
         if (host != NULL) winghostty_host_deinitialize(host);
         return fail("glyph render surface setup failed");
+    }
+    const char *font_fallbacks[] = {"Consolas"};
+    winghostty_font_config font_config;
+    winghostty_font_config_init(&font_config);
+    font_config.primary_family = "Winghostty Missing Test Face";
+    font_config.fallback_families = font_fallbacks;
+    font_config.fallback_count = 1;
+    font_config.point_size = 11.7f;
+    font_config.cell_width_ratio = 0.6f;
+    font_config.weight = 400;
+    font_config.raster_mode = WINGHOSTTY_FONT_RASTER_GRAYSCALE;
+    if (winghostty_surface_set_font_config(surface, &font_config) !=
+        WINGHOSTTY_OK) {
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return fail("glyph font configuration failed");
     }
 
     /*

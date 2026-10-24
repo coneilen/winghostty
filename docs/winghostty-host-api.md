@@ -20,6 +20,10 @@ independent of GraphCode product types.
   `version` fields must be initialized with
   `winghostty_surface_options_v2_init`, and it is passed to
   `winghostty_host_create_surface_v2`.
+- `winghostty_font_config` is a separate additive ABI, so neither surface
+  options layout changes. Initialize it with `winghostty_font_config_init` and
+  apply it with `winghostty_surface_set_font_config`. A null primary family
+  restores the legacy Consolas renderer.
 - Host lifecycle and surface mutation calls are UI-thread-affine to the thread
   that initialized the host. Renderer calls are affine to the first thread
   that claims the host's render context.
@@ -92,6 +96,41 @@ ranges, caret, selection, and update notifications. UIA state is detached
 before a surface is destroyed, so retained providers return
 `UIA_E_ELEMENTNOTAVAILABLE` and never call back into the embedding application
 after teardown.
+
+## Glyph font configuration
+
+`winghostty_surface_set_font_config` copies a version-1
+`winghostty_font_config`, including every UTF-8 family name, before returning.
+The configured primary family is followed by at most seven ordered fallbacks.
+For each grapheme run the provider rejects silent GDI face substitution,
+selects the first exact configured family that has every glyph, then falls
+back to the first exact installed configured family so Windows font linking or
+the missing-glyph box can still render. If none of the configured families is
+installed, the legacy Consolas path remains the final fallback. This lets an
+embedder name its shipped Nerd/Powerline-capable family explicitly rather than
+depending on machine-specific GDI linking.
+
+`point_size` is the final typographic size. The provider converts it with
+`points * monitor_dpi / 72` once; it is not multiplied by the legacy
+`font_scale`. `cell_width_ratio` sets the requested GDI glyph width relative
+to that pixel height. Neither field changes terminal grid geometry. Embedders
+that need input hit testing and cell bounds to match should continue to call
+`winghostty_surface_set_cell_metrics` with logical 96-DPI metrics; Winghostty
+applies the current monitor DPI to those metrics.
+
+`WINGHOSTTY_FONT_RASTER_GRAYSCALE` retains GDI grayscale antialiasing.
+`WINGHOSTTY_FONT_RASTER_NATURAL` requests ClearType-natural hinting, then
+collapses its RGB coverage to one luminance alpha channel because the current
+OpenGL renderer uploads `GL_ALPHA` textures. The glyph cache identity includes
+the full ordered font configuration, point size, width ratio, weight, raster
+mode, cell dimensions, and monitor DPI.
+
+The automated unit, ABI, and renderer contracts prove configuration
+validation, point-to-pixel conversion, fallback selection, cache separation,
+and that configured glyphs reach the WGL renderer. They do not prove live
+screen raster quality, antialiasing appearance, or that GraphCode's selected
+JetBrains Mono / Nerd Font families are installed or packaged on a target
+machine; those remain integration and visual-validation responsibilities.
 Embedders that own a parsed libghostty-vt render state can push a copied
 `winghostty_terminal_cell` snapshot with
 `winghostty_surface_set_terminal_snapshot` (or the legacy
