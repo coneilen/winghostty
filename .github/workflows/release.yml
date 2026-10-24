@@ -151,7 +151,7 @@ jobs:
             }
           }
           if (-not $evidenceRun) {
-            throw "Release SHA $sha has no successful interactive Win11 Test run with exact-SHA, hash-bound evidence. Dispatch Test with run_interactive_win11=true first."
+            throw "Release SHA $sha has no successful interactive Win11 Test run with exact-SHA, hash-bound evidence. The hosted required check is deterministic-only; produce and review separate manual Windows 11 flagship evidence before release."
           }
           Write-Host "Release SHA $sha is covered by interactive Test run $($evidenceRun.databaseId)."
 

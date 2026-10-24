@@ -17,12 +17,16 @@ It emits exact-source/binary provenance with the UIA tree and requires terminal
 text, all four directional split-focus moves,
 palette selection/focus semantics, non-overlapping native settings controls,
 settings owner-close survival, idle resource bounds, graceful close/reopen,
-and clean Explorer/WER postflight. Pull requests run the quick interactive
-lane; release candidates require the full default-branch interactive lane with
-exact-SHA, hash-bound evidence. Provider unit tests cover the degenerate
-TextPattern2 caret range plus its ABI and semantics. The physical screen-reader
-matrix is optional manual acceptance evidence for validating that contract end
-to end. When recording it, verify the exact build with Narrator and NVDA:
+and clean Explorer/WER postflight. Required pull-request CI runs deterministic
+provider, ABI, lifecycle, and renderer contracts on GitHub-hosted Windows; the
+retained `Windows 11 Interactive Composite` check name does not claim UIA,
+foreground, screen-capture, or physical-GPU execution. Release evidence that
+requires those properties remains a separate exact-SHA, hash-bound manual
+Windows 11 run and is not produced by the hosted required check. Provider unit
+tests cover the degenerate TextPattern2 caret range plus its ABI and semantics.
+The physical screen-reader matrix is optional manual acceptance evidence for
+validating that contract end to end. When recording it, verify the exact build
+with Narrator and NVDA:
 navigate tabs and panes, read terminal text, open/filter/invoke the palette,
 edit settings, and dismiss confirmation/update surfaces at 100%, 200%, and
 300% DPI with High Contrast both off and on.
