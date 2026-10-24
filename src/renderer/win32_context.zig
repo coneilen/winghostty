@@ -166,6 +166,8 @@ pub const terminal_cell_background_default: u32 = 1 << 3;
 pub const RenderState = struct {
     theme: Theme = .system,
     font_scale: f32 = 1.0,
+    dpi: u32 = 96,
+    font: glyph.FontConfig = .{},
     width: u32 = 1,
     height: u32 = 1,
     terminal_columns: u32 = 0,
@@ -675,8 +677,10 @@ pub const Context = struct {
                 if (column + cells_wide > columns) continue;
 
                 const options = glyph.RasterOptions{
+                    .font = state.font,
                     .cell_width = pixel_cell_width,
                     .cell_height = pixel_cell_height,
+                    .dpi = state.dpi,
                     .clip_to_cell = false,
                 };
                 const key = glyph.cacheKey(run, span.width, options);

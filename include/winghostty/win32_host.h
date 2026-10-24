@@ -33,6 +33,12 @@ typedef int32_t winghostty_theme;
 #define WINGHOSTTY_THEME_LIGHT ((winghostty_theme)1)
 #define WINGHOSTTY_THEME_DARK ((winghostty_theme)2)
 
+typedef int32_t winghostty_font_raster_mode;
+
+#define WINGHOSTTY_FONT_RASTER_GRAYSCALE ((winghostty_font_raster_mode)0)
+#define WINGHOSTTY_FONT_RASTER_NATURAL ((winghostty_font_raster_mode)1)
+#define WINGHOSTTY_FONT_FALLBACK_MAX 7u
+
 typedef struct winghostty_rect {
     int32_t x;
     int32_t y;
@@ -130,6 +136,35 @@ typedef struct winghostty_cell_metrics {
     uint32_t cell_height;
     uint32_t baseline;
 } winghostty_cell_metrics;
+
+#define WINGHOSTTY_FONT_CONFIG_VERSION_1 1u
+
+/*
+ * Versioned terminal glyph-font configuration.
+ *
+ * All strings are UTF-8 and copied before the setter returns. `point_size` is
+ * the final typographic point size; the provider converts it to device pixels
+ * using the surface's monitor DPI exactly once. `cell_width_ratio` requests a
+ * glyph width relative to that pixel height. It does not change terminal grid
+ * geometry; use winghostty_surface_set_cell_metrics with logical 96-DPI
+ * metrics when the embedding host needs matching hit-testing and cell bounds.
+ *
+ * A config initialized by winghostty_font_config_init, with
+ * `primary_family == NULL`, restores the legacy Consolas/cell-height raster
+ * path. Configured fallbacks are tried in order after the primary family.
+ */
+typedef struct winghostty_font_config {
+    uint32_t size;
+    uint32_t version;
+    const char *primary_family;
+    const char *const *fallback_families;
+    uint32_t fallback_count;
+    float point_size;
+    float cell_width_ratio;
+    uint32_t weight;
+    winghostty_font_raster_mode raster_mode;
+    uint32_t reserved[4];
+} winghostty_font_config;
 
 typedef enum winghostty_accessibility_role {
     WINGHOSTTY_ACCESSIBILITY_TERMINAL = 0,
@@ -395,6 +430,7 @@ typedef struct winghostty_surface_options_v2 {
 
 void winghostty_surface_options_init(winghostty_surface_options *options);
 void winghostty_surface_options_v2_init(winghostty_surface_options_v2 *options);
+void winghostty_font_config_init(winghostty_font_config *config);
 
 winghostty_result winghostty_host_initialize(winghostty_host **out_host);
 winghostty_result winghostty_host_deinitialize(winghostty_host *host);
@@ -432,6 +468,10 @@ winghostty_result winghostty_surface_set_theme(
 winghostty_result winghostty_surface_set_font_scale(
     winghostty_surface *surface,
     float font_scale
+);
+winghostty_result winghostty_surface_set_font_config(
+    winghostty_surface *surface,
+    const winghostty_font_config *config
 );
 winghostty_result winghostty_surface_set_cell_metrics(
     winghostty_surface *surface,

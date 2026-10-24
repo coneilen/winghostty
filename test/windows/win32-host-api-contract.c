@@ -15,6 +15,10 @@ WINGHOSTTY_LAYOUT_ASSERT(
     sizeof(winghostty_theme) == sizeof(int32_t),
     "winghostty_theme must remain int32_t"
 );
+WINGHOSTTY_LAYOUT_ASSERT(
+    sizeof(winghostty_font_raster_mode) == sizeof(int32_t),
+    "winghostty_font_raster_mode must remain int32_t"
+);
 WINGHOSTTY_LAYOUT_ASSERT(sizeof(winghostty_rect) == 16, "rect ABI changed");
 WINGHOSTTY_LAYOUT_ASSERT(
     offsetof(winghostty_rect, width) == 8,
@@ -103,6 +107,22 @@ WINGHOSTTY_LAYOUT_ASSERT(
 WINGHOSTTY_LAYOUT_ASSERT(
     offsetof(winghostty_terminal_snapshot_v2, text) == 48,
     "terminal snapshot v2 text pointer offset changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    sizeof(winghostty_font_config) == 64,
+    "font config ABI changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    offsetof(winghostty_font_config, primary_family) == 8,
+    "font config primary family offset changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    offsetof(winghostty_font_config, fallback_families) == 16,
+    "font config fallback families offset changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    offsetof(winghostty_font_config, raster_mode) == 40,
+    "font config raster mode offset changed"
 );
 
 static void on_exit(void *user_data, winghostty_surface *surface, int32_t status) {
@@ -222,6 +242,7 @@ void winghostty_win32_host_compile_contract(void) {
     winghostty_surface *surface = 0;
     winghostty_surface_options options;
     winghostty_surface_options_v2 options_v2;
+    winghostty_font_config font_config;
     winghostty_rect bounds = {0, 0, 800, 600};
     uint32_t drained = 0;
 
@@ -239,6 +260,15 @@ void winghostty_win32_host_compile_contract(void) {
     options.callbacks.on_focus = on_focus;
     options.callbacks.on_fatal_error = on_fatal_error;
     winghostty_surface_options_v2_init(&options_v2);
+    winghostty_font_config_init(&font_config);
+    const char *fallbacks[] = {"Consolas", "Segoe UI Symbol"};
+    font_config.primary_family = "JetBrains Mono";
+    font_config.fallback_families = fallbacks;
+    font_config.fallback_count = 2;
+    font_config.point_size = 11.7f;
+    font_config.cell_width_ratio = 0.6f;
+    font_config.weight = 400;
+    font_config.raster_mode = WINGHOSTTY_FONT_RASTER_NATURAL;
     options_v2.command = options.command;
     options_v2.cwd = options.cwd;
     options_v2.environment = options.environment;
@@ -275,6 +305,7 @@ void winghostty_win32_host_compile_contract(void) {
     (void)winghostty_surface_set_focus(surface, 1);
     (void)winghostty_surface_set_theme(surface, WINGHOSTTY_THEME_DARK);
     (void)winghostty_surface_set_font_scale(surface, 1.0f);
+    (void)winghostty_surface_set_font_config(surface, &font_config);
     winghostty_cell_metrics metrics = {8, 16, 8, 16, 13};
     (void)winghostty_surface_set_cell_metrics(surface, &metrics);
     (void)winghostty_surface_get_cell_metrics(surface, &metrics);
