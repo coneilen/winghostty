@@ -2,6 +2,14 @@
 
 Manual and interactive harnesses for Windows-specific functionality.
 
+The required GitHub check named `Windows 11 Interactive Composite` is a
+historical check context, not a claim that GitHub-hosted runners provide an
+interactive Windows 11 desktop. It runs on `windows-2022` and fails unless the
+same commit's deterministic `Windows Build And Tests` job succeeds. Foreground,
+screen-capture, accessibility, and physical-GPU evidence remains manual and is
+produced by `flagship/Invoke-InteractiveWin11.ps1` on a real interactive
+Windows 11 machine.
+
 Each interactive Win11 harness uses its own repo-local sandbox under
 `.sandbox\win11\<worktree-id>\<sandbox-name>`, so `-ResetState` resets
 only that harness's logs/temp state instead of tearing down sibling

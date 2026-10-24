@@ -108,6 +108,28 @@ verify:
    Contrast, reduced motion, DPI scaling, and a Narrator or NVDA
    spot-check.
 
+### Hosted CI coverage boundary
+
+The required `Windows 11 Interactive Composite` check name is retained for
+compatibility with existing pull-request consumers, but it now runs on
+GitHub-hosted `windows-2022` infrastructure. It is a fail-closed gate on the
+same commit's `Windows Build And Tests` job, which covers deterministic source,
+build, Win32 API lifecycle/input/renderer, full Zig, native compositor, glyph
+raster, and snapshot ABI contracts.
+
+GitHub-hosted Windows does not prove a foreground Windows 11 desktop, physical
+GPU presentation, real keyboard focus, screen capture, UI Automation, or
+assistive-technology behavior. For those claims, run the manual flagship suite
+on an interactive Windows 11 machine:
+
+```powershell
+.\test\windows\flagship\Invoke-InteractiveWin11.ps1 -Rebuild -ResetState -IncludeForegroundHarness
+```
+
+The manual suite emits exact-commit, hash-bound evidence under
+`test/windows/flagship/artifacts/interactive-win11`; that evidence is not
+produced or uploaded by the required hosted check.
+
 ## Runtime Notes
 
 - The application runtime is Win32.

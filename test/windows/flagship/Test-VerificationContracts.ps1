@@ -6702,15 +6702,15 @@ $releasePreflightScriptSha256 =
 $readinessPreflightScriptSha256 =
     '9e08d1fca871d8eb340ee88057e66b4472cef074eb0cab4ff728537ed439c7dc'
 $releaseInteractiveEvidenceScriptSha256 =
-    '2bc265c1052c000e5f8ea599d2f5e2002dec3d3dc893bff0b8ecd72da739bb92'
+    '3b4c3f533382d273a9c99e6920a83ff02d042ae37605c2b98bc7a887829bf266'
 $releaseInteractiveEvidenceStepSha256 =
-    '88a9d8d525eca9bb31327fdad515af39488a63b418222036b82edf94db945b6f'
+    '63436e33e214e6fbbdbeb2415ac35ab694eb845069d6cdc67b9f89bbb1217710'
 $releasePreflightStepSha256 =
     '0535add72682e9ee85894835766355e537d5a5a03174ed656e6365954d7f16eb'
 $readinessPreflightStepSha256 =
     '021214f70c1b21adcc770f9e96f66daf1ada2f9eae4180daf3958236941b05c9'
 $releaseWorkflowSha256 =
-    '13db031b8ee25fd3579ef1bd65354a14cec844e10f0b55817d1efe82b9dfe91a'
+    '33ea51377c1c042ecc2dea589a6a32f9ea7f69561c1ebf868d53bfd161bed8ba'
 $readinessWorkflowSha256 =
     'be9d472e2d2e2d8a57803810409634c8acc503093b0c7403050d9f80cc09c808'
 # Full-file pins deliberately make every workflow edit a semantic-review event,
@@ -7825,9 +7825,13 @@ foreach ($spec in $successPredicateMutationSpecs) {
 }
 Assert-TextContract `
     -Content $releaseInteractiveEvidenceStep `
-    -Pattern '(?ms)gh run list.*?--workflow Test.*?--commit \$sha.*?\$_\.name -eq ''Windows 11 Interactive Composite''.*?\$_\.conclusion -eq ''success''.*?\$artifact\.sha256.*?\$artifact\.path.*?Get-FileHash.*?\$result\.implementation_commit -eq \$sha.*?\$result\.workflow_run_id.*?\$hashesBound.*?exact-SHA, hash-bound evidence' `
-    -Description 'release remains gated on successful exact-SHA hash-bound interactive evidence' `
+    -Pattern '(?ms)gh run list.*?--workflow Test.*?--commit \$sha.*?\$_\.name -eq ''Windows 11 Interactive Composite''.*?\$_\.conclusion -eq ''success''.*?\$artifact\.sha256.*?\$artifact\.path.*?Get-FileHash.*?\$result\.implementation_commit -eq \$sha.*?\$result\.workflow_run_id.*?\$hashesBound.*?exact-SHA, hash-bound evidence.*?hosted required check is deterministic-only.*?separate manual Windows 11 flagship evidence' `
+    -Description 'release remains gated on separate exact-SHA hash-bound manual interactive evidence' `
     -Context "$releaseWorkflow :: Require successful Test workflow for release SHA"
+Assert-WorkflowContractAbsent `
+    -Path $releaseWorkflow `
+    -Pattern 'run_interactive_win11|Dispatch Test with' `
+    -Description 'release guidance cannot refer to the removed self-hosted dispatch input'
 Assert-TextContract `
     -Content $releasePreflightStep `
     -Pattern '(?ms)check-release-copy\.ps1 -ExpectedVersion.*?\r?\n\s+if \(\$LASTEXITCODE -ne 0\) \{ exit \$LASTEXITCODE \}' `
@@ -8072,65 +8076,45 @@ Assert-TextContract `
     -Pattern '(?ms)with:\s+version: 0\.15\.2\s+.*?use-cache: false' `
     -Description 'release builds cannot restore failed Zig build caches' `
     -Context "$releaseWorkflow :: windows-release :: Setup Zig"
-Assert-TextContract `
-    -Content (Get-YamlStepBlock `
-        -Content (Get-YamlJobText -Content $testWorkflowText -Name 'windows-interactive' -Source $testWorkflow) `
-        -Name 'Setup Zig' `
-        -Source "$testWorkflow :: windows-interactive") `
-    -Pattern '(?ms)with:\s+version: 0\.15\.2\s+.*?use-cache: false' `
-    -Description 'ephemeral interactive retries cannot restore failed Zig build caches' `
-    -Context "$testWorkflow :: windows-interactive :: Setup Zig"
-Assert-TextContract `
-    -Content (Get-YamlJobText -Content $testWorkflowText -Name 'windows-interactive' -Source $testWorkflow) `
-    -Pattern '(?m)^\s*timeout-minutes:\s+60\s*$' `
-    -Description 'full interactive validation has enough job budget for the accessibility soak' `
-    -Context "$testWorkflow :: windows-interactive"
 $interactiveJobText = Get-YamlJobText `
     -Content $testWorkflowText `
-    -Name 'windows-interactive' `
+    -Name 'windows-hosted-contracts' `
     -Source $testWorkflow
 $interactiveRunStep = Get-YamlStepBlock `
     -Content $interactiveJobText `
-    -Name 'Run interactive Win11 composite' `
-    -Source "$testWorkflow :: windows-interactive"
+    -Name 'Require deterministic Windows suite' `
+    -Source "$testWorkflow :: windows-hosted-contracts"
 Assert-TextContract `
     -Content $interactiveJobText `
-    -Pattern '(?ms)^    env:\s+ZIG_GLOBAL_CACHE_DIR: \$\{\{ github\.workspace \}\}\\\.zig-global-cache\s+ZIG_LOCAL_CACHE_DIR: \$\{\{ github\.workspace \}\}\\\.zig-cache' `
-    -Description 'interactive builds use the job-level workspace Zig caches' `
-    -Context "$testWorkflow :: windows-interactive"
+    -Pattern '(?ms)^    name: Windows 11 Interactive Composite\s+needs: windows\s+if: \$\{\{ always\(\) \}\}\s+runs-on: windows-2022\s+timeout-minutes: 10' `
+    -Description 'retained required context is a hosted fail-closed dependency on the deterministic Windows suite' `
+    -Context "$testWorkflow :: windows-hosted-contracts"
 Assert-TextContract `
     -Content $interactiveRunStep `
-    -Pattern '(?ms)^        run:\s+\|' `
-    -Description 'interactive cache paths are inherited by the run step' `
-    -Context "$testWorkflow :: windows-interactive :: Run interactive Win11 composite"
+    -Pattern '(?ms)WINDOWS_SUITE_RESULT: \$\{\{ needs\.windows\.result \}\}.*?if \(\$env:WINDOWS_SUITE_RESULT -ne ''success''\).*?throw.*?Hosted deterministic Windows coverage.*?does not provide evidence of a real foreground.*?makes no\s+interactive, screen-capture, accessibility, or hardware-rendering claim.*?Invoke-InteractiveWin11\.ps1' `
+    -Description 'hosted gate fails closed and explicitly rejects false interactive or hardware claims' `
+    -Context "$testWorkflow :: windows-hosted-contracts :: Require deterministic Windows suite"
 $interactiveRunScript = Get-YamlLiteralRunScript `
     -Content $interactiveRunStep `
-    -Source "$testWorkflow :: windows-interactive :: Run interactive Win11 composite"
-$expectedInteractiveRunScript = @'
-$ErrorActionPreference = 'Stop'
-$quick = '${{ github.event_name }}' -eq 'pull_request'
-if ($quick) {
-  ./test/windows/interactive-win11-pr-smoke.ps1 -Rebuild -ResetState
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  ./test/windows/interactive-win11-shaders.ps1 -Rebuild -ResetState
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-} else {
-  ./test/windows/flagship/Invoke-InteractiveWin11.ps1 -Rebuild -ResetState -IncludeForegroundHarness
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  ./test/windows/interactive-win11-shaders.ps1 -Rebuild -ResetState
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  ./test/windows/interactive-win11-accessibility.ps1 -ResetState -TimeoutSeconds 120 -IdleSoakSeconds 600
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  ./test/windows/interactive-win11-palette-theme.ps1 -ResetState -ExerciseHighContrast
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  ./test/windows/interactive-win11-session-restore.ps1 -ResetState
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    -Source "$testWorkflow :: windows-hosted-contracts :: Require deterministic Windows suite"
+if ($interactiveRunScript -match
+        '(?im)^\s*(?:&\s*)?(?:\./)?test/windows/(?:interactive-win11-(?:pr-smoke|validate|shaders|accessibility|palette-theme|session-restore)|flagship/Invoke-InteractiveWin11)\.ps1|assert-interactive-runner|flagship-interactive-win11|self-hosted|winghostty-interactive') {
+    throw 'Hosted required check must not execute or publish interactive Windows evidence.'
 }
-'@
-$expectedInteractiveRunScript = ($expectedInteractiveRunScript -replace '\r\n?', "`n").TrimEnd([char[]]"`n")
-if ($interactiveRunScript -cne $expectedInteractiveRunScript) {
-    throw 'Interactive workflow run script drifted from its exact fail-closed source snapshot.'
-}
+Assert-TextContract `
+    -Content $testWorkflowText `
+    -Pattern '(?ms)^  push:\s+branches:\s+- main\s+- graphcode-host\s+pull_request: \{\}' `
+    -Description 'feature branches use one pull-request check context instead of duplicate push and pull-request contexts' `
+    -Context $testWorkflow
+Assert-TextContract `
+    -Content $testWorkflowText `
+    -Pattern '(?m)^  workflow_dispatch: \{\}\s*$' `
+    -Description 'manual Test dispatch has no impossible self-hosted runner input' `
+    -Context $testWorkflow
+Assert-WorkflowContractAbsent `
+    -Path $testWorkflow `
+    -Pattern '(?i)run_interactive_win11|runs-on:\s*\[self-hosted|winghostty-interactive|flagship-interactive-win11|assert-interactive-runner' `
+    -Description 'required hosted workflow contains no self-hosted dispatch or interactive evidence path'
 Assert-WorkflowContract `
     -Path $shaderHarness `
     -Pattern 'zig build -Demit-exe=true -Dcustom-shaders=true' `
@@ -8166,8 +8150,8 @@ Assert-WorkflowContract `
     -Description 'Windows CI executes the forced cross-drive CMD cache regression'
 Assert-WorkflowContract `
     -Path $testWorkflow `
-    -Pattern '(?ms)- name: Win32 host API external compile/layout contract\s+shell: pwsh\s+run: ./test/windows/compile-win32-host-api\.ps1.*?- name: Win32 host API lifecycle smoke\s+shell: pwsh\s+run: ./test/windows/run-win32-host-api-smoke\.ps1' `
-    -Description 'Windows CI compiles, checks layout, and exercises the external Win32 host API boundary'
+    -Pattern '(?ms)- name: Win32 host API external compile/layout contract\s+shell: pwsh\s+run: ./test/windows/compile-win32-host-api\.ps1.*?- name: Win32 host API lifecycle smoke\s+shell: pwsh\s+run: ./test/windows/run-win32-host-api-smoke\.ps1.*?- name: Win32 host API input caller-loop smoke\s+shell: pwsh\s+run: ./test/windows/run-win32-host-api-input\.ps1.*?- name: Win32 host renderer contract\s+shell: pwsh\s+run: ./test/windows/run-win32-host-renderer\.ps1.*?- name: Full Zig test suite\s+run: zig build test -Demit-test-exe=true.*?- name: Native Win32 compositor tests\s+run: zig test src/apprt/win32_compositor_native\.zig -lc -luser32 -lkernel32.*?- name: Win32 glyph raster tests\s+run: zig test src/renderer/win32_glyph\.zig -lc -lgdi32 -lkernel32 -luser32.*?- name: Win32 host snapshot ABI tests\s+run: zig test src/win32_host\.zig -lc -luser32 -lkernel32 -lgdi32 -lopengl32 -lole32.*?- name: Build executable.*?run: zig build -Demit-exe=true' `
+    -Description 'hosted Windows suite covers every deterministic build, API lifecycle/input/renderer, Zig, compositor, glyph, and snapshot contract'
 Assert-WorkflowContract `
     -Path (Join-Path $repoRoot 'src\win32_host.zig') `
     -Pattern '(?s)pub export fn winghostty_host_initialize.*?pub export fn winghostty_host_deinitialize.*?pub export fn winghostty_host_create_surface.*?pub export fn winghostty_surface_destroy' `
@@ -8204,11 +8188,10 @@ Assert-WorkflowContract `
     -Path (Join-Path $repoRoot 'scripts\zig-cache.ps1') `
     -Pattern '(?s)\$local = \$env:ZIG_LOCAL_CACHE_DIR.*?\$global = \$env:ZIG_GLOBAL_CACHE_DIR' `
     -Description 'shared Zig cache bootstrap resolves local before global paths'
-Assert-TextContract `
-    -Content (Get-YamlStepBlock -Content $testWorkflowText -Name 'Upload interactive evidence' -Source $testWorkflow) `
-    -Pattern '(?ms)include-hidden-files: true.*?github\.workspace.*?\.sandbox/win11/\*\*/logs/\*\*' `
-    -Description 'interactive evidence upload includes the actual hidden sandbox log tree' `
-    -Context "$testWorkflow :: Upload interactive evidence"
+Assert-WorkflowContract `
+    -Path $releaseWorkflow `
+    -Pattern '(?ms)\$_\.name -eq ''Windows 11 Interactive Composite''.*?\$artifactName = "flagship-interactive-win11-\$\(\$run\.databaseId\)".*?scenario_id -eq ''windows\.interactive-win11\.composite''.*?\$result\.status -eq ''pass''.*?\$hashesBound' `
+    -Description 'release evidence remains bound to separate passing interactive artifacts, not the hosted deterministic check alone'
 Assert-WorkflowContract `
     -Path $interactivePrSmoke `
     -Pattern "(?ms)if \(\`$harness -eq 'interactive-win11-undo\.ps1'\) \{\s*\`$harnessArgs \+= @\('-TimeoutSeconds', '35'\)\s*\}" `
