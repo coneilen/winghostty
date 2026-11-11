@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <objbase.h>
 #include <windows.h>
 
@@ -134,6 +135,15 @@ typedef struct vt_render_call {
     winghostty_result clear_current_result;
     unsigned char pixel[4];
 } vt_render_call;
+
+typedef struct appearance_render_call {
+    winghostty_surface *surface;
+    winghostty_result make_current_result;
+    winghostty_result render_result;
+    winghostty_result clear_current_result;
+    unsigned char padding_pixel[4];
+    unsigned char terminal_pixel[4];
+} appearance_render_call;
 
 #define WM_UIA_SELECTION_TEST (0x8000 + 0x41)
 
@@ -399,6 +409,39 @@ static DWORD WINAPI vt_render_thread(void *parameter) {
         call->pixel
     );
     call->present_result = winghostty_surface_present(call->surface);
+    call->clear_current_result =
+        winghostty_surface_clear_current(call->surface);
+    return 0;
+}
+
+static DWORD WINAPI appearance_render_thread(void *parameter) {
+    appearance_render_call *call = (appearance_render_call *)parameter;
+    call->make_current_result =
+        winghostty_surface_make_current(call->surface);
+    if (call->make_current_result != WINGHOSTTY_OK) return 0;
+    call->render_result = winghostty_surface_render(call->surface);
+    if (call->render_result == WINGHOSTTY_OK) {
+        call->render_result = winghostty_surface_render(call->surface);
+    }
+    glReadBuffer(0x0405);
+    glReadPixels(
+        10,
+        20,
+        1,
+        1,
+        0x1908,
+        0x1401,
+        call->padding_pixel
+    );
+    glReadPixels(
+        20,
+        20,
+        1,
+        1,
+        0x1908,
+        0x1401,
+        call->terminal_pixel
+    );
     call->clear_current_result =
         winghostty_surface_clear_current(call->surface);
     return 0;
@@ -1441,6 +1484,195 @@ static int run_renderer_contract(test_state *state) {
     return 0;
 }
 
+static int run_appearance_config_contract(HWND parent) {
+    winghostty_host *host = NULL;
+    winghostty_surface *surface = NULL;
+    winghostty_surface_options options;
+    winghostty_surface_options_init(&options);
+    options.visible = 0;
+    options.bounds.width = 80;
+    options.bounds.height = 40;
+    options.font_scale = 1.25f;
+
+    if (winghostty_host_initialize(&host) != WINGHOSTTY_OK ||
+        winghostty_host_create_surface(
+            host,
+            parent,
+            &options,
+            &surface
+        ) != WINGHOSTTY_OK ||
+        surface == NULL) {
+        if (host != NULL) winghostty_host_deinitialize(host);
+        return fail("appearance config setup failed");
+    }
+
+    winghostty_appearance_config appearance;
+    winghostty_appearance_config_init(&appearance);
+    if (appearance.size != sizeof(appearance) ||
+        appearance.version != WINGHOSTTY_APPEARANCE_CONFIG_VERSION_1 ||
+        appearance.background_opacity != 1.0f ||
+        appearance.padding_top != 0.0f ||
+        appearance.padding_right != 0.0f ||
+        appearance.padding_bottom != 0.0f ||
+        appearance.padding_left != 0.0f ||
+        appearance.reserved[0] != 0 ||
+        appearance.reserved[1] != 0 ||
+        appearance.reserved[2] != 0 ||
+        appearance.reserved[3] != 0) {
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return fail("appearance config initializer produced invalid defaults");
+    }
+
+    appearance.background_rgb = 0x224466;
+    appearance.background_opacity = 0.25f;
+    appearance.padding_top = 3.0f;
+    appearance.padding_right = 4.0f;
+    appearance.padding_bottom = 5.0f;
+    appearance.padding_left = 6.0f;
+    winghostty_cell_metrics metrics_before;
+    winghostty_cell_metrics metrics_after;
+    if (winghostty_surface_notify_dpi_changed(surface, 192) != WINGHOSTTY_OK ||
+        winghostty_surface_get_cell_metrics(surface, &metrics_before) !=
+            WINGHOSTTY_OK ||
+        winghostty_surface_set_appearance_config(surface, &appearance) !=
+            WINGHOSTTY_OK ||
+        winghostty_surface_get_cell_metrics(surface, &metrics_after) !=
+            WINGHOSTTY_OK ||
+        memcmp(&metrics_before, &metrics_after, sizeof(metrics_before)) != 0) {
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return fail("appearance config changed font-scale-owned metrics");
+    }
+    appearance.background_rgb = 0xFFFFFF;
+
+    winghostty_appearance_config invalid = appearance;
+    invalid.size -= 1;
+    if (winghostty_surface_set_appearance_config(surface, &invalid) !=
+        WINGHOSTTY_INVALID_ARGUMENT) {
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return fail("appearance config accepted an invalid size");
+    }
+    invalid = appearance;
+    invalid.version += 1;
+    if (winghostty_surface_set_appearance_config(surface, &invalid) !=
+        WINGHOSTTY_INVALID_ARGUMENT) {
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return fail("appearance config accepted an invalid version");
+    }
+    invalid = appearance;
+    invalid.background_opacity = -0.01f;
+    if (winghostty_surface_set_appearance_config(surface, &invalid) !=
+        WINGHOSTTY_INVALID_ARGUMENT) {
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return fail("appearance config accepted negative opacity");
+    }
+    invalid.background_opacity = 1.01f;
+    if (winghostty_surface_set_appearance_config(surface, &invalid) !=
+        WINGHOSTTY_INVALID_ARGUMENT) {
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return fail("appearance config accepted excessive opacity");
+    }
+    invalid.background_opacity = NAN;
+    if (winghostty_surface_set_appearance_config(surface, &invalid) !=
+        WINGHOSTTY_INVALID_ARGUMENT) {
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return fail("appearance config accepted NaN opacity");
+    }
+    invalid = appearance;
+    invalid.padding_top = -1.0f;
+    if (winghostty_surface_set_appearance_config(surface, &invalid) !=
+        WINGHOSTTY_INVALID_ARGUMENT) {
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return fail("appearance config accepted negative padding");
+    }
+    invalid.padding_top = INFINITY;
+    if (winghostty_surface_set_appearance_config(surface, &invalid) !=
+        WINGHOSTTY_INVALID_ARGUMENT) {
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return fail("appearance config accepted infinite padding");
+    }
+    invalid.padding_top = NAN;
+    if (winghostty_surface_set_appearance_config(surface, &invalid) !=
+        WINGHOSTTY_INVALID_ARGUMENT) {
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return fail("appearance config accepted NaN padding");
+    }
+    if (winghostty_surface_set_appearance_config(surface, NULL) !=
+        WINGHOSTTY_INVALID_ARGUMENT) {
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return fail("appearance config accepted NULL");
+    }
+
+    const winghostty_terminal_cell cell = {
+        .codepoint = ' ',
+        .foreground = 0,
+        .background = 0x88CCEE,
+        .flags = WINGHOSTTY_TERMINAL_CELL_BACKGROUND_SET,
+    };
+    winghostty_terminal_snapshot snapshot;
+    winghostty_terminal_snapshot_init(&snapshot);
+    snapshot.columns = 1;
+    snapshot.rows = 1;
+    snapshot.cells = &cell;
+    snapshot.cell_count = 1;
+    snapshot.generation = 1;
+    if (winghostty_surface_set_terminal_snapshot(surface, &snapshot) !=
+        WINGHOSTTY_OK) {
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return fail("appearance terminal snapshot forwarding failed");
+    }
+
+    appearance_render_call call = {
+        .surface = surface,
+        .make_current_result = WINGHOSTTY_INVALID_ARGUMENT,
+        .render_result = WINGHOSTTY_INVALID_ARGUMENT,
+        .clear_current_result = WINGHOSTTY_INVALID_ARGUMENT,
+    };
+    HANDLE thread = CreateThread(NULL, 0, appearance_render_thread, &call, 0, NULL);
+    if (thread == NULL) {
+        winghostty_surface_destroy(surface);
+        winghostty_host_deinitialize(host);
+        return fail("appearance render thread creation failed");
+    }
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+
+    const int failed =
+        check(call.make_current_result == WINGHOSTTY_OK,
+              "appearance render context bind failed") ||
+        check(call.render_result == WINGHOSTTY_OK,
+              "appearance render failed") ||
+        check(call.clear_current_result == WINGHOSTTY_OK,
+              "appearance render context clear failed") ||
+        check(call.padding_pixel[0] == 0x22 &&
+                  call.padding_pixel[1] == 0x44 &&
+                  call.padding_pixel[2] == 0x66 &&
+                  call.padding_pixel[3] >= 63 &&
+                  call.padding_pixel[3] <= 65,
+              "serialized appearance was not forwarded to renderer") ||
+        check(call.terminal_pixel[0] == 0x88 &&
+                  call.terminal_pixel[1] == 0xCC &&
+                  call.terminal_pixel[2] == 0xEE &&
+                  call.terminal_pixel[3] == 0xFF,
+              "DPI-scaled padding was not applied before first use");
+    if (winghostty_surface_destroy(surface) != WINGHOSTTY_OK ||
+        winghostty_host_deinitialize(host) != WINGHOSTTY_OK) {
+        return fail("appearance config teardown failed");
+    }
+    return failed;
+}
+
 static int run_vt_render_state_contract(HWND parent) {
     const char *output =
         "\033[2J\033[H$ echo visible\r\n"
@@ -2440,6 +2672,10 @@ int main(void) {
 
     if (run_renderer_contract(&state) != 0) {
         if (state.host) winghostty_host_deinitialize(state.host);
+        DestroyWindow(state.parent);
+        return 1;
+    }
+    if (run_appearance_config_contract(state.parent) != 0) {
         DestroyWindow(state.parent);
         return 1;
     }

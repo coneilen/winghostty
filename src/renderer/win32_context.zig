@@ -170,6 +170,13 @@ pub const RenderState = struct {
     font: glyph.FontConfig = .{},
     width: u32 = 1,
     height: u32 = 1,
+    appearance_set: bool = false,
+    background_rgb: u32 = 0,
+    background_opacity: f32 = 1,
+    padding_top: u32 = 0,
+    padding_right: u32 = 0,
+    padding_bottom: u32 = 0,
+    padding_left: u32 = 0,
     terminal_columns: u32 = 0,
     terminal_rows: u32 = 0,
     terminal_cells: []const TerminalCell = &.{},
@@ -553,8 +560,20 @@ pub const Context = struct {
         const width: i32 = @intCast(@min(state.width, @as(u32, std.math.maxInt(i32))));
         const height: i32 = @intCast(@min(state.height, @as(u32, std.math.maxInt(i32))));
         glViewport(0, 0, width, height);
-        const background = backgroundColor(state.theme);
-        glClearColor(background[0], background[1], background[2], 1.0);
+        const background = if (state.appearance_set)
+            rgb(state.background_rgb)
+        else
+            backgroundColor(state.theme);
+        const background_opacity = if (state.appearance_set)
+            state.background_opacity
+        else
+            1.0;
+        glClearColor(
+            background[0],
+            background[1],
+            background[2],
+            background_opacity,
+        );
         glClear(GL_COLOR_BUFFER_BIT);
 
         renderTerminalCells(self, state);
@@ -570,6 +589,7 @@ pub const Context = struct {
     }
 
     fn renderTerminalCells(self: *Context, state: RenderState) void {
+        if (state.width == 0 or state.height == 0) return;
         if (state.terminal_columns == 0 or
             state.terminal_rows == 0 or
             state.terminal_cells.len == 0)
@@ -590,27 +610,50 @@ pub const Context = struct {
         );
         if (columns == 0 or rows == 0) return;
 
-        const cell_width = 2.0 / @as(f32, @floatFromInt(columns));
-        const cell_height = 2.0 / @as(f32, @floatFromInt(rows));
-        const default_background = backgroundColor(state.theme);
+        const horizontal_padding = @min(
+            @as(u64, state.padding_left) + @as(u64, state.padding_right),
+            @as(u64, state.width),
+        );
+        const vertical_padding = @min(
+            @as(u64, state.padding_top) + @as(u64, state.padding_bottom),
+            @as(u64, state.height),
+        );
+        const content_width: u32 =
+            state.width - @as(u32, @intCast(horizontal_padding));
+        const content_height: u32 =
+            state.height - @as(u32, @intCast(vertical_padding));
+        if (content_width == 0 or content_height == 0) return;
+        const origin_left = -1.0 + 2.0 *
+            @as(f32, @floatFromInt(@min(state.padding_left, state.width))) /
+            @as(f32, @floatFromInt(state.width));
+        const origin_top = 1.0 - 2.0 *
+            @as(f32, @floatFromInt(@min(state.padding_top, state.height))) /
+            @as(f32, @floatFromInt(state.height));
+        const cell_width = 2.0 *
+            (@as(f32, @floatFromInt(content_width)) /
+                @as(f32, @floatFromInt(state.width))) /
+            @as(f32, @floatFromInt(columns));
+        const cell_height = 2.0 *
+            (@as(f32, @floatFromInt(content_height)) /
+                @as(f32, @floatFromInt(state.height))) /
+            @as(f32, @floatFromInt(rows));
 
-        // Background pass. Every cell paints its own background, including
-        // the continuation cell a wide grapheme reserves.
+        // Explicit cell backgrounds paint over the already-cleared appearance
+        // background, including continuation cells of wide graphemes.
         for (0..@intCast(rows)) |row| {
             for (0..@intCast(columns)) |column| {
                 const cell = state.terminal_cells[row * @as(usize, @intCast(columns)) + column];
-                const left = -1.0 + @as(f32, @floatFromInt(column)) * cell_width;
-                const top = 1.0 - @as(f32, @floatFromInt(row)) * cell_height;
-                const background = if (backgroundIsSet(cell))
-                    rgb(cell.background)
-                else
-                    default_background;
-                drawRect(left, top, cell_width, -cell_height, background);
+                if (!backgroundIsSet(cell)) continue;
+                const left = origin_left +
+                    @as(f32, @floatFromInt(column)) * cell_width;
+                const top = origin_top -
+                    @as(f32, @floatFromInt(row)) * cell_height;
+                drawRect(left, top, cell_width, -cell_height, rgb(cell.background));
             }
         }
 
-        const pixel_cell_width = state.width / columns;
-        const pixel_cell_height = state.height / rows;
+        const pixel_cell_width = content_width / columns;
+        const pixel_cell_height = content_height / rows;
         if (state.hasGlyphs() and
             pixel_cell_width > 0 and
             pixel_cell_height > 0)
@@ -619,6 +662,8 @@ pub const Context = struct {
                 state,
                 columns,
                 rows,
+                origin_left,
+                origin_top,
                 cell_width,
                 cell_height,
                 pixel_cell_width,
@@ -627,7 +672,15 @@ pub const Context = struct {
             return;
         }
 
-        renderLegacyInk(state, columns, rows, cell_width, cell_height);
+        renderLegacyInk(
+            state,
+            columns,
+            rows,
+            origin_left,
+            origin_top,
+            cell_width,
+            cell_height,
+        );
     }
 
     /// v2 ink pass: real glyph coverage rasterized by GDI and uploaded as a
@@ -639,6 +692,8 @@ pub const Context = struct {
         state: RenderState,
         columns: u32,
         rows: u32,
+        origin_left: f32,
+        origin_top: f32,
         cell_width: f32,
         cell_height: f32,
         pixel_cell_width: u32,
@@ -696,8 +751,10 @@ pub const Context = struct {
                         continue;
                 };
 
-                const left = -1.0 + @as(f32, @floatFromInt(column)) * cell_width;
-                const top = 1.0 - @as(f32, @floatFromInt(row)) * cell_height;
+                const left = origin_left +
+                    @as(f32, @floatFromInt(column)) * cell_width;
+                const top = origin_top -
+                    @as(f32, @floatFromInt(row)) * cell_height;
                 const quad_width = cell_width * @as(f32, @floatFromInt(cells_wide));
                 const max_s = @as(f32, @floatFromInt(entry.glyph_width)) /
                     @as(f32, @floatFromInt(entry.texture_width));
@@ -727,6 +784,8 @@ pub const Context = struct {
         state: RenderState,
         columns: u32,
         rows: u32,
+        origin_left: f32,
+        origin_top: f32,
         cell_width: f32,
         cell_height: f32,
     ) void {
@@ -738,8 +797,10 @@ pub const Context = struct {
             for (0..@intCast(columns)) |column| {
                 const cell = state.terminal_cells[row * @as(usize, @intCast(columns)) + column];
                 if (cell.codepoint == 0 or cell.codepoint == ' ') continue;
-                const left = -1.0 + @as(f32, @floatFromInt(column)) * cell_width;
-                const top = 1.0 - @as(f32, @floatFromInt(row)) * cell_height;
+                const left = origin_left +
+                    @as(f32, @floatFromInt(column)) * cell_width;
+                const top = origin_top -
+                    @as(f32, @floatFromInt(row)) * cell_height;
 
                 const foreground = foregroundColor(cell);
                 const seed = cell.codepoint *% 0x9E3779B1;

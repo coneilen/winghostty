@@ -428,9 +428,24 @@ typedef struct winghostty_surface_options_v2 {
 
 #define WINGHOSTTY_SURFACE_OPTIONS_VERSION_2 ((uint32_t)2)
 
+typedef struct winghostty_appearance_config {
+    uint32_t size;
+    uint32_t version;
+    uint32_t background_rgb;
+    float background_opacity;
+    float padding_top;
+    float padding_right;
+    float padding_bottom;
+    float padding_left;
+    uint32_t reserved[4];
+} winghostty_appearance_config;
+
+#define WINGHOSTTY_APPEARANCE_CONFIG_VERSION_1 ((uint32_t)1)
+
 void winghostty_surface_options_init(winghostty_surface_options *options);
 void winghostty_surface_options_v2_init(winghostty_surface_options_v2 *options);
 void winghostty_font_config_init(winghostty_font_config *config);
+void winghostty_appearance_config_init(winghostty_appearance_config *config);
 
 winghostty_result winghostty_host_initialize(winghostty_host **out_host);
 winghostty_result winghostty_host_deinitialize(winghostty_host *host);
@@ -472,6 +487,10 @@ winghostty_result winghostty_surface_set_font_scale(
 winghostty_result winghostty_surface_set_font_config(
     winghostty_surface *surface,
     const winghostty_font_config *config
+);
+winghostty_result winghostty_surface_set_appearance_config(
+    winghostty_surface *surface,
+    const winghostty_appearance_config *config
 );
 winghostty_result winghostty_surface_set_cell_metrics(
     winghostty_surface *surface,

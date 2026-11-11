@@ -643,6 +643,20 @@ pub const InputOptions = extern struct {
     keyboard_layout: ?[*:0]const u8,
 };
 
+pub const AppearanceConfig = extern struct {
+    size: u32,
+    version: u32,
+    background_rgb: u32,
+    background_opacity: f32,
+    padding_top: f32,
+    padding_right: f32,
+    padding_bottom: f32,
+    padding_left: f32,
+    reserved: [4]u32,
+};
+
+const appearance_config_version_1: u32 = 1;
+
 pub const LegacySurfaceOptions = extern struct {
     command: ?[*:0]const u8,
     cwd: ?[*:0]const u8,
@@ -758,6 +772,7 @@ const SurfaceState = struct {
     parent: HWND,
     hwnd: ?HWND = null,
     options: OwnedOptions,
+    appearance: ?AppearanceConfig = null,
     admission: AdmissionState = .{},
     options_mutex: std.Thread.Mutex = .{},
     terminal_mutex: std.Thread.Mutex = .{},
@@ -1176,6 +1191,16 @@ fn metricsFor(surface: *const SurfaceState) ScaledMetrics {
         surface.dpi,
         surface.options.font_scale,
     );
+}
+
+fn pointsToPixels(points: f32, dpi: u32) u32 {
+    const pixels = std.math.round(
+        @as(f64, points) * @as(f64, @floatFromInt(dpi)) / 72.0,
+    );
+    if (pixels >= @as(f64, @floatFromInt(std.math.maxInt(u32)))) {
+        return std.math.maxInt(u32);
+    }
+    return @intFromFloat(pixels);
 }
 
 fn beginSurfaceOperation(surface: *SurfaceState) bool {
@@ -2856,6 +2881,20 @@ pub export fn winghostty_surface_options_init(options: *LegacySurfaceOptions) vo
     };
 }
 
+pub export fn winghostty_appearance_config_init(options: *AppearanceConfig) void {
+    options.* = .{
+        .size = @sizeOf(AppearanceConfig),
+        .version = appearance_config_version_1,
+        .background_rgb = 0,
+        .background_opacity = 1.0,
+        .padding_top = 0,
+        .padding_right = 0,
+        .padding_bottom = 0,
+        .padding_left = 0,
+        .reserved = .{0} ** 4,
+    };
+}
+
 pub export fn winghostty_host_initialize(out_host: ?*?*Host) Result {
     const output = out_host orelse return result_invalid_argument;
     output.* = null;
@@ -3438,6 +3477,42 @@ pub export fn winghostty_surface_set_font_config(
     return result_ok;
 }
 
+pub export fn winghostty_surface_set_appearance_config(
+    surface: ?*Surface,
+    config: ?*const AppearanceConfig,
+) Result {
+    const next = config orelse return result_invalid_argument;
+    if (next.size != @sizeOf(AppearanceConfig) or
+        next.version != appearance_config_version_1 or
+        !std.math.isFinite(next.background_opacity) or
+        next.background_opacity < 0 or
+        next.background_opacity > 1 or
+        !std.math.isFinite(next.padding_top) or
+        next.padding_top < 0 or
+        !std.math.isFinite(next.padding_right) or
+        next.padding_right < 0 or
+        !std.math.isFinite(next.padding_bottom) or
+        next.padding_bottom < 0 or
+        !std.math.isFinite(next.padding_left) or
+        next.padding_left < 0)
+    {
+        return result_invalid_argument;
+    }
+
+    var admission = admitSurface(surface) orelse
+        return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+
+    state.options_mutex.lock();
+    state.appearance = next.*;
+    state.options_mutex.unlock();
+    if (state.hwnd) |hwnd| _ = InvalidateRect(hwnd, null, 0);
+    return result_ok;
+}
+
 pub export fn winghostty_surface_set_cell_metrics(
     surface: ?*Surface,
     metrics: ?*const CellMetrics,
@@ -3771,6 +3846,7 @@ pub export fn winghostty_surface_render(surface: ?*Surface) Result {
 
     state.options_mutex.lock();
     state.terminal_mutex.lock();
+    const appearance = state.appearance;
     const render_state = win32_presentation.RenderState{
         .theme = @enumFromInt(state.options.theme),
         .font_scale = state.options.font_scale,
@@ -3778,6 +3854,25 @@ pub export fn winghostty_surface_render(surface: ?*Surface) Result {
         .font = state.options.font,
         .width = state.options.bounds.width,
         .height = state.options.bounds.height,
+        .appearance_set = appearance != null,
+        .background_rgb = if (appearance) |value| value.background_rgb else 0,
+        .background_opacity = if (appearance) |value| value.background_opacity else 1,
+        .padding_top = if (appearance) |value|
+            pointsToPixels(value.padding_top, state.dpi)
+        else
+            0,
+        .padding_right = if (appearance) |value|
+            pointsToPixels(value.padding_right, state.dpi)
+        else
+            0,
+        .padding_bottom = if (appearance) |value|
+            pointsToPixels(value.padding_bottom, state.dpi)
+        else
+            0,
+        .padding_left = if (appearance) |value|
+            pointsToPixels(value.padding_left, state.dpi)
+        else
+            0,
         .terminal_columns = state.terminal_columns,
         .terminal_rows = state.terminal_rows,
         .terminal_cells = state.terminal_cells,

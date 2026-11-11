@@ -80,6 +80,18 @@ WINGHOSTTY_LAYOUT_ASSERT(
     offsetof(winghostty_surface_options_v2, input) == 248,
     "input options offset changed"
 );
+WINGHOSTTY_LAYOUT_ASSERT(
+    sizeof(winghostty_appearance_config) == 48,
+    "appearance config ABI changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    offsetof(winghostty_appearance_config, background_opacity) == 12,
+    "appearance opacity offset changed"
+);
+WINGHOSTTY_LAYOUT_ASSERT(
+    offsetof(winghostty_appearance_config, reserved) == 32,
+    "appearance reserved offset changed"
+);
 WINGHOSTTY_LAYOUT_ASSERT(sizeof(winghostty_key_event) == 48, "key event ABI changed");
 WINGHOSTTY_LAYOUT_ASSERT(sizeof(winghostty_mouse_event) == 36, "mouse event ABI changed");
 WINGHOSTTY_LAYOUT_ASSERT(sizeof(winghostty_selection_event) == 20, "selection event ABI changed");
@@ -243,6 +255,7 @@ void winghostty_win32_host_compile_contract(void) {
     winghostty_surface_options options;
     winghostty_surface_options_v2 options_v2;
     winghostty_font_config font_config;
+    winghostty_appearance_config appearance;
     winghostty_rect bounds = {0, 0, 800, 600};
     uint32_t drained = 0;
 
@@ -306,6 +319,9 @@ void winghostty_win32_host_compile_contract(void) {
     (void)winghostty_surface_set_theme(surface, WINGHOSTTY_THEME_DARK);
     (void)winghostty_surface_set_font_scale(surface, 1.0f);
     (void)winghostty_surface_set_font_config(surface, &font_config);
+    winghostty_appearance_config_init(&appearance);
+    appearance.background_rgb = 0x112233;
+    (void)winghostty_surface_set_appearance_config(surface, &appearance);
     winghostty_cell_metrics metrics = {8, 16, 8, 16, 13};
     (void)winghostty_surface_set_cell_metrics(surface, &metrics);
     (void)winghostty_surface_get_cell_metrics(surface, &metrics);
