@@ -1805,6 +1805,7 @@ static int run_vt_render_state_contract(HWND parent) {
 #define GLYPH_FB_HEIGHT 32
 #define GLYPH_COLUMNS 4
 #define GLYPH_CELL_WIDTH (GLYPH_FB_WIDTH / GLYPH_COLUMNS)
+#define GLYPH_MAX_FRAMES 12
 
 typedef struct {
     winghostty_surface *surface;
@@ -1812,9 +1813,11 @@ typedef struct {
     HANDLE next_frame;
     winghostty_result make_current_result;
     winghostty_result clear_current_result;
-    winghostty_result render_result[2];
-    winghostty_result present_result[2];
-    unsigned char frames[2][GLYPH_FB_WIDTH * GLYPH_FB_HEIGHT * 4];
+    int frame_count;
+    volatile LONG stop;
+    winghostty_result render_result[GLYPH_MAX_FRAMES];
+    winghostty_result present_result[GLYPH_MAX_FRAMES];
+    unsigned char frames[GLYPH_MAX_FRAMES][GLYPH_FB_WIDTH * GLYPH_FB_HEIGHT * 4];
 } glyph_render_session;
 
 /*
@@ -1831,10 +1834,12 @@ static DWORD WINAPI glyph_render_thread(void *parameter) {
         SetEvent(session->frame_ready);
         return 0;
     }
-    for (int frame = 0; frame < 2; ++frame) {
+    const int frame_count = session->frame_count ? session->frame_count : 2;
+    for (int frame = 0; frame < frame_count; ++frame) {
         if (frame > 0) {
             WaitForSingleObject(session->next_frame, INFINITE);
         }
+        if (InterlockedCompareExchange(&session->stop, 0, 0)) break;
         session->render_result[frame] =
             winghostty_surface_render(session->surface);
         /*
@@ -1928,6 +1933,201 @@ static int glyph_session_ok(const glyph_render_session *session, int frame) {
         session->present_result[frame] == WINGHOSTTY_OK;
 }
 
+
+static void cursor_redraw(void *userdata, winghostty_surface *surface) {
+    (void)surface;
+    InterlockedIncrement((volatile LONG *)userdata);
+}
+
+static unsigned cursor_color_pixels(const unsigned char *pixels, unsigned r, unsigned g, unsigned b) {
+    unsigned count = 0;
+    for (unsigned i = 0; i < GLYPH_FB_WIDTH * GLYPH_FB_HEIGHT; ++i) {
+        const unsigned char *p = pixels + i * 4;
+        if (p[0] == r && p[1] == g && p[2] == b) ++count;
+    }
+    return count;
+}
+
+/*
+ * Device-gated contract: hidden-parent WGL back-buffer pixels and the actual
+ * provider WM_TIMER/redraw lifecycle. This is not foreground/macOS parity.
+ */
+static int run_cursor_render_contract(HWND parent) {
+    winghostty_host *host = NULL;
+    winghostty_surface *surface = NULL;
+    HANDLE thread = NULL;
+    volatile LONG redraws = 0;
+    int failed = 0;
+    static glyph_render_session session;
+    memset(&session, 0, sizeof(session));
+    session.frame_count = GLYPH_MAX_FRAMES;
+    session.frame_ready = CreateEventW(NULL, FALSE, FALSE, NULL);
+    session.next_frame = CreateEventW(NULL, FALSE, FALSE, NULL);
+    winghostty_surface_options options;
+    winghostty_surface_options_init(&options);
+    options.bounds.width = GLYPH_FB_WIDTH;
+    options.bounds.height = GLYPH_FB_HEIGHT;
+    options.visible = 1;
+    options.focus = 1;
+    options.callbacks.on_redraw = cursor_redraw;
+    options.user_data = (void *)&redraws;
+    if (!session.frame_ready || !session.next_frame ||
+        winghostty_host_initialize(&host) != WINGHOSTTY_OK ||
+        winghostty_host_create_surface(host, parent, &options, &surface) != WINGHOSTTY_OK) {
+        failed = fail("cursor contract setup failed");
+        goto cleanup;
+    }
+    winghostty_appearance_config appearance;
+    winghostty_appearance_config_init(&appearance);
+    appearance.background_rgb = 0x223344;
+    appearance.padding_left = appearance.padding_right = 3;
+    appearance.padding_top = appearance.padding_bottom = 3;
+    if (winghostty_surface_set_appearance_config(surface, &appearance) != WINGHOSTTY_OK) {
+        failed = fail("cursor appearance setup failed");
+        goto cleanup;
+    }
+    const winghostty_terminal_cell cells[4] = {
+        {0, 0xFFFFFF, 0x223344, WINGHOSTTY_TERMINAL_CELL_FOREGROUND_SET},
+        {'M', 0xFFFFFF, 0x223344, WINGHOSTTY_TERMINAL_CELL_FOREGROUND_SET},
+        {0x4E2D, 0xFFFFFF, 0x223344, WINGHOSTTY_TERMINAL_CELL_FOREGROUND_SET},
+        {0, 0xFFFFFF, 0x223344, WINGHOSTTY_TERMINAL_CELL_FOREGROUND_SET}
+    };
+    const winghostty_terminal_glyph glyphs[4] = {
+        {0, 0, 1, 0}, {0, 1, 1, 0}, {1, 3, 2, 0}, {0, 0, 0, 0}
+    };
+    winghostty_terminal_snapshot_v3 snapshot;
+    winghostty_terminal_snapshot_v3_init(&snapshot);
+    snapshot.columns = 4;
+    snapshot.rows = 1;
+    snapshot.cells = cells;
+    snapshot.cell_count = 4;
+    snapshot.glyphs = glyphs;
+    snapshot.glyph_count = 4;
+    snapshot.text = (const uint8_t *)"M\xE4\xB8\xAD";
+    snapshot.text_length = 4;
+    snapshot.cursor.x = 1;
+    snapshot.cursor.y = 0;
+    snapshot.cursor.color_rgb = 0x00FF00;
+    snapshot.cursor.text_rgb = 0;
+    session.surface = surface;
+    for (int frame = 0; frame < GLYPH_MAX_FRAMES; ++frame) {
+        snapshot.generation++;
+        if (frame == 1) snapshot.cursor.flags = WINGHOSTTY_CURSOR_VISIBLE;
+        if (frame == 2) snapshot.cursor.style = WINGHOSTTY_CURSOR_BAR;
+        if (frame == 3) snapshot.cursor.style = WINGHOSTTY_CURSOR_UNDERLINE;
+        if (frame == 4) {
+            snapshot.cursor.style = WINGHOSTTY_CURSOR_BLOCK;
+            if (winghostty_surface_set_focus(surface, 0) != WINGHOSTTY_OK) failed = 1;
+        }
+        if (frame == 5) {
+            if (winghostty_surface_set_focus(surface, 1) != WINGHOSTTY_OK) failed = 1;
+            snapshot.cursor.x = 2;
+        }
+        if (frame == 6) {
+            snapshot.cursor.x = 3;
+            snapshot.cursor.flags |= WINGHOSTTY_CURSOR_WIDE_TAIL;
+        }
+        if (frame == 7) {
+            snapshot.cursor.x = 0;
+            snapshot.cursor.flags = WINGHOSTTY_CURSOR_VISIBLE;
+        }
+        if (frame == 8) snapshot.cursor.style = 99;
+        if (frame == 10) {
+            snapshot.cursor.style = WINGHOSTTY_CURSOR_BLOCK;
+            snapshot.cursor.flags = WINGHOSTTY_CURSOR_VISIBLE | WINGHOSTTY_CURSOR_BLINKING;
+        }
+        if (frame == 9) {
+            winghostty_terminal_snapshot_v2 legacy;
+            winghostty_terminal_snapshot_v2_init(&legacy);
+            legacy.columns = snapshot.columns;
+            legacy.rows = snapshot.rows;
+            legacy.cells = snapshot.cells;
+            legacy.cell_count = snapshot.cell_count;
+            legacy.glyphs = snapshot.glyphs;
+            legacy.glyph_count = snapshot.glyph_count;
+            legacy.text = snapshot.text;
+            legacy.text_length = snapshot.text_length;
+            if (winghostty_surface_set_terminal_snapshot_v2(surface, &legacy) != WINGHOSTTY_OK) failed = 1;
+        } else if (frame == 11) {
+            /* No snapshot/PTY update: only the provider timer requests redraw. */
+            MSG message;
+            while (PeekMessageW(&message, NULL, WM_PAINT, WM_PAINT, PM_REMOVE)) {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            const LONG before = redraws;
+            const ULONGLONG deadline = GetTickCount64() + 1000;
+            while (redraws == before && GetTickCount64() < deadline) {
+                while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+                Sleep(1);
+            }
+            if (check(redraws > before, "idle cursor timer did not request redraw")) failed = 1;
+        } else {
+            const winghostty_result result = winghostty_surface_set_terminal_snapshot_v3(surface, &snapshot);
+            if (check(result == (frame == 8 ? WINGHOSTTY_INVALID_ARGUMENT : WINGHOSTTY_OK),
+                      "cursor snapshot acceptance mismatch")) failed = 1;
+        }
+        if (frame == 0) {
+            thread = CreateThread(NULL, 0, glyph_render_thread, &session, 0, NULL);
+            if (!thread) {
+                failed = fail("cursor render thread creation failed");
+                goto cleanup;
+            }
+        } else {
+            SetEvent(session.next_frame);
+        }
+        if (WaitForSingleObject(session.frame_ready, 20000) != WAIT_OBJECT_0 ||
+            !glyph_session_ok(&session, frame)) {
+            failed = fail("cursor frame failed");
+            goto cleanup;
+        }
+    }
+    {
+        const unsigned block = cursor_color_pixels(session.frames[1], 0, 255, 0);
+        const unsigned bar = cursor_color_pixels(session.frames[2], 0, 255, 0);
+        const unsigned underline = cursor_color_pixels(session.frames[3], 0, 255, 0);
+        const unsigned hollow = cursor_color_pixels(session.frames[4], 0, 255, 0);
+        if (check(block > 0 && bar > 0 && underline > 0 && hollow > 0,
+                  "a cursor shape produced no pixels")) failed = 1;
+        if (check(block > bar && block > underline && block > hollow,
+                  "thin/unfocused cursor shapes were filled blocks")) failed = 1;
+        if (check(cursor_color_pixels(session.frames[1], 0, 0, 0) > 0,
+                  "block cursor did not recolor the underlying glyph")) failed = 1;
+        const size_t bytes = sizeof(session.frames[0]);
+        if (check(memcmp(session.frames[5], session.frames[6], bytes) == 0,
+                  "wide tail did not match wide lead cursor")) failed = 1;
+        if (check(memcmp(session.frames[6], session.frames[7], bytes) != 0,
+                  "cursor-only movement did not change pixels")) failed = 1;
+        if (check(memcmp(session.frames[7], session.frames[8], bytes) == 0,
+                  "rejected descriptor changed accepted pixels")) failed = 1;
+        if (check(memcmp(session.frames[0], session.frames[9], bytes) == 0,
+                  "v2 snapshot did not clear visual cursor")) failed = 1;
+        if (check(memcmp(session.frames[0], session.frames[11], bytes) == 0 &&
+                  memcmp(session.frames[10], session.frames[11], bytes) != 0,
+                  "idle blink did not erase cursor without new PTY output")) failed = 1;
+        fprintf(stderr, "cursor pixels: block=%u bar=%u underline=%u hollow=%u; frames=12\n",
+                block, bar, underline, hollow);
+    }
+cleanup:
+    if (thread) {
+        InterlockedExchange(&session.stop, 1);
+        SetEvent(session.next_frame);
+        WaitForSingleObject(thread, INFINITE);
+        if (session.clear_current_result != WINGHOSTTY_OK) failed = fail("cursor clear-current failed");
+        CloseHandle(thread);
+    }
+    if (surface) {
+        if (winghostty_surface_set_visible(surface, 0) != WINGHOSTTY_OK) failed = fail("cursor hide failed");
+        if (winghostty_surface_destroy(surface) != WINGHOSTTY_OK) failed = fail("cursor surface teardown failed");
+    }
+    if (host && winghostty_host_deinitialize(host) != WINGHOSTTY_OK) failed = fail("cursor host teardown failed");
+    if (session.frame_ready) CloseHandle(session.frame_ready);
+    if (session.next_frame) CloseHandle(session.next_frame);
+    return failed;
+}
 
 /*
  * End-to-end proof that the v2 snapshot reaches real rasterized glyph pixels
@@ -2684,6 +2884,10 @@ int main(void) {
         return 1;
     }
     if (run_glyph_render_contract(state.parent) != 0) {
+        DestroyWindow(state.parent);
+        return 1;
+    }
+    if (run_cursor_render_contract(state.parent) != 0) {
         DestroyWindow(state.parent);
         return 1;
     }

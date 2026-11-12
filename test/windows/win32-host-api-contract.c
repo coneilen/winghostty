@@ -120,6 +120,11 @@ WINGHOSTTY_LAYOUT_ASSERT(
     offsetof(winghostty_terminal_snapshot_v2, text) == 48,
     "terminal snapshot v2 text pointer offset changed"
 );
+WINGHOSTTY_LAYOUT_ASSERT(sizeof(winghostty_terminal_cursor) == 32, "cursor ABI changed");
+WINGHOSTTY_LAYOUT_ASSERT(sizeof(winghostty_terminal_snapshot_v3) == 104, "snapshot v3 ABI changed");
+WINGHOSTTY_LAYOUT_ASSERT(offsetof(winghostty_terminal_snapshot_v3, cursor) == 72, "cursor offset changed");
+WINGHOSTTY_LAYOUT_ASSERT(offsetof(winghostty_terminal_snapshot_v3, generation) == 64, "v3 generation offset changed");
+WINGHOSTTY_LAYOUT_ASSERT(offsetof(winghostty_terminal_cursor, color_rgb) == 16, "cursor color offset changed");
 WINGHOSTTY_LAYOUT_ASSERT(
     sizeof(winghostty_font_config) == 64,
     "font config ABI changed"
@@ -256,10 +261,13 @@ void winghostty_win32_host_compile_contract(void) {
     winghostty_surface_options_v2 options_v2;
     winghostty_font_config font_config;
     winghostty_appearance_config appearance;
+    winghostty_terminal_snapshot_v3 snapshot_v3;
     winghostty_rect bounds = {0, 0, 800, 600};
     uint32_t drained = 0;
 
     winghostty_surface_options_init(&options);
+    winghostty_terminal_snapshot_v3_init(&snapshot_v3);
+    (void)winghostty_surface_set_terminal_snapshot_v3(surface, &snapshot_v3);
     options.command = "cmd.exe";
     options.cwd = "C:\\";
     options.environment = "TERM=xterm-256color";

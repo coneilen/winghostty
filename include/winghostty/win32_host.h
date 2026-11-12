@@ -129,6 +129,58 @@ typedef struct {
     uint64_t generation;
 } winghostty_terminal_snapshot_v2;
 
+#define WINGHOSTTY_TERMINAL_SNAPSHOT_VERSION_3 3u
+#define WINGHOSTTY_CURSOR_BLOCK 0u
+#define WINGHOSTTY_CURSOR_BAR 1u
+#define WINGHOSTTY_CURSOR_UNDERLINE 2u
+#define WINGHOSTTY_CURSOR_BLOCK_HOLLOW 3u
+#define WINGHOSTTY_CURSOR_VISIBLE (1u << 0)
+#define WINGHOSTTY_CURSOR_BLINKING (1u << 1)
+#define WINGHOSTTY_CURSOR_WIDE_TAIL (1u << 2)
+#define WINGHOSTTY_CURSOR_PENDING_WRAP (1u << 3)
+
+/*
+ * Visual cursor, independent of the accessibility caret. x/y are zero-based
+ * viewport coordinates; negative or out-of-grid coordinates suppress drawing.
+ * WIDE_TAIL must agree with the glyph continuation at an in-grid position.
+ * PENDING_WRAP leaves the cursor on its cell, not the next row/column.
+ *
+ * Colors are resolved opaque 0xRRGGBB: use the effective cursor color (default
+ * terminal foreground), and cursor text color (default terminal background),
+ * NOT the styled cell colors. Reserved words/unknown flags/styles are rejected.
+ * A focused block recolors the complete grapheme beneath it for legibility.
+ * Unfocused cursors are steady hollow blocks, including when blinking is set.
+ */
+typedef struct {
+    int32_t x;
+    int32_t y;
+    uint32_t style;
+    uint32_t flags;
+    uint32_t color_rgb;
+    uint32_t text_rgb;
+    uint32_t reserved[2];
+} winghostty_terminal_cursor;
+
+/*
+ * Separate additive ABI: all v2 validation and ownership rules apply, with
+ * cursor state copied atomically alongside cells/glyphs/text. A v1/v2 install
+ * clears any prior visual cursor. Initialize before filling this descriptor.
+ */
+typedef struct {
+    uint32_t size;
+    uint32_t version;
+    uint32_t columns;
+    uint32_t rows;
+    const winghostty_terminal_cell *cells;
+    uint64_t cell_count;
+    const winghostty_terminal_glyph *glyphs;
+    uint64_t glyph_count;
+    const uint8_t *text;
+    uint64_t text_length;
+    uint64_t generation;
+    winghostty_terminal_cursor cursor;
+} winghostty_terminal_snapshot_v3;
+
 typedef struct winghostty_cell_metrics {
     uint32_t font_width;
     uint32_t font_height;
@@ -600,6 +652,12 @@ void winghostty_terminal_snapshot_v2_init(winghostty_terminal_snapshot_v2 *snaps
 winghostty_result winghostty_surface_set_terminal_snapshot_v2(
     winghostty_surface *surface,
     const winghostty_terminal_snapshot_v2 *snapshot
+);
+
+void winghostty_terminal_snapshot_v3_init(winghostty_terminal_snapshot_v3 *snapshot);
+winghostty_result winghostty_surface_set_terminal_snapshot_v3(
+    winghostty_surface *surface,
+    const winghostty_terminal_snapshot_v3 *snapshot
 );
 
 HDC winghostty_surface_get_hdc(const winghostty_surface *surface);

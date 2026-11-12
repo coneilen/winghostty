@@ -8,6 +8,7 @@
 const std = @import("std");
 const win32_types = @import("../apprt/win32_types.zig");
 const glyph = @import("win32_glyph.zig");
+const cursor = @import("win32_cursor.zig");
 
 const HWND = win32_types.HWND;
 const HDC = win32_types.HDC;
@@ -186,6 +187,11 @@ pub const RenderState = struct {
     /// snapshot, which still renders through the legacy path.
     terminal_glyphs: []const TerminalGlyph = &.{},
     terminal_text: []const u8 = &.{},
+    cursor: cursor.Cursor = .{},
+    cursor_focused: bool = false,
+    cursor_surface_visible: bool = false,
+    cursor_epoch_ms: u64 = 0,
+    now_ms: u64 = 0,
 
     fn hasGlyphs(self: RenderState) bool {
         return self.terminal_glyphs.len != 0 and
@@ -654,6 +660,29 @@ pub const Context = struct {
 
         const pixel_cell_width = content_width / columns;
         const pixel_cell_height = content_height / rows;
+        const cursor_width: u8 = if (state.hasGlyphs() and cursor.inViewport(state.cursor, columns, rows))
+            state.terminal_glyphs[@as(usize, @intCast(state.cursor.y)) * columns + @as(usize, @intCast(state.cursor.x))].width
+        else
+            1;
+        const cursor_at = cursor.placement(
+            state.cursor,
+            columns,
+            rows,
+            cursor_width,
+            state.cursor_focused,
+            state.cursor_surface_visible,
+            state.cursor_epoch_ms,
+            state.now_ms,
+        );
+        const grid = cursor.Rect{
+            .x = @floatFromInt(@min(state.padding_left, state.width)),
+            .y = @floatFromInt(@min(state.padding_top, state.height)),
+            .width = @floatFromInt(content_width),
+            .height = @floatFromInt(content_height),
+        };
+        if (cursor_at) |at| {
+            if (at.shape == .block) drawCursor(state, at, grid, columns, rows);
+        }
         if (state.hasGlyphs() and
             pixel_cell_width > 0 and
             pixel_cell_height > 0)
@@ -668,19 +697,23 @@ pub const Context = struct {
                 cell_height,
                 pixel_cell_width,
                 pixel_cell_height,
+                cursor_at,
             );
-            return;
+        } else {
+            renderLegacyInk(state, columns, rows, origin_left, origin_top, cell_width, cell_height);
         }
+        if (cursor_at) |at| {
+            if (at.shape != .block) drawCursor(state, at, grid, columns, rows);
+        }
+    }
 
-        renderLegacyInk(
-            state,
-            columns,
-            rows,
-            origin_left,
-            origin_top,
-            cell_width,
-            cell_height,
-        );
+    fn drawCursor(state: RenderState, at: cursor.Placement, grid: cursor.Rect, columns: u32, rows: u32) void {
+        const rects = cursor.rectangles(at, grid, columns, rows);
+        const width: f32 = @floatFromInt(state.width);
+        const height: f32 = @floatFromInt(state.height);
+        for (rects.items[0..rects.len]) |rect| {
+            drawRect(-1 + 2 * rect.x / width, 1 - 2 * rect.y / height, 2 * rect.width / width, -2 * rect.height / height, rgb(state.cursor.color_rgb));
+        }
     }
 
     /// v2 ink pass: real glyph coverage rasterized by GDI and uploaded as a
@@ -698,6 +731,7 @@ pub const Context = struct {
         cell_height: f32,
         pixel_cell_width: u32,
         pixel_cell_height: u32,
+        cursor_at: ?cursor.Placement,
     ) void {
         self.glyph_cache.syncMetrics(pixel_cell_width, pixel_cell_height);
 
@@ -760,7 +794,13 @@ pub const Context = struct {
                     @as(f32, @floatFromInt(entry.texture_width));
                 const max_t = @as(f32, @floatFromInt(entry.glyph_height)) /
                     @as(f32, @floatFromInt(entry.texture_height));
-                const foreground = foregroundColor(cell);
+                const foreground = if (cursor_at) |at|
+                    if (at.shape == .block and at.column == column and at.row == row)
+                        rgb(state.cursor.text_rgb)
+                    else
+                        foregroundColor(cell)
+                else
+                    foregroundColor(cell);
 
                 glBindTexture(GL_TEXTURE_2D, entry.texture);
                 glBegin(GL_QUADS);

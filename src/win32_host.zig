@@ -6,6 +6,7 @@ const host_metrics = @import("win32_host_metrics.zig");
 const host_uia = @import("win32_host_uia.zig");
 const win32_context = @import("renderer/win32_context.zig");
 const win32_glyph = @import("renderer/win32_glyph.zig");
+const win32_cursor = @import("renderer/win32_cursor.zig");
 const win32_presentation = @import("renderer/win32_presentation.zig");
 const paste_protection = @import("apprt/win32_paste_protection.zig");
 const win32_clipboard_html = @import("apprt/win32_clipboard_html.zig");
@@ -47,6 +48,8 @@ const GWLP_USERDATA: i32 = -21;
 const WM_NCCREATE: u32 = 0x0081;
 const WM_NCDESTROY: u32 = 0x0082;
 const WM_PAINT: u32 = 0x000F;
+const WM_TIMER: u32 = 0x0113;
+const cursor_timer_id: usize = 0x574743;
 const WM_ERASEBKGND: u32 = 0x0014;
 const WM_MOVE: u32 = 0x0003;
 const WM_WINDOWPOSCHANGED: u32 = 0x0047;
@@ -180,6 +183,9 @@ extern "user32" fn InvalidateRect(
     erase: BOOL,
 ) callconv(.winapi) BOOL;
 extern "user32" fn SetFocus(hwnd: ?HWND) callconv(.winapi) ?HWND;
+extern "user32" fn SetTimer(hwnd: HWND, id: usize, milliseconds: UINT, callback: ?*const anyopaque) callconv(.winapi) usize;
+extern "user32" fn KillTimer(hwnd: HWND, id: usize) callconv(.winapi) BOOL;
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 extern "user32" fn SetCapture(hwnd: HWND) callconv(.winapi) ?HWND;
 extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
 extern "user32" fn ScreenToClient(hwnd: HWND, point: *POINT) callconv(.winapi) BOOL;
@@ -335,6 +341,21 @@ pub const TerminalSnapshotV2 = extern struct {
     text: ?[*]const u8,
     text_length: u64,
     generation: u64,
+};
+
+pub const TerminalSnapshotV3 = extern struct {
+    size: u32,
+    version: u32,
+    columns: u32,
+    rows: u32,
+    cells: ?[*]const win32_context.TerminalCell,
+    cell_count: u64,
+    glyphs: ?[*]const win32_context.TerminalGlyph,
+    glyph_count: u64,
+    text: ?[*]const u8,
+    text_length: u64,
+    generation: u64,
+    cursor: win32_cursor.Cursor,
 };
 
 pub const Host = opaque {};
@@ -782,6 +803,10 @@ const SurfaceState = struct {
     terminal_generation: u64 = 0,
     terminal_columns: u32 = 0,
     terminal_rows: u32 = 0,
+    terminal_cursor: win32_cursor.Cursor = .{},
+    cursor_epoch_ms: u64 = 0,
+    cursor_timer_armed: bool = false,
+    cursor_blink_on: bool = true,
     renderer: ?*win32_context.Context = null,
     retired_renderer: ?*win32_context.Context = null,
     renderer_mutex: std.Thread.Mutex = .{},
@@ -1825,6 +1850,17 @@ fn notifyFocus(surface: *SurfaceState, focused: bool) void {
     {
         return;
     }
+    surface.options_mutex.lock();
+    surface.options.focus = @intFromBool(focused);
+    surface.options_mutex.unlock();
+    surface.terminal_mutex.lock();
+    surface.cursor_epoch_ms = GetTickCount64();
+    surface.cursor_blink_on = true;
+    surface.terminal_mutex.unlock();
+    if (updateCursorTimer(surface, surface.terminal_cursor, surface.terminal_columns, surface.terminal_rows, true) != result_ok) {
+        std.log.err("failed to update visual cursor timer on focus change: {d}", .{surface.last_error.load(.acquire)});
+    }
+    if (surface.hwnd) |hwnd| _ = InvalidateRect(hwnd, null, 0);
     surface.focused = focused;
     if (surface.uia) |provider| provider.updateFocus(focused);
     if (surface.options.callbacks.on_focus) |callback| {
@@ -2557,6 +2593,20 @@ fn surfaceWindowProc(
             return 0;
         },
         WM_ERASEBKGND => return 1,
+        WM_TIMER => {
+            if (wparam == cursor_timer_id) {
+                if (surface) |value| {
+                    value.terminal_mutex.lock();
+                    const on = win32_cursor.blinkOn(value.cursor_epoch_ms, GetTickCount64());
+                    const changed = value.cursor_blink_on != on;
+                    value.cursor_blink_on = on;
+                    value.terminal_mutex.unlock();
+                    if (value.cursor_timer_armed and changed) notifyRedraw(value);
+                }
+                return 0;
+            }
+            return DefWindowProcW(hwnd, message, wparam, lparam);
+        },
         WM_PAINT => {
             var paint: PAINTSTRUCT = undefined;
             _ = BeginPaint(hwnd, &paint);
@@ -2567,6 +2617,7 @@ fn surfaceWindowProc(
         WM_NCDESTROY => {
             setUserData(hwnd, null);
             if (surface) |value| {
+                stopCursorTimer(value);
                 detachSurfaceProvider(value);
                 value.hwnd = null;
                 destroyRenderer(value);
@@ -2617,6 +2668,7 @@ fn destroySurfaceNow(
         disableClearAdmissionAndWait(surface, remaining_admissions);
     }
     if (surface.hwnd) |hwnd| {
+        stopCursorTimer(surface);
         setUserData(hwnd, null);
         _ = DestroyWindow(hwnd);
         surface.hwnd = null;
@@ -2632,6 +2684,7 @@ fn cleanupUnregisteredSurface(
     surface.destroying.store(true, .release);
     detachSurfaceProvider(surface);
     if (hwnd) |value| {
+        stopCursorTimer(surface);
         setUserData(value, null);
         _ = DestroyWindow(value);
         surface.hwnd = null;
@@ -3303,8 +3356,24 @@ pub export fn winghostty_surface_set_visible(
     }
     const next_visible: u8 = if (visible == 0) 0 else 1;
     state.options_mutex.lock();
+    const previous_visible = state.options.visible;
     state.options.visible = next_visible;
     state.options_mutex.unlock();
+    const changed = previous_visible != next_visible;
+    const timer_result = updateCursorTimer(state, state.terminal_cursor, state.terminal_columns, state.terminal_rows, changed);
+    if (timer_result != result_ok) {
+        state.options_mutex.lock();
+        state.options.visible = previous_visible;
+        state.options_mutex.unlock();
+        releaseSurfaceAdmission(&admission);
+        return timer_result;
+    }
+    if (changed) {
+        state.terminal_mutex.lock();
+        state.cursor_epoch_ms = GetTickCount64();
+        state.cursor_blink_on = true;
+        state.terminal_mutex.unlock();
+    }
     if (state.uia) |provider| provider.updateVisibility(next_visible != 0);
     const hwnd = state.hwnd orelse {
         releaseSurfaceAdmission(&admission);
@@ -3312,6 +3381,7 @@ pub export fn winghostty_surface_set_visible(
     };
     releaseSurfaceAdmission(&admission);
     _ = ShowWindow(hwnd, if (next_visible != 0) SW_SHOW else SW_HIDE);
+    if (next_visible != 0) _ = InvalidateRect(hwnd, null, 0);
     return result_ok;
 }
 
@@ -3329,12 +3399,29 @@ pub export fn winghostty_surface_set_focus(
     }
     const next_focused: u8 = if (focused == 0) 0 else 1;
     state.options_mutex.lock();
+    const previous_focused = state.options.focus;
     state.options.focus = next_focused;
     state.options_mutex.unlock();
+    const changed = previous_focused != next_focused;
+    const timer_result = updateCursorTimer(state, state.terminal_cursor, state.terminal_columns, state.terminal_rows, changed);
+    if (timer_result != result_ok) {
+        state.options_mutex.lock();
+        state.options.focus = previous_focused;
+        state.options_mutex.unlock();
+        releaseSurfaceAdmission(&admission);
+        return timer_result;
+    }
+    if (changed) {
+        state.terminal_mutex.lock();
+        state.cursor_epoch_ms = GetTickCount64();
+        state.cursor_blink_on = true;
+        state.terminal_mutex.unlock();
+    }
     const hwnd = state.hwnd orelse {
         releaseSurfaceAdmission(&admission);
         return result_shutting_down;
     };
+    if (changed) _ = InvalidateRect(hwnd, null, 0);
     releaseSurfaceAdmission(&admission);
     if (focused != 0) {
         _ = SetFocus(hwnd);
@@ -3661,6 +3748,32 @@ fn setTerminalCells(
     state.terminal_columns = columns;
     state.terminal_rows = rows;
     state.terminal_generation = 0;
+    state.terminal_cursor = .{};
+    stopCursorTimer(state);
+    return result_ok;
+}
+
+fn stopCursorTimer(state: *SurfaceState) void {
+    if (state.cursor_timer_armed) {
+        if (state.hwnd) |hwnd| _ = KillTimer(hwnd, cursor_timer_id);
+        state.cursor_timer_armed = false;
+    }
+}
+
+fn updateCursorTimer(state: *SurfaceState, cursor: win32_cursor.Cursor, columns: u32, rows: u32, reset: bool) Result {
+    const hwnd = state.hwnd orelse return result_ok;
+    state.options_mutex.lock();
+    const needed = win32_cursor.needsTimer(cursor, columns, rows, state.options.focus != 0, state.options.visible != 0);
+    state.options_mutex.unlock();
+    if (!needed) {
+        stopCursorTimer(state);
+    } else if (!state.cursor_timer_armed or reset) {
+        if (SetTimer(hwnd, cursor_timer_id, @intCast(win32_cursor.blink_interval_ms), null) == 0) {
+            state.last_error.store(GetLastError(), .release);
+            return result_win32_error;
+        }
+        state.cursor_timer_armed = true;
+    }
     return result_ok;
 }
 
@@ -3672,6 +3785,15 @@ fn setTerminalSnapshotV2(
     state: *SurfaceState,
     source: *const TerminalSnapshotV2,
 ) Result {
+    return setTerminalSnapshotWithCursor(state, source, .{});
+}
+
+fn setTerminalSnapshotWithCursor(
+    state: *SurfaceState,
+    source: *const TerminalSnapshotV2,
+    cursor: win32_cursor.Cursor,
+) Result {
+    win32_cursor.validate(cursor) catch return result_invalid_argument;
     const cell_count = std.math.cast(usize, source.cell_count) orelse
         return result_invalid_argument;
     const glyph_count = std.math.cast(usize, source.glyph_count) orelse
@@ -3697,14 +3819,21 @@ fn setTerminalSnapshotV2(
         .text = text,
     }) catch return result_invalid_argument;
 
+    if (win32_cursor.inViewport(cursor, source.columns, source.rows)) {
+        const index = @as(usize, @intCast(cursor.y)) * source.columns + @as(usize, @intCast(cursor.x));
+        if ((cursor.flags & win32_cursor.wide_tail != 0) !=
+            (glyphs[index].width == win32_glyph.width_continuation)) return result_invalid_argument;
+    }
+
     var next_cells: []win32_context.TerminalCell = &.{};
     var next_glyphs: []win32_context.TerminalGlyph = &.{};
     var next_text: []u8 = &.{};
-    errdefer {
+    var installed = false;
+    defer if (!installed) {
         if (next_cells.len != 0) allocator.free(next_cells);
         if (next_glyphs.len != 0) allocator.free(next_glyphs);
         if (next_text.len != 0) allocator.free(next_text);
-    }
+    };
     if (cell_count != 0) {
         next_cells = allocator.alloc(win32_context.TerminalCell, cell_count) catch
             return result_out_of_memory;
@@ -3721,6 +3850,9 @@ fn setTerminalSnapshotV2(
         @memcpy(next_text, text);
     }
 
+    const cursor_changed = !std.meta.eql(state.terminal_cursor, cursor);
+    const timer_result = updateCursorTimer(state, cursor, source.columns, source.rows, cursor_changed);
+    if (timer_result != result_ok) return timer_result;
     state.terminal_mutex.lock();
     defer state.terminal_mutex.unlock();
     if (state.terminal_cells.len != 0) allocator.free(state.terminal_cells);
@@ -3732,6 +3864,15 @@ fn setTerminalSnapshotV2(
     state.terminal_columns = source.columns;
     state.terminal_rows = source.rows;
     state.terminal_generation = source.generation;
+    state.terminal_cursor = cursor;
+    if (cursor_changed) {
+        state.cursor_epoch_ms = GetTickCount64();
+        state.cursor_blink_on = true;
+    }
+    installed = true;
+    if (cursor_changed) {
+        if (state.hwnd) |hwnd| _ = InvalidateRect(hwnd, null, 0);
+    }
     return result_ok;
 }
 
@@ -3825,6 +3966,55 @@ pub export fn winghostty_surface_set_terminal_snapshot_v2(
     return setTerminalSnapshotV2(state, source);
 }
 
+pub export fn winghostty_terminal_snapshot_v3_init(snapshot: ?*TerminalSnapshotV3) void {
+    const output = snapshot orelse return;
+    output.* = .{
+        .size = @sizeOf(TerminalSnapshotV3),
+        .version = 3,
+        .columns = 0,
+        .rows = 0,
+        .cells = null,
+        .cell_count = 0,
+        .glyphs = null,
+        .glyph_count = 0,
+        .text = null,
+        .text_length = 0,
+        .generation = 0,
+        .cursor = .{},
+    };
+}
+
+fn setTerminalSnapshotV3(state: *SurfaceState, source: *const TerminalSnapshotV3) Result {
+    if (source.size < @sizeOf(TerminalSnapshotV3) or source.version != 3) return result_invalid_argument;
+    const v2 = TerminalSnapshotV2{
+        .size = @sizeOf(TerminalSnapshotV2),
+        .version = 2,
+        .columns = source.columns,
+        .rows = source.rows,
+        .cells = source.cells,
+        .cell_count = source.cell_count,
+        .glyphs = source.glyphs,
+        .glyph_count = source.glyph_count,
+        .text = source.text,
+        .text_length = source.text_length,
+        .generation = source.generation,
+    };
+    const result = setTerminalSnapshotWithCursor(state, &v2, source.cursor);
+    if (result == result_ok) {
+        if (state.hwnd) |hwnd| _ = InvalidateRect(hwnd, null, 0);
+    }
+    return result;
+}
+
+pub export fn winghostty_surface_set_terminal_snapshot_v3(surface: ?*Surface, snapshot: ?*const TerminalSnapshotV3) Result {
+    var admission = admitSurface(surface) orelse return unavailableSurfaceResult(surface);
+    defer releaseSurfaceAdmission(&admission);
+    const state = admission.surface;
+    const result = checkSurface(state);
+    if (result != result_ok) return result;
+    return setTerminalSnapshotV3(state, snapshot orelse return result_invalid_argument);
+}
+
 pub export fn winghostty_surface_render(surface: ?*Surface) Result {
     var admission = admitSurface(surface) orelse
         return unavailableSurfaceResult(surface);
@@ -3878,6 +4068,11 @@ pub export fn winghostty_surface_render(surface: ?*Surface) Result {
         .terminal_cells = state.terminal_cells,
         .terminal_glyphs = state.terminal_glyphs,
         .terminal_text = state.terminal_text,
+        .cursor = state.terminal_cursor,
+        .cursor_focused = state.options.focus != 0,
+        .cursor_surface_visible = state.options.visible != 0,
+        .cursor_epoch_ms = state.cursor_epoch_ms,
+        .now_ms = GetTickCount64(),
     };
     state.options_mutex.unlock();
 
@@ -4772,6 +4967,11 @@ fn initTerminalTestSurface(state: *SurfaceState) void {
     state.terminal_columns = 0;
     state.terminal_rows = 0;
     state.terminal_generation = 0;
+    state.terminal_cursor = .{};
+    state.cursor_epoch_ms = 0;
+    state.cursor_timer_armed = false;
+    state.cursor_blink_on = true;
+    state.hwnd = null;
 }
 
 fn deinitTerminalTestSurface(state: *SurfaceState) void {
@@ -4937,4 +5137,96 @@ test "v2 snapshot ABI layout is stable and v1 is unchanged" {
     winghostty_terminal_snapshot_v2_init(&v2);
     try std.testing.expectEqual(terminal_snapshot_version_2, v2.version);
     try std.testing.expectEqual(@as(u32, @sizeOf(TerminalSnapshotV2)), v2.size);
+}
+
+test "v3 cursor atomic install rejection and legacy clearing" {
+    var state: SurfaceState = undefined;
+    initTerminalTestSurface(&state);
+    defer deinitTerminalTestSurface(&state);
+    const cells = [_]win32_context.TerminalCell{
+        terminalTestCell(0x4E2D), terminalTestCell(0), terminalTestCell('a'),
+    };
+    const glyphs = [_]win32_context.TerminalGlyph{
+        .{ .offset = 0, .length = 3, .width = 2, .reserved = 0 },
+        .{ .offset = 0, .length = 0, .width = 0, .reserved = 0 },
+        .{ .offset = 3, .length = 1, .width = 1, .reserved = 0 },
+    };
+    var snapshot: TerminalSnapshotV3 = undefined;
+    winghostty_terminal_snapshot_v3_init(&snapshot);
+    snapshot.columns = 3;
+    snapshot.rows = 1;
+    snapshot.cells = &cells;
+    snapshot.cell_count = cells.len;
+    snapshot.glyphs = &glyphs;
+    snapshot.glyph_count = glyphs.len;
+    snapshot.text = "\u{4E2D}a";
+    snapshot.text_length = 4;
+    snapshot.generation = 19;
+    snapshot.cursor = .{ .x = 1, .y = 0, .flags = win32_cursor.visible | win32_cursor.wide_tail };
+    try std.testing.expectEqual(result_ok, setTerminalSnapshotV3(&state, &snapshot));
+    try std.testing.expectEqual(snapshot.cursor, state.terminal_cursor);
+    try std.testing.expect(state.terminal_cells.ptr != &cells);
+    try std.testing.expect(state.terminal_glyphs.ptr != &glyphs);
+    const installed_cells = state.terminal_cells.ptr;
+    const installed_glyphs = state.terminal_glyphs.ptr;
+    const installed_text = state.terminal_text.ptr;
+    const epoch = state.cursor_epoch_ms;
+    for (0..10) |scenario| {
+        var bad = snapshot;
+        bad.generation += 1;
+        switch (scenario) {
+            0 => bad.cursor.style = 4,
+            1 => bad.cursor.flags |= 16,
+            2 => bad.cursor.color_rgb = 0x1000000,
+            3 => bad.cursor.text_rgb = 0x1000000,
+            4 => bad.cursor.reserved[1] = 1,
+            5 => bad.cursor.x = 0,
+            6 => bad.cursor.flags &= ~win32_cursor.wide_tail,
+            7 => bad.version = 2,
+            8 => bad.size -= 1,
+            9 => bad.text_length = 3,
+            else => unreachable,
+        }
+        try std.testing.expectEqual(result_invalid_argument, setTerminalSnapshotV3(&state, &bad));
+        try std.testing.expectEqual(installed_cells, state.terminal_cells.ptr);
+        try std.testing.expectEqual(installed_glyphs, state.terminal_glyphs.ptr);
+        try std.testing.expectEqual(installed_text, state.terminal_text.ptr);
+        try std.testing.expectEqual(snapshot.cursor, state.terminal_cursor);
+        try std.testing.expectEqual(@as(u64, 19), state.terminal_generation);
+        try std.testing.expectEqual(epoch, state.cursor_epoch_ms);
+    }
+    // Equal snapshots do not restart an idle blink, even as generations advance.
+    state.cursor_epoch_ms = 42;
+    snapshot.generation += 1;
+    try std.testing.expectEqual(result_ok, setTerminalSnapshotV3(&state, &snapshot));
+    try std.testing.expectEqual(@as(u64, 42), state.cursor_epoch_ms);
+    snapshot.cursor = .{ .x = 2, .y = 0, .style = 1, .flags = win32_cursor.visible };
+    try std.testing.expectEqual(result_ok, setTerminalSnapshotV3(&state, &snapshot));
+    try std.testing.expectEqual(snapshot.cursor, state.terminal_cursor);
+    try std.testing.expectEqualStrings("\u{4E2D}a", state.terminal_text);
+    snapshot.cursor.x = -1;
+    try std.testing.expectEqual(result_ok, setTerminalSnapshotV3(&state, &snapshot));
+    snapshot.cursor.x = 3;
+    try std.testing.expectEqual(result_ok, setTerminalSnapshotV3(&state, &snapshot));
+    var v2: TerminalSnapshotV2 = undefined;
+    winghostty_terminal_snapshot_v2_init(&v2);
+    try std.testing.expectEqual(result_ok, setTerminalSnapshotV2(&state, &v2));
+    try std.testing.expectEqual(win32_cursor.Cursor{}, state.terminal_cursor);
+    try std.testing.expectEqual(result_ok, setTerminalSnapshotV3(&state, &snapshot));
+    try std.testing.expectEqual(result_ok, setTerminalCells(&state, 0, 0, null, 0));
+    try std.testing.expectEqual(win32_cursor.Cursor{}, state.terminal_cursor);
+}
+
+test "v3 cursor ABI is additive with stable legacy offsets" {
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(win32_cursor.Cursor));
+    try std.testing.expectEqual(@as(usize, 104), @sizeOf(TerminalSnapshotV3));
+    try std.testing.expectEqual(@as(usize, 72), @offsetOf(TerminalSnapshotV3, "cursor"));
+    inline for (std.meta.fields(TerminalSnapshotV2)) |field| {
+        try std.testing.expectEqual(@offsetOf(TerminalSnapshotV2, field.name), @offsetOf(TerminalSnapshotV3, field.name));
+    }
+    var snapshot: TerminalSnapshotV3 = undefined;
+    winghostty_terminal_snapshot_v3_init(&snapshot);
+    try std.testing.expectEqual(@as(u32, 3), snapshot.version);
+    try std.testing.expectEqual(@as(u32, 104), snapshot.size);
+    try std.testing.expectEqual(win32_cursor.Cursor{}, snapshot.cursor);
 }
