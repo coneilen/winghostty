@@ -194,7 +194,76 @@ Accessibility snapshots are caller-owned and are pushed through the
 teardown, and retained providers return `UIA_E_ELEMENTNOTAVAILABLE` without
 invoking callbacks after destruction.
 
+## Visual cursor snapshots
+
+The additive `winghostty_terminal_snapshot_v3` is 104 bytes on Win64: the
+unchanged v2 fields occupy the first 72 bytes, followed by a 32-byte
+`winghostty_terminal_cursor`. Initialize and install it on the UI thread:
+
+```c
+void winghostty_terminal_snapshot_v3_init(winghostty_terminal_snapshot_v3 *);
+winghostty_result winghostty_surface_set_terminal_snapshot_v3(
+    winghostty_surface *, const winghostty_terminal_snapshot_v3 *);
+```
+
+The provider validates the entire snapshot before changing accepted state,
+then owns independent copies of cells, spans, text, and cursor. Invalid
+versions, sizes, UTF-8/spans, cursor styles/flags/colors/reserved words, or
+in-grid wide-tail mismatches return `WINGHOSTTY_INVALID_ARGUMENT`; allocation
+and timer failures return their explicit errors without replacing the snapshot.
+The old v1/v2 layouts and entry points remain supported and clear a prior v3
+cursor rather than pairing it with unrelated cells.
+
+Cursor styles are block (0), bar (1), underline (2), and hollow block (3).
+Flags are visible (1), blinking (2), wide tail (4), and pending wrap (8).
+Signed x/y are viewport cell coordinates, not accessibility offsets. Negative
+or out-of-viewport coordinates suppress drawing; wide tails normalize to the
+lead cell and cover the complete wide grapheme. Pending wrap does not advance
+to another cell. Cursor geometry uses the same padded, device-pixel grid as
+the glyph pass, without scaling font size or padding a second time.
+The one-device-pixel bar/outline follows the retained Ghostty sprite default;
+the bar is clipped at the left grid edge, and the underline is clipped to the
+bottom of the provider cell (the provider does not expose a font underline
+position).
+
+`color_rgb` and `text_rgb` are resolved opaque RGB values. The caller must
+provide effective cursor color (OSC 12/config, otherwise terminal foreground)
+and cursor text color (config, otherwise terminal background), matching
+`src/renderer/generic.zig`'s defaults. Do not substitute the styled cell colors.
+Initialization uses `Config.zig` defaults (`FFFFFF` and `282C34`) and an
+invisible, out-of-viewport block. Filled blocks recolor the underlying entire
+grapheme; bars, underlines, and hollow blocks preserve glyph ink.
+
+The provider owns the 600 ms blink clock, using the existing child window's
+message loop and `on_redraw` callback. The embedder must service that callback
+by scheduling its normal render operation on the owning render thread, even
+without PTY output; no consumer timer or HWND overlay is needed. A cursor
+change or focus/visibility transition restarts the visible phase; repeating
+identical cursor state (including newer snapshot generations) does not.
+Hidden, out-of-viewport, nonblinking, and unfocused cursors do not keep a timer
+running. Unfocused visible cursors are steady hollow blocks, per
+`src/renderer/Cursor.zig`. Teardown cancels the timer before detaching the HWND.
+
+**Capability limit:** secure-input/password lock cursors are not represented
+by v3. Ghostty renders those using the Nerd Font U+F023 glyph, which this
+standalone provider cannot guarantee is present. Consumers must surface that
+unsupported state explicitly, not silently convert it into a normal cursor.
+This contract does not qualify live GPU presentation, OS focus delivery,
+macOS pixel parity, or backend PTY resize.
+
 ## Validation
+
+Pure geometry/blink and copied-snapshot/ABI regressions (no WGL device) run
+with:
+
+```powershell
+.\scripts\dev-windows.cmd zig test src\renderer\win32_cursor.zig
+.\scripts\dev-windows.cmd zig test src\win32_host.zig -lc -luser32 -lkernel32 -lgdi32 -lopengl32 -lole32 -loleaut32
+```
+
+The renderer executable below creates hidden native HWND/WGL contexts and
+reads GL pixels. It requires a usable native graphics device; compilation or
+pure tests alone do not prove its pixel assertions or idle message delivery.
 
 ```powershell
 .\scripts\dev-windows.cmd powershell -NoProfile -ExecutionPolicy Bypass -File .\test\windows\compile-win32-host-api.ps1
